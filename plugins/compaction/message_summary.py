@@ -4,6 +4,7 @@ from __future__ import annotations
 from plugins.models.contract import ModelError
 import json
 import logging
+import re
 from dataclasses import replace
 from collections.abc import Awaitable, Callable, Sequence
 
@@ -228,6 +229,29 @@ def _fit_inputs(model: BoundChatModel, groups: tuple[tuple[Message, ...], ...], 
     raise SummaryError("摘要提示加一条最短消息摘录已超过摘要模型容量")
 
 
+def _summary_headings(text: str) -> tuple[str, ...]:
+    """代码围栏内的 # 是代码，不参与固定标题合同；未闭合围栏不能隐藏后续标题。"""
+    headings: list[str] = []
+    fence = ""
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if fence:
+            if re.fullmatch(re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*", stripped):
+                fence = ""
+            continue
+        opening = re.match(r"(`{3,}|~{3,})(.*)$", stripped)
+        if opening is not None:
+            marker, info = opening.groups()
+            if marker[0] == "~" or "`" not in info:
+                fence = marker
+                continue
+        if stripped.startswith("#"):
+            headings.append(line.strip())
+    if fence:
+        raise SummaryError("摘要代码围栏未闭合")
+    return tuple(headings)
+
+
 async def _summarize(model: BoundChatModel, groups: tuple[tuple[Message, ...], ...],
                      previous: str, limit: int) -> tuple[str, tuple[str, ...], tuple[tuple[Message, ...], ...]]:
     """输入先缩进摘要模型，再只发出一次摘要请求。"""
@@ -236,7 +260,7 @@ async def _summarize(model: BoundChatModel, groups: tuple[tuple[Message, ...], .
 
     # 只接纳成功调用的真实正文；格式错误不会用空摘要掩盖。
     text = (response.content or "").strip()
-    headings = tuple(line.strip() for line in text.splitlines() if line.lstrip().startswith("#"))
+    headings = _summary_headings(text)
     if response.tool_calls or headings != HEADINGS:
         raise SummaryError("摘要响应没有遵守固定标题合同")
     if response.call_record_id is None:
