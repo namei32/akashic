@@ -5,6 +5,7 @@ from plugins.delivery.contract import DELIVERY_SCOPED_READ
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -12,6 +13,7 @@ from typing import cast
 from core.common.file_io import run_file_io
 
 from agent.plugin_composition import Context
+from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
 from plugins.ledger.contract import BINDINGS
 from plugins.ledger.contract import (
     MESSAGE_CATALOG,
@@ -37,6 +39,7 @@ from ._boundary import (
     ToolView,
 )
 from .admission import Admission, Duties
+from .active_sources import ActiveSources
 from .api import DRIFT_WAKE, EVENTMAIL_WAKE, Config, DeliveryTarget
 from .legacy_rules import read_archived_rules
 from .messages import recent_context
@@ -151,6 +154,7 @@ class Runtime:
         self.state = WakeState(ctx.data_root / "wake.sqlite3")
         # apply/follow 拥有异步初始化；构造函数不在共享 loop 执行 SQL。
         self.source = Source(ctx, self.state, now=now)
+        self.active_sources = ActiveSources()
         target = None if self.config.delivery is None else self.config.delivery.model_dump()
         self.duties = Duties(ctx.require(EVENTMAIL_WAKE), ctx.require(DRIFT_WAKE), self.state,
                              ctx.require(SEMANTIC_INTEREST), target)
@@ -195,23 +199,40 @@ class Runtime:
         proposal = propose_drift(admission.proposals) if owner == "drift" else None
         memory_assisted = proposal is not None and proposal.payload.get("memory_assisted") is True
         memory_query, memory_blocked, source_seq = "", "", None
-        if memory_assisted:
+        auto_sources = owner == "drift" and self.config.active_sources.enabled
+        history = ""
+        if memory_assisted and not auto_sources:
             with ctx.borrow(DELIVERY_SCOPED_READ) as scoped:
                 if scoped is None:
                     history, memory_blocked = "", "scoped_history_unavailable"
                 else:
                     messages, content = ctx.require(MESSAGE_CATALOG), ctx.require(CONTENT)
+                    scoped_history = scoped
                     source_seq, memory_query, history, memory_blocked = await run_file_io(
-                        lambda: capture_memory_context(messages, content, scoped, session_id=target.session_id, now=now),
+                        lambda: capture_memory_context(messages, content, scoped_history, session_id=target.session_id, now=now),
                     )
             if not memory_blocked and not memory_query:
                 memory_blocked = "no_user_input"
             if events and not memory_blocked:
                 memory_blocked = "unscoped_context"
             events = ()
-        else:
+        elif not auto_sources:
             history = recent_context(ctx.require(MESSAGE_CATALOG), ctx.require(DELIVERY_READ),
                                      target=target.session_id, now=now)
+        source_policy, source_evidence, memory_source_session, rejected = "", (), "", []
+        if auto_sources:
+            source_evidence, passive, queries, rejected = await self.active_sources.capture(
+                ctx, self.config.active_sources, target, now)
+            source_policy = self.config.active_sources.fingerprint()
+            # Recall exactly one source scope; do not blend several provider queries.
+            if memory_assisted and source_evidence:
+                memory_source_session = source_evidence[0].session_id
+                memory_query = queries[memory_source_session]
+                source_seq = source_evidence[0].through_seq
+                memory_blocked = "" if memory_blocked == "no_user_input" else memory_blocked
+            events = ()  # Unscoped EventMail Context must not broaden the source policy.
+            # Source evidence is archived separately; never truncate the JSON document.
+            history = json.dumps({"recent_conversation": passive, "delivered_messages": []}, ensure_ascii=False)
         return Request(
             flow_id=flow_id,
             owner=owner,
@@ -231,6 +252,9 @@ class Runtime:
             model_id=model.model_id, reasoning_effort=model.reasoning_effort,
             rules=read_archived_rules(ctx.data_root) or "",
             history=history, events=events, memory_assisted=memory_assisted,
+            source_policy=source_policy, source_evidence=source_evidence, source_rejections=tuple(rejected),
+            source_config_revision=str(ctx.require(PLUGIN_CONFIG).read(ctx)["config_revision"]) if source_policy else "",
+            memory_source_session=memory_source_session,
             memory_provider=self.config.memory_provider,
             memory_query=memory_query, memory_source_seq=source_seq, memory_blocked=memory_blocked)
 

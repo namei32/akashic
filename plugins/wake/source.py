@@ -63,6 +63,7 @@ from .request import (
     read_request,
     retryable,
 )
+from .active_sources import source_guard
 from .selection import propose_content, propose_drift
 from .state import WakeState
 from .tools import Alert, Screen, Share, Skip
@@ -359,6 +360,11 @@ class Source:
         return "wake:" + request.flow_id
 
     async def _memory_snapshot(self, request: Request) -> Mapping[str, object]:
+        async with source_guard(self.ctx, request) as reason:
+            _check_initiative_guard(reason)
+            return await self._prepare_memory(request)
+
+    async def _prepare_memory(self, request: Request) -> Mapping[str, object]:
         ctx, target = self.ctx, request.target
         selected_memory = memory_key(request.memory_provider)
         if selected_memory is None:
@@ -376,14 +382,14 @@ class Source:
             with ctx.borrow(selected_memory) as memory:
                 if memory is None:
                     raise _InitiativeUnavailable("memory_provider_unavailable")
-                await memory.admit(self._memory_id(request), target.session_id, request.memory_query,
+                await memory.admit(self._memory_id(request), (request.memory_source_session or target.session_id), request.memory_query,
                                    timestamp=request.now.isoformat())
             async with ctx.require(DRIFT_WAKE).send_start(request.accepted, target.model_dump()) as reason:
                 _check_initiative_guard(reason)
                 state = ctx.require(OWNER_STATE).open(ctx)
                 key = "memory-recall:" + request.flow_id
                 admitted: Mapping[str, object] = {
-                    "request_id": self._memory_id(request), "session_id": target.session_id,
+                    "request_id": self._memory_id(request), "session_id": request.memory_source_session or target.session_id,
                     "query_sha256": hashlib.sha256(request.memory_query.encode()).hexdigest(),
                     "source_seq": request.memory_source_seq, "timestamp": request.now.isoformat(),
                 }
@@ -399,13 +405,21 @@ class Source:
             with ctx.borrow(selected_memory) as memory:
                 if memory is None:
                     raise _InitiativeUnavailable("memory_provider_unavailable")
-                result = await memory.prepare(self._memory_id(request), target.session_id, request.memory_query,
+                result = await memory.prepare(self._memory_id(request), (request.memory_source_session or target.session_id), request.memory_query,
                                               timestamp=request.now.isoformat())
         text, references, status = result.get("text"), result.get("references"), result.get("status")
         if (not isinstance(text, str) or not isinstance(references, list)
                 or any(not isinstance(item, str) for item in references)
                 or status not in {"ok", "empty", "degraded"}):
             raise ValueError("主动记忆快照结构无效")
+        if request.source_policy:
+            # A provider may recall other sessions in the same graph. Its graph
+            # scope is not consent to bypass this request's selected sources.
+            catalog = ctx.require(MESSAGE_CATALOG)
+            if any(not any((message := catalog.reader(e.session_id).get(identity)) is not None
+                           and message.seq <= e.through_seq and message.recorded_at <= request.now
+                           for e in request.source_evidence) for identity in references):
+                raise _InitiativeInvalid("memory_source_outside_selection")
         return {"text": text, "references": references, "status": status}
 
     @asynccontextmanager
@@ -430,13 +444,24 @@ class Source:
                 if memory is None:
                     yield "memory_provider_unavailable"
                     return
-                memory_guard = memory.guard(self._memory_id(request), target.session_id)
+                memory_guard = memory.guard(self._memory_id(request), request.memory_source_session or target.session_id)
             async with memory_guard as reason:
                 if reason is not None:
                     yield reason
                     return
                 async with ctx.require(DRIFT_WAKE).send_start(request.accepted, target.model_dump()) as reason:
                     yield reason
+
+    @asynccontextmanager
+    async def _drift_guard(self, request: Request) -> AsyncIterator[str | None]:
+        async with source_guard(self.ctx, request) as source_reason:
+            if source_reason is not None:
+                yield source_reason
+                return
+            guard = (self._memory_guard(request) if request.memory_assisted else
+                     self.ctx.require(DRIFT_WAKE).send_start(request.accepted, request.target.model_dump()))
+            async with guard as reason:
+                yield reason
 
     async def _drift(self, task: Task, request: Request, reader: MessageReader) -> str:
         domain = self.ctx.require(DRIFT_WAKE)
@@ -469,6 +494,13 @@ class Source:
             selected = await domain.selection(request.accepted)
             if selected is None:
                 raise ValueError("Drift 领取成功却缺少领域回执")
+        if request.source_policy and not request.source_evidence:
+            await self._record(request, "skip", "active_sources_no_user_evidence")
+            result = await domain.transition(_string(selected.get("selection_token"), "Drift token"), "await_change")
+            if result.get("changed") is not True:
+                raise RuntimeError("空来源机会未结算")
+            await self._settled(request, reader)
+            return "model_skip"
         if proposal.decision == "decline":
             action = "defer" if selected.get("next_due") is not None else "await_change"
             recorded_decision = "skip"
@@ -490,8 +522,7 @@ class Source:
                     data["memory"] = await self._memory_snapshot(request)
                 _ = await self._phase(
                     task, request, reader, "drift", data,
-                    start_guard=(lambda: self._memory_guard(request)) if request.memory_assisted else
-                                (lambda: domain.send_start(request.accepted, request.target.model_dump())),
+                    start_guard=lambda: self._drift_guard(request),
                 )
             except (_InitiativePaused, _InitiativeUnavailable, PromptUnavailable):
                 return "deferred"  # Keep the original pointer for resume.
@@ -547,9 +578,7 @@ class Source:
             payloads = {_candidate_id(_mapping(item["ref"], "Content ref")): _mapping(item["payload"], "Content payload")
                         for item in request.items}
             text = _message_with_source_links(text, {"source_refs": [payloads[name] for name in value.items]})
-        guard = ((lambda: self._memory_guard(request)) if request.memory_assisted else
-                 (lambda: self.ctx.require(DRIFT_WAKE).send_start(request.accepted, request.target.model_dump()))
-                 if request.owner == "drift" else None)
+        guard = (lambda: self._drift_guard(request)) if request.owner == "drift" else None
         token = _string(selected.get("selection_token"), "selection_token")
         paused_reason = "paused:" + token if request.owner == "drift" else None
         expired_reason = "expired:" + token if request.owner == "drift" else None
