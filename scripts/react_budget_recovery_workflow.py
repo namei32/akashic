@@ -1,4 +1,4 @@
-"""真实 HTTP、SourceSession、ReAct、文件工具与 SQLite 的预算恢复工作流。"""
+"""真实 HTTP、SourceSession、ReAct、文件工具与 SQLite 的恢复工作流。"""
 from __future__ import annotations
 
 import argparse
@@ -12,12 +12,13 @@ import sys
 import tempfile
 
 
-async def run(folder: Path, limit: int, *, complete_after: int | None = None) -> dict:
+async def run(folder: Path, limit: int, *, complete_after: int | None = None,
+              history_receipt: str | None = None, legacy_history: bool = False) -> dict:
     import httpx
     from agent.plugin_composition.tasks import Tasks
     from core.net.http import HttpClient
     from plugins.content.plugin import _decode_text, check_text
-    from plugins.context.api import check_summary
+    from plugins.context.api import check_notice, check_summary
     from plugins.context.plugin import ContextBuilder
     from plugins.host_execution.contract import FileError
     from plugins.host_execution.files import Files
@@ -38,7 +39,7 @@ async def run(folder: Path, limit: int, *, complete_after: int | None = None) ->
 
     requests, effects, handlers = [], [], set()
     entered, released = asyncio.Event(), asyncio.Event()
-    holds, final, reject_next = (0 if complete_after is not None else 2), False, False
+    holds, final, reject_next = (0 if complete_after is not None or history_receipt else 2), False, False
 
     async def serve(reader, writer):
         nonlocal holds, reject_next
@@ -103,7 +104,8 @@ async def run(folder: Path, limit: int, *, complete_after: int | None = None) ->
     def writer(session, body, ref=None, source="conversation"):
         return log.writer(session, author="user" if body is Input else "scenario", source=source, body_types=(body,),
             content={"text": check_text, "model.facts": check_facts,
-                     "model.tool_rejection": check_tool_rejection, "context.summary": check_summary},
+                     "model.tool_rejection": check_tool_rejection, "context.summary": check_summary,
+                     "context.notice": check_notice},
             call_ref=ref, check_call=lambda call: None)
 
     def source(session="scenario"):
@@ -187,6 +189,57 @@ async def run(folder: Path, limit: int, *, complete_after: int | None = None) ->
     try:
         conversation = source()
         await conversation.accept("first", Input((ContentPart("text", "write numbered receipts"),)))
+        if history_receipt is not None:
+            # 真实文件工具成功后停在预算边界，模拟重开时两库落在不同提交点。
+            await budget_failure(await conversation.start(program))
+            protected = rows()
+            snapshot = log.reader("scenario").snapshot()
+            facts = next(part.value for message in snapshot if isinstance(message.body, Output)
+                         for part in message.body.parts if isinstance(part, ContentPart) and part.kind == "model.facts")
+            assert ("replay" in facts) is not legacy_history
+            finished = [message.body for message in snapshot if isinstance(message.body, ToolResult)]
+            assert len(finished) == len(effects) == 1 and finished[0].outcome == "success"
+            result_text = finished[0].parts[0].value
+            file = folder / "receipt-1.txt"
+            before = file.read_bytes(), file.stat().st_mtime_ns
+            await tasks.close()
+            log.close()
+            store.close()
+            with sqlite3.connect(folder / "models.db") as registry:
+                if history_receipt == "missing":
+                    changed = registry.execute("DELETE FROM model_calls WHERE state='success'")
+                else:
+                    changed = registry.execute(
+                        "UPDATE model_calls SET state='started',finished_at=NULL,response_json=NULL,usage_json=NULL"
+                        " WHERE state='success'"
+                    )
+                assert changed.rowcount == 1
+            log, tasks = MessageLog(folder / "sessions.db"), Tasks()
+            log._connection.set_authorizer(observe)
+            store = ModelsStore(folder / "models.db", folder / "backups")
+            store.initialize()
+            model = _BoundChat(descriptor, physical, store, max_attempts=1)
+            final = True
+            conversation = source()
+            await conversation.accept("next", Input((ContentPart("text", "continue the same session"),)))
+            await asyncio.wait_for((await conversation.start(program)).join(), 30)
+            output = log.reader("scenario").snapshot()[-1].body
+            assert isinstance(output, Output) and output.finish == "complete"
+            notices = [part for part in output.parts if isinstance(part, ContentPart) and part.kind == "context.notice"]
+            assert bool(notices) is legacy_history
+            sent = requests[-1]["messages"]
+            assert isinstance(result_text, str) and result_text in json.dumps(sent, ensure_ascii=False)
+            tool_rows = [row for row in sent if row["role"] == "tool"]
+            wire_calls = [call for row in sent for call in row.get("tool_calls", ())]
+            if legacy_history:
+                assert not tool_rows and not wire_calls
+            else:
+                assert len(tool_rows) == len(wire_calls) == 1
+                assert tool_rows[0]["tool_call_id"] == wire_calls[0]["id"] == "write-1"
+            assert rows()[:len(protected)] == protected and set(mutations) == {sqlite3.SQLITE_INSERT}
+            assert len(effects) == 1 and (file.read_bytes(), file.stat().st_mtime_ns) == before
+            return {"receipt": history_receipt, "legacy_history": legacy_history, "same_session_completed": True,
+                    "original_rows_preserved": len(protected), "tool_executions": len(effects)}
         if complete_after is not None:
             protected = rows()
             await asyncio.wait_for((await conversation.start(program)).join(), 60)
@@ -301,6 +354,8 @@ if __name__ == "__main__":
     parser.add_argument("--entrypoint", choices=("reply", "scheduler", "subagent"),
                         help="从真实入口 Config 读取缺省步数；0 时完成 --steps 次工具操作")
     parser.add_argument("--max-steps", type=int, help="向选定入口显式传入 max_steps 配置")
+    parser.add_argument("--history-receipt", choices=("missing", "started"))
+    parser.add_argument("--legacy-history", action="store_true", help="配合仅写旧格式的 --source-root 验证兼容路径")
     args = parser.parse_args()
     if args.steps < 2:
         parser.error("--steps 必须至少为 2，供中途暂停和插话场景使用")
@@ -313,10 +368,12 @@ if __name__ == "__main__":
         config = config_type.model_validate({} if args.max_steps is None else {"max_steps": args.max_steps})
         limit = config.max_steps
     complete_after = args.steps if limit == 0 or (args.entrypoint and args.max_steps is None) else None
-    if complete_after is None and limit < 2:
+    if complete_after is None and limit < 2 and args.history_receipt is None:
         parser.error("有界恢复场景需要至少 2 步，供中途暂停和插话场景使用")
     with tempfile.TemporaryDirectory(prefix="react-budget-workflow-") as temporary:
-        result = asyncio.run(run(Path(temporary), limit, complete_after=complete_after))
+        result = asyncio.run(run(Path(temporary), 1 if args.history_receipt else limit,
+                                 complete_after=complete_after, history_receipt=args.history_receipt,
+                                 legacy_history=args.legacy_history))
         if args.entrypoint:
             result["entrypoint"] = args.entrypoint
         print(json.dumps(result, ensure_ascii=False, indent=2))
