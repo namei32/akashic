@@ -45,6 +45,7 @@ class ReplyExecuteV4(Protocol):
         tool_names: Sequence[str] | None = None,
         exclude_material_kinds: frozenset[MaterialKind] = frozenset(),
         prompt_hints: Sequence[str] = (),
+        work_status: Callable[[tuple[Message, ...]], tuple[str, bool]] | None = None,
         fixed_bindings: Mapping[str, str] | None = None,
         preview: Callable[[str], AbstractContextManager[StreamCallback]] | None = None,
         reminders: Sequence[Mapping[str, object]] = (),

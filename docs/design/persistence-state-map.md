@@ -1178,3 +1178,10 @@ Yoyo `20260909_02_execution_failures` 当时由 workspace 独占锁保护，迁�
 `codex_notifications` 通过 Ledger OwnerState 追加 `event:<digest>`，固定原事件与目标；
 Ledger / Delivery 保存消息和投递选择。没有自动删除或历史改写协议。正常接纳、重投、
 停用和会话删除的完整边界见 [ADR-0128](../decisions/0128-codex-notifications-use-local-gateway.md)。
+
+### 多事项任务与回调恢复
+
+`sessions.db/owner_records` 中，reply 的 `work` 子空间按原用户 Input 保存目标、进度、证据、等待的作业和每次更新回执。
+jobs 独占可唤醒作业的原输入、首次登记、结算结果、去重回执和待处理索引；索引与回执在同一事务推进。
+结算后保留去重记录。恢复时读取现有消息、工具结果与投递回执，只接续仍需处理的回复。
+没有自动删除或历史回填。完整数据库备份同时保留这些记录与对应消息。见 [后台通知与主任务接续](../decisions/0113-background-job-notices.md)。

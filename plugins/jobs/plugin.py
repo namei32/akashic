@@ -8,18 +8,19 @@ from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent.plugin_composition import CompositionError, Context
+from agent.plugin_composition import RUNTIME_STARTED, CompositionError, Context
 from agent.plugin_composition.tasks import Task, independent_task_context
 from plugins.context.contract import MATERIALS_V4 as MATERIALS
 from plugins.conversation.contract import CONVERSATION_COMPLETE_V2 as CONVERSATION_COMPLETE
 from plugins.delivery.contract import DELIVERY_GUARDED_START as DELIVERY
 from plugins.delivery.contract import DELIVERY_SENDERS
-from plugins.ledger.contract import BINDINGS, MESSAGE_CATALOG, Input, Message, MessageReader, json_value
+from plugins.ledger.contract import BINDINGS, MESSAGE_CATALOG, OWNER_STATE, ContentPart, Input, Message, MessageReader, Output, json_value
 from plugins.reply.contract import REPLY_PROGRAM_V3 as REPLY_PROGRAM
 from plugins.sources.contract import SourceGuard
 
 from .board import JobBoard, JobMirror, Notice
-from .contract import JOB_NOTICES, JobOutcome, JobSnapshot, JobWatch
+from .contract import JOB_NOTICES, JOB_WAITING, JobOutcome, JobSnapshot, JobWatch
+from .journal import WakeJournal, receipt_key
 
 logger = logging.getLogger(__name__)
 _STOPPED_BY_USER = "用户在界面上停止了此任务"
@@ -27,7 +28,7 @@ api_version = 3
 name = "jobs"
 version = "1.0.0"
 desc = "后台任务完成通知：忙时注入当前回合，闲时唤醒原会话"
-inject = (MESSAGE_CATALOG, MATERIALS, CONVERSATION_COMPLETE, REPLY_PROGRAM, DELIVERY, DELIVERY_SENDERS, BINDINGS)
+inject = (MESSAGE_CATALOG, MATERIALS, CONVERSATION_COMPLETE, REPLY_PROGRAM, DELIVERY, DELIVERY_SENDERS, BINDINGS, OWNER_STATE)
 
 _CONVERSATION = "conversation"
 
@@ -60,15 +61,37 @@ class Jobs:
         self._ctx = ctx
         self._config = config
         self._board = JobBoard(config.max_consecutive_wakes)
+        self._journal = WakeJournal(ctx.require(OWNER_STATE).open(ctx))
         self._mirror = JobMirror()
         self._queue: asyncio.Queue[JobWatch] = asyncio.Queue()
-        self._running: dict[str, JobWatch] = {}
-        self._stopped_by_user: set[str] = set()
+        self._running: dict[tuple[str, str], JobWatch] = {}
+        self._stopped_by_user: set[tuple[str, str]] = set()
 
     def watch(self, job: JobWatch) -> None:
-        self._running[job.job_id] = job
+        if self._durable(job):
+            reader = self._ctx.require(MESSAGE_CATALOG).reader(job.session_id)
+            head = reader.head() if job.through_seq is None else job.through_seq
+            origin = reader.latest_input(_CONVERSATION, through_seq=head)
+            if origin is None or not self._journal.watch(job, origin.message_id):
+                return
+        self._running[job.session_id, job.job_id] = job
         self._mirror.start(job)
         self._queue.put_nowait(job)
+
+    def _durable(self, job: JobWatch) -> bool:
+        return job.source == _CONVERSATION and self._config.completion_delivery == "wakeup"
+
+    def waiting(self, session_id: str, job_id: str) -> bool:
+        job = self._running.get((session_id, job_id))
+        return job is not None and self._durable(job)
+
+    async def recover(self) -> None:
+        # Restart resumes the reply source with its original tool references, never the command.
+        async with asyncio.TaskGroup() as group:
+            for value in self._journal.pending():
+                job, outcome = self._journal.restore(value)
+                if (job.session_id, job.job_id) not in self._running:
+                    group.create_task(self._notify(job, outcome))
 
     def origin_source(self, session_id: str, source: str) -> str:
         return self._board.origin_source(session_id, source)
@@ -76,17 +99,17 @@ class Jobs:
     # 1. 只停本会话登记、且生产方给了停止入口的运行中任务；2. 先进入停止中，再交给生产方终止；
     # 3. 结算时据 _stopped_by_user 注明是用户停止，通知照常送达模型，不让它以为任务还在跑。
     async def stop_job(self, session_id: str, job_id: str) -> bool:
-        job = self._running.get(job_id)
+        job = self._running.get((session_id, job_id))
         if job is None or job.session_id != session_id or job.stop is None:
             return False
         if not self._mirror.set_stopping(session_id, job_id, True):
             return False
-        self._stopped_by_user.add(job_id)
+        self._stopped_by_user.add((session_id, job_id))
         try:
             return await job.stop()
         except Exception:
             logger.warning("用户停止后台任务失败 job=%s", job_id, exc_info=True)
-            self._stopped_by_user.discard(job_id)
+            self._stopped_by_user.discard((session_id, job_id))
             _ = self._mirror.set_stopping(session_id, job_id, False)
             return False
 
@@ -115,7 +138,7 @@ class Jobs:
         if not notices:
             return {}
         return {"reminders": tuple(
-            {"name": "job-" + notice.job.job_id, "text": notice.text(), "priority": 450, "replay": True}
+            {"name": "job-" + notice.job.job_id, "text": self._notice_text(notice), "priority": 450, "replay": True}
             for notice in notices
         )}
 
@@ -127,13 +150,22 @@ class Jobs:
         except Exception:
             logger.warning("后台任务结算等待失败 job=%s", job.job_id, exc_info=True)
         finally:
-            _ = self._running.pop(job.job_id, None)
-            if job.job_id in self._stopped_by_user:
-                self._stopped_by_user.discard(job.job_id)
+            key = (job.session_id, job.job_id)
+            _ = self._running.pop(key, None)
+            if key in self._stopped_by_user:
+                self._stopped_by_user.discard(key)
                 outcome = _stopped_outcome(outcome)
             self._mirror.finish(job, outcome)
+        if self._durable(job):
+            self._journal.update(job, "done" if outcome is None else "settled", outcome)
         if outcome is None:
             return
+        await self._notify(job, outcome)
+
+    def _notice_text(self, notice: Notice) -> str:
+        return notice.text() + "\n通知回执 " + receipt_key(notice.job)
+
+    async def _notify(self, job: JobWatch, outcome: JobOutcome) -> None:
         notice = self._board.settle(job, outcome)
         if self._config.completion_delivery == "quiet" or job.source != _CONVERSATION:
             return
@@ -149,16 +181,43 @@ class Jobs:
     # 在原会话槽空闲后运行一轮；槽内再次核对，忙时已被回合领取的结算不再唤醒。
     async def _wake(self, notice: Notice) -> None:
         ctx, board, job = self._ctx, self._board, notice.job
-        source = "job:" + job.job_id
+        source = job.wake_source
+        deferred = False
 
         async def report(task: Task, current: MessageReader, check_admission: SourceGuard) -> Message:
+            nonlocal deferred
             latest = current.latest_input(_CONVERSATION, through_seq=current.head())
             if latest is None:
                 raise RuntimeError("后台任务的原会话没有用户输入")
+            record = self._journal.store.read(receipt_key(job))
+            if record is None:
+                return latest
+            origin = current.get(str(record.value["input"]))
+            if origin is None:
+                return latest
+            control = current.latest_control(_CONVERSATION, through_seq=current.head())
+            if control is not None and control.seq > latest.seq and getattr(control.body, "action", "") in {"pause", "abandon", "failure"}:
+                return latest
+            finished = current.latest_finished_output_seq(source, after_seq=origin.seq, through_seq=current.head())
+            if finished is not None:
+                return current.read(source=source, after_seq=finished-1, limit=1)[0]
+            # The busy path can have committed the reminder before the host died.
+            marker = "通知回执 " + receipt_key(job)
+            consumed = await current.read_async(lambda reader: reader.scan(lambda rows: any(
+                isinstance(row.body, Output) and any(
+                    isinstance(part, ContentPart) and part.kind == "model.facts" and
+                    isinstance(part.value, Mapping) and marker in str(part.value.get("reminder", ""))
+                    for part in row.body.parts) for row in rows
+            ), source=_CONVERSATION, after_seq=origin.seq))
+            if consumed:
+                return latest
+            check_admission()
             if not board.take_wake(notice, latest.message_id):
+                deferred = notice.claimed_by is None
                 return latest
             reminders: tuple[Mapping[str, object], ...] = (
-                {"name": "background_job", "text": notice.text(), "priority": 500},
+                {"name": "background_job" if origin.message_id == latest.message_id else "prior_task_result",
+                 "text": self._notice_text(notice), "priority": 500},
             )
             try:
                 return await ctx.require(REPLY_PROGRAM)(task, current, source, reminders, check_admission=check_admission)
@@ -169,9 +228,13 @@ class Jobs:
 
         message = await ctx.require(CONVERSATION_COMPLETE)(job.session_id, report)
         if message.source != source:
+            if not deferred:
+                self._journal.update(job, "done")
+                board.finish_wake(notice)
             return
         board.finish_wake(notice)
         await self._deliver(message)
+        self._journal.update(job, "done")
 
     # 唤醒回复不属于 conversation 来源，按原会话最近输入的渠道显式回传。
     async def _deliver(self, message: Message) -> None:
@@ -211,7 +274,11 @@ def _stopped_outcome(outcome: JobOutcome | None) -> JobOutcome | None:
 async def apply(ctx: Context) -> None:
     config = Config.model_validate(ctx.config)
     jobs = Jobs(ctx, config)
+    async def recover(_event: object) -> None:
+        _ = await ctx.spawn(jobs.recover(), name="job-recovery")
+    _ = await ctx.on(RUNTIME_STARTED, recover)
     _ = await ctx.spawn(jobs.run(), name="job-notices")
     _ = await ctx.effect(lambda: jobs.close, label="job-mirror")
     _ = await ctx.provide(JOB_NOTICES, jobs)
+    _ = await ctx.provide(JOB_WAITING, jobs.waiting)
     _ = await ctx.require(MATERIALS).register(ctx, name="job-notices", kind="context", prepare=jobs.materials)

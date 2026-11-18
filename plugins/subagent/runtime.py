@@ -287,7 +287,12 @@ class Subagents:
                 message = await finished()
                 if message is not None:
                     return message
-                return await ctx.require(REPLY_PROGRAM)(task, current, source, extra, check_admission=check_admission)
+                call = current.get(request.parent_message_id)
+                latest = current.latest_input("conversation", through_seq=current.head())
+                material = extra
+                if latest is not None and (call is None or latest.seq > call.seq):
+                    material = ({**extra[0], "name": "prior_task_result"},)
+                return await ctx.require(REPLY_PROGRAM)(task, current, source, material, check_admission=check_admission)
             message = await ctx.require(CONVERSATION_COMPLETE)(parent.session_id, report)
 
         # 2. 原发送成功或失败都关闭通知；失败回执保留，不重复回传。
@@ -307,6 +312,13 @@ class Subagents:
                 logger.error("子任务结果发送失败 job=%s reason=%s", request.job_id, receipt.error or receipt.status)
                 await self._trace(request, "delivery_failed")
         return True
+
+    def waiting(self, session_id: str, job_id: str) -> bool:
+        for key, row in self.ctx.require(OWNER_STATE).open(self.ctx).list():
+            if not row.value["settled"] and row.value["session_id"] == "subagent:" + job_id:
+                found = self.read(key)
+                return bool(found and found[1].background and found[1].parent_session_id == session_id)
+        return False
 
     def jobs(self) -> tuple[Mapping[str, object], ...]:
         result: list[Mapping[str, object]] = []

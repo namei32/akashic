@@ -482,6 +482,7 @@ async def react(
     capture_scope: Callable[[], RuntimeScope] | None = None,
     state: OwnerStore | None = None,
     max_parallel_calls: int = 1,
+    pending_work: Callable[[], bool] | None = None,
     check_start: StartCheck | None = None,
 ) -> Message:
     """先结算已提交调用，再读日志推理并逐条提交；没有 Turn、Attempt 或历史副本。"""
@@ -631,17 +632,26 @@ async def react(
             parts.extend(ContentPart("context.notice", notice)
                          for notice in cast(Sequence[str], prepared.get("notices", ())))
             mark("output.decoded", counts={"tool_calls": len(indices)})
+            more = bool(indices) or (pending_work is not None and pending_work())
+            if more and not indices:
+                previous = next((m.body for m in reversed(snapshot) if m.source == writer.source), None)
+                if isinstance(previous, Output) and previous.finish == "continue" and not any(
+                    isinstance(part, ToolCall) or part.kind == "model.tool_rejection" for part in previous.parts
+                ):
+                    parts.append(ContentPart("text", "\n\n执行暂停：仍有待办事项，但模型连续两步只返回了进度说明。"
+                                             "本次未取得新证据，已保留未完成事项与先前工具结果。"))
+                    more = False
             # 4. 内容完成后在窄事务内核对前提并提交；失败的草稿绝不触发工具。
             try:
                 message = await commit(
                     message_id,
-                    Output(tuple(parts), "continue" if indices else "complete"),
+                    Output(tuple(parts), "continue" if more else "complete"),
                     metadata,
                 )
             except _Superseded:
                 raise asyncio.CancelledError from None
             mark("output.committed", request_id=response.call_record_id or "", parent_operation_id=message.message_id, counts={"seq": message.seq, "tool_calls": len(indices)})
-            if not indices:
+            if not more:
                 return message
         # Loop 保留当前历史，直到下轮真实快照替换它；弱解码缓存才能复用旧消息。
         # 不再使用的准备材料与提交闭包立即释放，结束或取消时释放整个 Loop。

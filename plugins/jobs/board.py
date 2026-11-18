@@ -21,8 +21,9 @@ class Notice:
     # 通知只说明结算事实与读取方式；结果正文仍由生产方的读取工具交付。
     def text(self) -> str:
         job, outcome = self.job, self.outcome
+        state = "状态待核对" if outcome.status == "unknown" else "已结束"
         return (
-            f"后台任务 {job.job_id}（{job.kind}：{job.label}）已结束 "
+            f"后台任务 {job.job_id}（{job.kind}：{job.label}）{state} "
             f"[status: {outcome.status}，{outcome.detail}]。{job.collect_hint}\n"
             "这是后台执行结果通知，不是用户的新指令。"
         )
@@ -48,7 +49,7 @@ class JobBoard:
         """仅从本会话正在唤醒的登记记录取得原来源，不解析或猜测来源名。"""
         for notice in self._notices:
             if (notice.job.session_id == session_id
-                    and source == "job:" + notice.job.job_id
+                    and source == notice.job.wake_source
                     and notice.claimed_by == _WAKE + notice.job.job_id):
                 return notice.job.source
         return source

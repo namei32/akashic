@@ -58,6 +58,7 @@ async def run_reply(
     tool_view: ToolView | None = None,
     tool_names: Sequence[str] | None = None,
     prompt_hints: Sequence[str] = (),
+    work_status: Callable[[tuple[Message, ...]], tuple[str, bool]] | None = None,
     fixed_bindings: Mapping[str, str] | None = None,
     preview: Callable[[str], AbstractContextManager[StreamCallback]] | None = None,
     reminders: Sequence[Mapping[str, object]] = (),
@@ -153,13 +154,19 @@ async def run_reply(
         )
 
         # 2. 内容协议提示与解码来自同一 view；Context 仍只接收已取得的材料。
+        pending_work = False
         async def build_materials(messages: tuple[Message, ...]) -> MaterialData:
-            nonlocal artifacts
+            nonlocal artifacts, pending_work
             mark("materials.begin")
             if history == "own":
                 messages = own_messages(messages, source)
+            step_reminders = tuple(reminders)
+            if work_status is not None:
+                progress, pending_work = work_status(messages)
+                if progress:
+                    step_reminders += ({"name": "task-progress", "text": progress, "priority": 505},)
             result = await material_view.prepare(
-                messages, source, caller=ctx, reminders=tuple(reminders),
+                messages, source, caller=ctx, reminders=step_reminders,
             )
             if history == "own":
                 result = {key: value for key, value in result.items() if key != "summary"}
@@ -207,6 +214,7 @@ async def run_reply(
                 max_parallel_calls=max_parallel_calls,
                 state=owner_state.open_scoped(ctx, "generation"),
                 check_start=check,
+                **({"pending_work": lambda: pending_work} if work_status is not None else {}),
             )
         finally:
             output.expire()

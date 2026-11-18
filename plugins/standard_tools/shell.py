@@ -112,6 +112,7 @@ class BackgroundTarget(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     session_id: str
     source: str
+    through_seq: int | None = None
 
 
 class PreparedCommand(BaseModel):
@@ -252,7 +253,8 @@ class ShellTool:
                 if notices is None:
                     return '后台运行需要启用 jobs 插件'
             owner = background_owner
-            background = BackgroundTarget(session_id=source.messages[-1].session_id, source=background_source)
+            parent = source.messages[-1]
+            background = BackgroundTarget(session_id=parent.session_id, source=background_source, through_seq=parent.seq)
         return PreparedCommand(
             background=background, owner_key=owner, command=text, description=command.description,
             argv=shell.derive_argv(text, login=command.login), shell_kind=shell.kind.value,
@@ -327,7 +329,7 @@ class ShellTool:
         value = _result(result, command.command)
         if command.background is None or result.execution_id is None:
             return value
-        watched = self._watch(command, command.background, result.execution_id, started_at_ms)
+        watched = self._watch(command, command.background, result.execution_id, started_at_ms, key)
         notice = (
             f"已转入后台（execution_id={result.execution_id}）。完成时会通知当前会话，不要轮询；"
             "可以继续处理其他事情，需要时用 write_stdin 读取输出、task_stop 终止。"
@@ -336,7 +338,7 @@ class ShellTool:
         return ToolResultValue(value.outcome, (*value.parts, ContentPart("text", notice)))
 
     # 运行中的后台命令交给 jobs 等待结算；插件缺席时命令照常运行，只是没有完成通知。
-    def _watch(self, command: PreparedCommand, target: BackgroundTarget, execution_id: int, started_at_ms: int) -> bool:
+    def _watch(self, command: PreparedCommand, target: BackgroundTarget, execution_id: int, started_at_ms: int, key: str) -> bool:
         with self._ctx.borrow(JOB_NOTICES) as notices:
             if notices is None:
                 return False
@@ -346,6 +348,8 @@ class ShellTool:
                 collect_hint=f"需要结果时用 write_stdin(execution_id={execution_id}) 读取输出。",
                 settled=partial(_settled, self._ctx, command.owner_key, execution_id),
                 started_at_ms=started_at_ms,
+                effect_key=key,
+                through_seq=target.through_seq,
                 stop=partial(_stop_background, self._ctx, command.owner_key, execution_id),
             ))
         return True
