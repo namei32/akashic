@@ -315,6 +315,7 @@ class MessageProjection:
             wire_tool_calls=wire,
             content_refs=content_refs,
             content_transformed=content_transformed,
+            binding_id=binding_id,
         )
 
     def render(
