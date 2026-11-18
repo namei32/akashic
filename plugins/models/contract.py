@@ -166,6 +166,8 @@ class ModelRequest:
     # 本次完整展示、尚无成功展示回执的消息内容位置；不发送给 provider。
     content_refs: tuple[tuple[str, int], ...] = ()
     content_transformed: bool = False
+    # 本地历史降级标记，用于回复诊断，不发送给 provider。
+    history_recovery: bool = False
 
     @staticmethod
     def read_content_refs(value: object) -> tuple[tuple[str, int], ...]:
@@ -198,6 +200,8 @@ class ModelRequest:
         object.__setattr__(self, "content_refs", self.read_content_refs(self.content_refs))
         if type(self.content_transformed) is not bool:
             raise ValueError("内容投影标记必须是 bool")
+        if type(self.history_recovery) is not bool:
+            raise ValueError("历史恢复标记必须是 bool")
         if isinstance(self.tool_choice, Mapping):
             object.__setattr__(
                 self, "tool_choice", cast(Mapping[str, Any], freeze_json(self.tool_choice))

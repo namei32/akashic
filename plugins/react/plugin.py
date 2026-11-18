@@ -492,6 +492,7 @@ async def react(
     if reader.session_id != writer.session_id:
         raise ValueError("ReAct reader 与 writer 必须属于同一 Session")
     history = _History(writer.source, max_steps)
+    history_recovery_reported = False
     while True:
         operation_id = uuid4().hex
         mark = partial(log_timing, session_id=reader.session_id, source=writer.source, operation_id=operation_id)
@@ -630,6 +631,9 @@ async def react(
                 parts.append(ContentPart("context.summary", {"reference": summary["reference"]}))
             parts.extend(ContentPart("context.notice", notice)
                          for notice in cast(Sequence[str], prepared.get("notices", ())))
+            if request.history_recovery and not history_recovery_reported:
+                parts.append(ContentPart("context.notice",
+                    "部分历史模型调用回执不可用，已根据保存的消息和工具结果重新建立模型上下文。原调用的计费状态未知。"))
             mark("output.decoded", counts={"tool_calls": len(indices)})
             # 4. 内容完成后在窄事务内核对前提并提交；失败的草稿绝不触发工具。
             try:
@@ -640,6 +644,7 @@ async def react(
                 )
             except _Superseded:
                 raise asyncio.CancelledError from None
+            history_recovery_reported |= request.history_recovery
             mark("output.committed", request_id=response.call_record_id or "", parent_operation_id=message.message_id, counts={"seq": message.seq, "tool_calls": len(indices)})
             if not indices:
                 return message
