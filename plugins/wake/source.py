@@ -413,6 +413,8 @@ class Source:
                 or status not in {"ok", "empty", "degraded"}):
             raise ValueError("主动记忆快照结构无效")
         if request.source_policy:
+            if text and not references:
+                raise _InitiativeInvalid("memory_source_unattributed")
             # A provider may recall other sessions in the same graph. Its graph
             # scope is not consent to bypass this request's selected sources.
             catalog = ctx.require(MESSAGE_CATALOG)

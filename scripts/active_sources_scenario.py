@@ -50,6 +50,32 @@ def configure(sources, workspace):
                 "timezone": "UTC", "active_sources": POLICY})
 
 
+def instrument_boundaries(sources, workspace, provider):
+    # Keep real admission, preparation and guards; change only the returned material.
+    with (sources / provider / "initiative.py").open("a") as stream:
+        stream.write(f"""
+from pathlib import Path as _Path
+import json as _json
+_original_prepare = Initiative.prepare
+async def _fixture_prepare(self, *args, **kwargs):
+    result = await _original_prepare(self, *args, **kwargs)
+    override = _Path({str(workspace / 'fixture-recall.json')!r})
+    if override.exists():
+        return {{**result, **_json.loads(override.read_text())}}
+    return result
+Initiative.prepare = _fixture_prepare
+""")
+    with (sources / "eventmail/plugin.py").open("a") as stream:
+        stream.write(f"""
+from pathlib import Path as _Path
+_original_context = _WakeServices.active_context
+async def _observed_context(self, now):
+    _Path({str(workspace / 'eventmail-context-read')!r}).touch()
+    return await _original_context(self, now)
+_WakeServices.active_context = _observed_context
+""")
+
+
 async def scenario(provider="default_memory"):
     entered, release = asyncio.Event(), asyncio.Event()
     prompts = []
@@ -112,7 +138,7 @@ async def scenario(provider="default_memory"):
                         return
                     await asyncio.sleep(.03)
 
-        async def propose(identity, *, memory=False):
+        async def submit(identity, *, memory=False):
             entered.clear()
             release.clear()
             now = datetime.now(UTC)
@@ -122,6 +148,9 @@ async def scenario(provider="default_memory"):
             result = store.propose(identity, "1", payload, now, initiative_target=TARGET)
             assert result["inserted"] is True
             root.context.emit(DRIFT_CHANGED, None)
+
+        async def propose(identity, *, memory=False):
+            await submit(identity, memory=memory)
             await asyncio.wait_for(entered.wait(), 25)
             prompt = prompts[-1]
             assert "coffee without sugar" in prompt
@@ -148,6 +177,28 @@ async def scenario(provider="default_memory"):
         first_ids = first[-1].source_evidence[0].message_ids
         # Same real evidence is not counted twice when a second opportunity runs.
         await rpc("memory-consent", enabled=True, target=TARGET, request_id="grant", expected_version=0)
+        marker = workspace / "eventmail-context-read"
+        fixture = workspace / "fixture-recall.json"
+        fixture.write_text(json.dumps({"text": "", "references": [], "status": "empty"}))
+        await propose("empty-recall", memory=True)
+        release.set()
+        await wait_state("empty-recall", "settled")
+        assert len(notifications()) == 2
+        for identity, refs in (("outside", ["active-0", "excluded-user"]), ("unattributed", [])):
+            fixture.write_text(json.dumps({"text": "RECALL_CANARY", "references": refs, "status": "ok"}))
+            count = len(prompts)
+            target_rows = catalog.reader(TARGET["session_id"]).snapshot()
+            await submit(identity, memory=True)
+            release.set()
+            async with asyncio.timeout(25):
+                while not entered.is_set():
+                    with sqlite3.connect(database) as db:
+                        if db.execute("SELECT status FROM proposals WHERE proposal_id=?", (identity,)).fetchone() == ("invalidated",):
+                            break
+                    await asyncio.sleep(.03)
+            assert len(prompts) == count, f"{identity}: recall reached model; EventMail read={marker.exists()}"
+            assert len(notifications()) == 2 and catalog.reader(TARGET["session_id"]).snapshot() == target_rows
+        fixture.unlink()
         await propose("memory", memory=True)
         latest = [read_request(catalog.reader(sid).snapshot()) for sid in catalog.snapshot_heads(prefix="wake:")]
         assert any(r.memory_source_session == "akashic:active" and r.source_evidence[0].message_ids == first_ids for r in latest)
@@ -155,10 +206,11 @@ async def scenario(provider="default_memory"):
         await root.context.require(SESSION_ADMIN).set_deleted("akashic:active", deleted=True)
         release.set()
         await wait_state("memory", "invalidated")
-        assert len(notifications()) == 1, sent.read_text()
-        assert len(catalog.reader(TARGET["session_id"]).snapshot()) == len(before[TARGET["session_id"]]) + 1
+        assert len(notifications()) == 2, sent.read_text()
+        assert len(catalog.reader(TARGET["session_id"]).snapshot()) == len(before[TARGET["session_id"]]) + 2
         await root.context.require(SESSION_ADMIN).set_deleted("akashic:active", deleted=False)
         await propose("policy-revoked")
+        assert not marker.exists(), "auto capture called EventMail.active_context"
         # Apply a real owner configuration generation while model I/O is pending.
         current = host.read_config_input("wake")
         await host.apply_config_input("wake", "revoke-auto-sources", current["input_ref"],
@@ -169,19 +221,20 @@ async def scenario(provider="default_memory"):
             while host.read_config_update("wake", "revoke-auto-sources")["state"] != "active":
                 await asyncio.sleep(.03)
         await wait_state("policy-revoked", "invalidated")
-        assert len(notifications()) == 1, sent.read_text()
-        # Restart the real owner generation; old settled/invalidated flows cannot replay.
+        assert len(notifications()) == 2, sent.read_text()
+        # Observe the notification count at load_all return, not completion of async recovery.
         await host.terminate_all()
         from agent.plugins.manager import PluginManager
         restarted = PluginManager([workspace.parent / "sources"], workspace=workspace,
                                   installed_cache_root=workspace.parent / "home/cache")
         try:
             await restarted.load_all()
-            assert len(notifications()) == 1, sent.read_text()
+            assert len(notifications()) == 2, sent.read_text()
         finally:
             await restarted.terminate_all()
         return {"ordinary_auto_source_delivered": True, "memory_uses_selected_source": True,
-            "restart_does_not_replay_old_flows": True, "multi_day_activity_beats_one_day_burst": True,
+            "restart_load_return_no_additional_send": True, "empty_recall_allowed": True,
+            "unattributed_and_outside_blocked_before_model": True, "auto_eventmail_context_unread": True, "multi_day_activity_beats_one_day_burst": True,
             "config_revoke_during_model_blocks_publication": True,
             "background_tail_does_not_hide_user": True, "unscoped_material_excluded": True,
             "excluded_and_project_sources_hidden": True, "deletion_before_publish_blocks_send": True,
@@ -189,6 +242,7 @@ async def scenario(provider="default_memory"):
 
     def configure_provider(sources, workspace):
         configure(sources, workspace)
+        instrument_boundaries(sources, workspace, provider)
         if provider == "akasha":
             save_config(workspace / "plugin-data/akasha-builtin", {"memory_enabled": True})
             save_config(workspace / "plugin-data/default_memory-builtin", {"enabled": False})
