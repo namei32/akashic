@@ -42,6 +42,7 @@ class OrderedReact(Protocol):
         state: OwnerStore,
         check_start: StartCheck,
         max_parallel_calls: int = 1,
+        pending_work: Callable[[], bool] | None = None,
     ) -> Message: ...
 
 

@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Literal, Protocol
 
 from agent.plugin_composition import ServiceKey
 
-JobStatus = Literal["completed", "failed", "timeout", "killed"]
-JobSnapshotStatus = Literal["running", "stopping", "completed", "failed", "timeout", "killed"]
+JobStatus = Literal["completed", "failed", "timeout", "killed", "unknown"]
+JobSnapshotStatus = Literal["running", "stopping", "completed", "failed", "timeout", "killed", "unknown"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,14 @@ class JobWatch:
     started_at_ms: int | None = None
     # 生产方提供的停止入口，供用户在界面上终止；返回 False 表示任务已不在运行。缺席时界面不提供停止。
     stop: Callable[[], Awaitable[bool]] | None = None
+    # A process handle can be reused after restart. Producers may supply the stable tool-call key.
+    effect_key: str = ""
+    through_seq: int | None = None
+
+    @property
+    def wake_source(self) -> str:
+        suffix = "@" + sha256(self.effect_key.encode()).hexdigest() if self.effect_key else ""
+        return "job:" + self.job_id + suffix
 
 
 # 前端只读镜像的一行；时间均为 epoch 毫秒。
@@ -71,3 +80,4 @@ class JobNotices(Protocol):
 
 
 JOB_NOTICES = ServiceKey[JobNotices]("jobs.notices.v1")
+JOB_WAITING = ServiceKey[Callable[[str, str], bool]]("jobs.waiting.v1")

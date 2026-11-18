@@ -228,7 +228,7 @@ class Control:
                 source=notices.origin_source(session, str(prepared["parent_source"])),
                 job_id="codex-" + turn_id, kind="codex", label="Windows Codex 任务状态",
                 collect_hint=f"用 codex_control(action='read', thread_id='{thread_id}') 读取实际结果。",
-                settled=settled))
+                settled=settled, through_seq=int(str(prepared["parent_seq"]))))
             return True
 
 
