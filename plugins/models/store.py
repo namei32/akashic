@@ -39,6 +39,7 @@ from .settings import (
     RemoveModel,
     UpdateConnection,
     UpdateModel,
+    ExtendModelReasoningEfforts,
 )
 from plugins.models.contract import (
     LLMResponse,
@@ -900,6 +901,45 @@ class ModelsStore:
             return True
 
         return self._domain_write(command.expected_revision, "update-model", write)
+
+    def extend_model_reasoning_efforts(self, command: ExtendModelReasoningEfforts) -> int:
+        model_id = _required(command.model_id, "model_id")
+        if not 1 <= len(command.efforts) <= 16 or any(
+            not isinstance(effort, str) or not effort or len(effort) > 32
+            or not effort.isascii() or not effort[0].isalpha()
+            or not effort.replace("_", "").replace("-", "").isalnum()
+            for effort in command.efforts
+        ):
+            raise ValueError("reasoning efforts must be 1 to 16 short identifiers")
+
+        def write(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                "SELECT capabilities_json FROM model_definitions WHERE id = ?",
+                (model_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"chat model does not exist: {model_id}")
+            raw = row["capabilities_json"]
+            decoded = _decode_model_payload(raw, f"model {model_id}")
+            if decoded is None or decoded[3] != "manual":
+                raise ValueError("only manually configured chat models support declaring additional efforts")
+            capabilities, _, _, _ = decoded
+            current = capabilities.supported_reasoning_efforts
+            efforts = tuple(dict.fromkeys((*current, *command.efforts)))
+            if efforts == current:
+                return False
+            payload = json.loads(raw)
+            payload["capabilities"]["supported_reasoning_efforts"] = efforts
+            payload["capability_sources"]["reasoning_efforts"] = "user"
+            connection.execute(
+                "UPDATE model_definitions SET supported_reasoning_efforts = ?, capabilities_json = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (_strict_json(efforts, "model reasoning efforts"),
+                 _strict_json(payload, "model capabilities"), model_id),
+            )
+            return True
+
+        return self._domain_write(command.expected_revision, "extend-model-reasoning-efforts", write)
 
     def set_default(self, command: SetDefaultModel) -> int:
         """Set one chat role or the workspace default embedding model."""

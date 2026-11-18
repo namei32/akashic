@@ -101,6 +101,7 @@ from .settings import (
     SyncModels,
     UpdateConnection,
     UpdateModel,
+    ExtendModelReasoningEfforts,
     VerifyModel,
 )
 from .store import (
@@ -1588,6 +1589,8 @@ class ModelsState:
             if model.kind != 'chat':
                 raise ModelUnavailableError("向量模型的参数由试算维度决定，不支持手动编辑。").exception()
             revision = self.store.update_model(command)
+        elif isinstance(command, ExtendModelReasoningEfforts):
+            revision = self.store.extend_model_reasoning_efforts(command)
         elif isinstance(command, SetDefaultModel):
             if command.verify_embedding:
                 if command.role is not None:
