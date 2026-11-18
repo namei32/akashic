@@ -195,11 +195,11 @@ class Runtime:
         )
         names = (*WAKE_TOOLS[owner], *(ref.name for ref in view.refs
                  if ref.name in allowed and ref.name not in WAKE_TOOLS[owner]))
-        events = tuple(dict(item) for item in (await ctx.require(EVENTMAIL_WAKE).active_context(now)))
+        auto_sources = owner == "drift" and self.config.active_sources.enabled
+        events = () if auto_sources else tuple(dict(item) for item in await ctx.require(EVENTMAIL_WAKE).active_context(now))
         proposal = propose_drift(admission.proposals) if owner == "drift" else None
         memory_assisted = proposal is not None and proposal.payload.get("memory_assisted") is True
         memory_query, memory_blocked, source_seq = "", "", None
-        auto_sources = owner == "drift" and self.config.active_sources.enabled
         history = ""
         if memory_assisted and not auto_sources:
             with ctx.borrow(DELIVERY_SCOPED_READ) as scoped:
@@ -230,7 +230,6 @@ class Runtime:
                 memory_query = queries[memory_source_session]
                 source_seq = source_evidence[0].through_seq
                 memory_blocked = "" if memory_blocked == "no_user_input" else memory_blocked
-            events = ()  # Unscoped EventMail Context must not broaden the source policy.
             # Source evidence is archived separately; never truncate the JSON document.
             history = json.dumps({"recent_conversation": passive, "delivered_messages": []}, ensure_ascii=False)
         return Request(
