@@ -269,6 +269,8 @@ Source body-kind reads also use `message_source_kind_seq` on Session, source, `j
 
 ## Shell 自部署
 
+### Docker
+
 Docker 默认执行 `gateway`；AppRuntime 拥有 Web Shell、readiness 和关闭顺序，
 Docker init 负责回收子进程，systemd 负责服务生命周期。原生直接运行模式仍使用 Supervisor。
 首次启用需由部署者用既有安装流程启动支持 [0091](../decisions/0091-shell-self-deployment.md)
@@ -319,3 +321,35 @@ Docker socket 的 privileged systemd 容器。虚拟机内先完成正式初始�
 新 boot/commit、原消息全文与顺序、下一回合和默认组合的 Skill 可见性。
 更新全程核对无关服务 PID、重启次数、容器身份、机器 boot 及连续心跳。
 外部 HTTP 模型响应受控；这证明执行协议，不证明真实模型总会遵守最后一次调用要求。
+
+### 原生 WSL
+
+WSL 复用 Shell 的调用身份、送达凭据、排空与正常关闭回执。宿主用独立 systemd 用户任务完成发布。Core 仍以普通用户和原生 Supervisor 运行。
+
+部署者首次在固定的宿主 checkout 安装 `akashic-release`，使它用宿主 Python 环境运行 `scripts.akashic_release.cli`。配置 `/etc/akashic/wsl-release.json`，由 root 持有并禁止组及其他用户写入。
+
+```json
+{
+  "root": "/home/namei/.local/state/akashic-wsl-release",
+  "state": "/home/namei/.akashic",
+  "repository": "/home/namei/akashic",
+  "unit": "akashic.service",
+  "port": 2236
+}
+```
+
+创建独立发布目录，保持 systemd 用户管理器持续运行。系统服务复用 `/usr/local/libexec/akashic-wsl-service` 的固定状态、启动和带 invocation ID 的停止权限。启动失败进入 `failed` 时，允许宿主为这一个服务执行 `sudo -n /usr/bin/systemctl reset-failed akashic.service`。这项权限由部署者按需配置。
+
+现有实例先用 `akashic-release wsl register --adopt --distribution DIR --core DIR --python PATH` 登记实际运行的发行制品，再把固定 unit 的 `ExecStart` 指向 `akashic-release wsl launch`。固定启动入口和发布配置由部署者维护，不能设置 `User=root`。隔离实例可用独立的 `--profile`、`akashic-wsl-*.service` 用户服务、全新的 state/HOME 和独立端口。
+
+日常在配置仓库取回用户确认的提交后，通过 `wsl prepare --commit SHA` 构建。只有兼容的外置插件更新时，使用 `wsl plugin-install --source SOURCE --ref SHA` 和 `wsl plugin-status UPDATE_ID`，由现有网关负责安装与激活。发行版或混合改动用 `wsl submit --commit SHA`，混合改动同时指定 `--plan` 和 `--inputs`。清单使用上文的格式。独立宿主重新核对当前 Root 和已经确认的清单，使用同一个安装器发布。任务回执由 `wsl status REQUEST_ID` 查询。
+
+停止后，启动入口会暂时阻止新进程读到未结算的组合。有完整发布回执时，用 `wsl resume REQUEST_ID` 继续启动和验收。回到旧版本时先确认旧代码和旧插件都能读取当前数据，再执行 `wsl rollback REQUEST_ID --compatible-data`。旧外置制品与旧发行版一同发布。回执缺失且实际 Root 已变化时，先核对发布指针和迁移账本。数据库恢复与向前修复仍按对应数据 owner 的合同执行。
+
+在 WSL 用户 systemd 和项目 Python 环境中运行隔离验收，参数为已构建发行制品的 `wheels/` 目录。
+
+```sh
+.venv/bin/python scripts/verify_wsl_self_deploy.py /path/to/distribution/wheels
+```
+
+该脚本创建独立服务、状态目录和端口，通过实际网关和安装器验收外置热更新、内置发布、混合发布及失败恢复。使用受控模型回复触发真实 Shell 调用，并从原频道读到回复后继续等待宿主完成。运行证据目录会在开头输出。

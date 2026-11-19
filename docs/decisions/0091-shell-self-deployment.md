@@ -5,6 +5,8 @@
 - 关联：RUN-004、RUN-013、SH-003、STA-002、MIG
 - 范围：Docker 生产路径；直接 Python 的 Supervisor 入口保留。
 
+原生 WSL 的发布入口复用下文 Shell 接单和 Core 停机协议，宿主负责 WSL 服务与制品切换。操作细节见[部署手册的原生 WSL 章节](../design/operator-deployment.md#原生-wsl)。
+
 ## 决定与理由
 
 用户要求不用新模型工具，让 Agent 通过 Shell 完成检查、合并和提交，然后正常回复并结束。
