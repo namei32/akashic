@@ -273,7 +273,8 @@ class Host:
                     raise RuntimeError("运行的源码或 Root 不符")
                 snapshot = self.rpc("plugin/status", {}, timeout=3)
                 if snapshot["selection_ref"] != root or any(
-                    row.get("enabled") is True and (row.get("state") != "active"
+                    row.get("enabled") is True and row.get("selected_ref") is not None
+                    and (row.get("state") != "active"
                     or row.get("input_ref") != row.get("selected_ref")) for row in snapshot["plugins"]
                 ):
                     raise RuntimeError("选中插件尚未全部激活")
