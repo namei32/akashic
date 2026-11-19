@@ -23,6 +23,7 @@ from ._boundary import (  # noqa: F401 - 显式再导出给本插件消费者。
     SinkValue,
 )
 from .api import DeliveryTarget
+from .active_sources import SourceEvidence
 
 Owner = Literal["content", "drift", "alert"]
 Stage = Literal["screen", "investigate", "drift", "alert"]
@@ -65,9 +66,20 @@ class Request(BaseModel):
     memory_query: str = Field(default="", max_length=800)
     memory_source_seq: int | None = Field(default=None, ge=-1)
     memory_blocked: str = ""
+    source_policy: str = ""
+    source_config_revision: str = ""
+    source_evidence: tuple[SourceEvidence, ...] = ()
+    source_rejections: tuple[dict[str, str], ...] = Field(default=(), max_length=20)
+    memory_source_session: str = ""
 
     @model_validator(mode="after")
     def check_choices(self) -> Self:
+        if self.source_policy or self.source_evidence or self.memory_source_session or self.source_config_revision:
+            if (self.owner != "drift" or not self.source_policy or not self.source_config_revision
+                    or len(self.source_evidence) > 3
+                    or (self.memory_assisted and self.source_evidence and self.memory_source_session != self.source_evidence[0].session_id)
+                    or (not self.memory_assisted and self.memory_source_session)):
+                raise ValueError("自动来源必须固定 Drift 的授权与实际证据")
         if self.memory_assisted and self.owner != "drift":
             raise ValueError("只有 Drift 职责可以使用主动记忆")
         if not self.memory_assisted and (self.memory_query or self.memory_source_seq is not None or self.memory_blocked):

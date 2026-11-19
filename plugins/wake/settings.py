@@ -21,6 +21,7 @@ from plugins.akasha.contract import SEMANTIC_INTEREST
 from plugins.ledger.contract import Input
 from plugins.gateway.contract import RpcMethod
 from .contract import WAKE_MEMORY_READY
+from .active_sources import SourcePolicy
 
 SETTINGS = ServiceKey[Configuration]("wake.settings.v1")
 
@@ -91,12 +92,12 @@ class Settings:
             return {**self.ctx.require(PLUGIN_CONFIG).read(self.ctx), "enabled": enabled,
                 "ready": enabled is True and not reason and self.function.state.value == "active",
                 "can_enable": can_enable, "blocked": blocked, "reason": reason or fiber["error"] or "",
-                "values": {"delivery": config["delivery"], "timezone": config["timezone"]}, "targets": self.targets()}
+                "values": {"delivery": config["delivery"], "timezone": config["timezone"], "active_sources": config["active_sources"]}, "targets": self.targets()}
 
     async def save(self, request_id: str, expected_input: str, values: dict[str, object]) -> dict[str, object]:
         """只接受用户决定与本插件字段，启用前重新核对前置。"""
         async with self.ctx.runtime_scope():
-            if set(values) - {"enabled", "delivery", "timezone"} or type(values.get("enabled")) is not bool:
+            if set(values) - {"enabled", "delivery", "timezone", "active_sources"} or type(values.get("enabled")) is not bool:
                 raise ValueError("配置字段无效，请选择开启或关闭")
             current = await self.read()
             if values["enabled"] and not current["can_enable"]:
@@ -106,6 +107,11 @@ class Settings:
                 choices = [{key: value for key, value in item.items() if key != "label"} for item in self.targets()]
                 if target not in choices:
                     raise ValueError("请选择现有对话的可用发送目标")
+            if "active_sources" in values:
+                previous = SourcePolicy.model_validate(self.ctx.config.get("active_sources", {}))
+                desired = SourcePolicy.model_validate(values["active_sources"])
+                if desired != previous and desired.revision <= previous.revision:
+                    raise ValueError("来源授权变化必须递增 revision，撤销后不能复用旧版本")
             config = self.model.model_validate({**self.ctx.config, **values}).model_dump()
             return await self.ctx.require(PLUGIN_CONFIG).apply(self.ctx, request_id=request_id,
                 expected_input=expected_input, config=config)

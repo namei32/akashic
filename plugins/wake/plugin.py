@@ -226,6 +226,8 @@ async def apply(ctx: Context) -> None:
         ctx.entrypoint(lambda session, message: catalog.reader(session).get(message)), delivery_status)
     await ctx.provide(WAKE_DASHBOARD, lambda: dashboard)
     dependencies = function_inject + (() if config.delivery is None else (SenderDefinition.key(config.delivery.channel),))
+    if config.active_sources.enabled:
+        dependencies += (PLUGIN_CONFIG,)
     async def worker(child: Context):
         await start_function(child)
     function = await ctx.inject(dependencies, worker, name="function")
