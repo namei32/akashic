@@ -177,6 +177,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["wsl"]:
+        from scripts.akashic_release.wsl import main as wsl_main
+
+        return wsl_main(sys.argv[2:])
     args = _parser().parse_args()
     result = args.handler(args)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
