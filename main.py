@@ -542,43 +542,46 @@ async def serve(config_path: str, workspace: Path) -> int:
             runtime_task is not None and not runtime_task.done()
         )
     finally:
-        for sig in registered_signal_handlers:
-            _ = loop.remove_signal_handler(sig)
-        for sig, previous_handler in fallback_signal_handlers.items():
-            _ = signal.signal(sig, previous_handler)
-        if restart_signal_registered:
-            _ = loop.remove_signal_handler(signal.SIGUSR2)
-        if stop_task is not None:
-            stop_error, caller_cancel = await _settle_owned_task(
-                stop_task,
-                request_cancel=True,
-            )
-            deferred_cancellation = caller_cancel or deferred_cancellation
-            _record_error(stop_error)
-        if restart_task is not None:
-            restart_error, caller_cancel = await _settle_owned_task(
-                restart_task,
-                request_cancel=True,
-            )
-            deferred_cancellation = caller_cancel or deferred_cancellation
-            _record_error(restart_error)
-        if settings_restart_task is not None:
-            settings_error, caller_cancel = await _settle_owned_task(
-                settings_restart_task,
-                request_cancel=True,
-            )
-            deferred_cancellation = caller_cancel or deferred_cancellation
-            _record_error(settings_error)
-        if restart_commit_error:
-            _record_error(restart_commit_error[0])
-        if runtime_task is not None:
-            runtime_error, caller_cancel = await _settle_owned_task(
-                runtime_task,
-                request_cancel=runtime_cancel_requested,
-            )
-            deferred_cancellation = caller_cancel or deferred_cancellation
-            _record_error(runtime_error)
-        _record_error(deferred_cancellation)
+        try:
+            if stop_task is not None:
+                stop_error, caller_cancel = await _settle_owned_task(
+                    stop_task,
+                    request_cancel=True,
+                )
+                deferred_cancellation = caller_cancel or deferred_cancellation
+                _record_error(stop_error)
+            if restart_task is not None:
+                restart_error, caller_cancel = await _settle_owned_task(
+                    restart_task,
+                    request_cancel=True,
+                )
+                deferred_cancellation = caller_cancel or deferred_cancellation
+                _record_error(restart_error)
+            if settings_restart_task is not None:
+                settings_error, caller_cancel = await _settle_owned_task(
+                    settings_restart_task,
+                    request_cancel=True,
+                )
+                deferred_cancellation = caller_cancel or deferred_cancellation
+                _record_error(settings_error)
+            if restart_commit_error:
+                _record_error(restart_commit_error[0])
+            if runtime_task is not None:
+                runtime_error, caller_cancel = await _settle_owned_task(
+                    runtime_task,
+                    request_cancel=runtime_cancel_requested,
+                )
+                deferred_cancellation = caller_cancel or deferred_cancellation
+                _record_error(runtime_error)
+            _record_error(deferred_cancellation)
+        finally:
+            # Guardian may resend SIGTERM before Gateway writes its close receipt.
+            for sig in registered_signal_handlers:
+                _ = loop.remove_signal_handler(sig)
+            for sig, previous_handler in fallback_signal_handlers.items():
+                _ = signal.signal(sig, previous_handler)
+            if restart_signal_registered:
+                _ = loop.remove_signal_handler(signal.SIGUSR2)
     if primary_error is not None:
         raise primary_error
     return result

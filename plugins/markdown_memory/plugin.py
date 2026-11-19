@@ -803,7 +803,8 @@ async def apply(ctx: Context) -> None:
         watcher = await ctx.spawn(follow(ctx.require(MESSAGE_CATALOG)), name="markdown-memory")
 
     async def stop(_event: object) -> None:
-        if watcher is not None:
+        # The Fiber already recorded any failure from a finished watcher.
+        if watcher is not None and not watcher.done():
             _ = watcher.cancel()
             try:
                 await watcher
