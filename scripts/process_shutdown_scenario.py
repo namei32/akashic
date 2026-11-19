@@ -45,6 +45,12 @@ async def apply(ctx):
                 print("ADMISSION_CLOSED", flush=True)
             else:
                 raise AssertionError("停止后仍接纳新工作")
+        except asyncio.CancelledError:
+            cleanup_fd = os.environ.get("SCENARIO_CLEANUP_FD")
+            if cleanup_fd is not None:
+                os.write(int(cleanup_fd), b"1")
+                await reader.readline()
+            raise
         finally:
             transport.close()
     await ctx.spawn(read_intent(), name="native-intent")
@@ -54,24 +60,35 @@ async def apply(ctx):
 async def stop_ready_process(
     config: Path, workspace: Path, peer_workspace: Path, env: dict[str, str],
 ) -> None:
-    """通过真实就绪管道协调 SIGTERM，核对取消后的关闭回执。"""
+    """在真实插件清理期间重复送 SIGTERM，核对关闭回执。"""
     # 1. 使用宿主生命周期管道等待完整启动，避免按时间猜测就绪。
     read_fd, write_fd = os.pipe()
     reader = asyncio.StreamReader()
     transport, _ = await asyncio.get_running_loop().connect_read_pipe(
         lambda: asyncio.StreamReaderProtocol(reader), os.fdopen(read_fd, "rb"))
+    cleanup_read_fd, cleanup_write_fd = os.pipe()
+    cleanup_reader = asyncio.StreamReader()
+    cleanup_transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(cleanup_reader), os.fdopen(cleanup_read_fd, "rb"))
     boot_id = uuid4().hex
     # 日志写入文件，避免等待就绪或退出时填满无人读取的管道。
-    with closing(transport), tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as error:
+    with (
+        closing(transport),
+        closing(cleanup_transport),
+        tempfile.TemporaryFile() as output,
+        tempfile.TemporaryFile() as error,
+    ):
         try:
             process = await asyncio.create_subprocess_exec(
                 sys.executable, str(ROOT / "main.py"), "gateway", "--config", str(config),
-                "--workspace", str(workspace), pass_fds=(write_fd,),
+                "--workspace", str(workspace), pass_fds=(write_fd, cleanup_write_fd),
                 env={**env, "AKASHIC_SUPERVISED": "1", "AKASHIC_BOOT_ID": boot_id,
-                     "AKASHIC_RESTART_NONCE": uuid4().hex, "AKASHIC_LIFECYCLE_FD": str(write_fd)},
+                     "AKASHIC_RESTART_NONCE": uuid4().hex, "AKASHIC_LIFECYCLE_FD": str(write_fd),
+                     "SCENARIO_CLEANUP_FD": str(cleanup_write_fd)},
                 stdin=asyncio.subprocess.PIPE, stdout=output, stderr=error)
         finally:
             os.close(write_fd)
+            os.close(cleanup_write_fd)
         try:
             async with asyncio.timeout(20):
                 while True:
@@ -96,12 +113,17 @@ async def stop_ready_process(
                         contender.kill()
                         await contender.communicate()
                 assert (workspace / ".runtime-ready.json").exists()
-            # 3. 保持输入管道打开，确保退出来自 SIGTERM，而不是输入 EOF。
+            # 3. 等插件进入清理后重发 SIGTERM，再释放其清理步骤。
             process.send_signal(signal.SIGTERM)
+            assert await asyncio.wait_for(cleanup_reader.readexactly(1), 20) == b"1"
+            process.send_signal(signal.SIGTERM)
+            assert process.stdin is not None
+            process.stdin.write(b"\n")
+            await process.stdin.drain()
             await asyncio.wait_for(process.wait(), 20)
             output.seek(0)
             error.seek(0)
-            assert process.returncode == 0, (output.read(), error.read())
+            assert process.returncode == 0, (process.returncode, output.read()[-4096:], error.read()[-4096:])
             assert not (workspace / ".runtime-ready.json").exists()
             closed = json.loads((workspace / "runtime/closed" / f"{boot_id}.json").read_text())
             assert closed["state"] == "closed" and closed["pid"] == process.pid
@@ -171,7 +193,8 @@ async def run(base: Path) -> dict[str, bool]:
     return {"native_process_stop": True, "admission_closed": True,
             "failure_exit_and_visible_reason": True, "eof_exit_zero": True,
             "restart_after_failure": True, "messages_preserved": True,
-            "sigterm_after_ready": True, "readiness_cleared_and_closed": True,
+            "sigterm_after_ready": True, "repeated_sigterm_during_cleanup": True,
+            "readiness_cleared_and_closed": True,
             "workspace_conflict_rejected": True, "publication_conflict_rejected": True}
 
 
