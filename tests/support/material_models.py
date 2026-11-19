@@ -23,7 +23,7 @@ from plugins.models.contract import (
     EmbeddingSpaceDescriptor,
     ModelCapabilities,
 )
-from plugins.models.contract import EMBEDDINGS
+from plugins.models.contract import EMBEDDINGS, MODEL_CATALOG
 from plugins.models.contract import (
     CHAT_MODELS,
     MODEL_DRIVERS,
@@ -244,6 +244,7 @@ async def material_models(
         _ = await ctx.provide(CHAT_MODELS, state.chat_models)
         _ = await ctx.provide(EMBEDDINGS, state.embeddings)
         _ = await ctx.provide(MODEL_SETTINGS, state.settings)
+        _ = await ctx.provide(MODEL_CATALOG, state.catalog)
 
     async def mount_driver(ctx) -> None:
         _ = await ctx.require(MODEL_DRIVERS).register(ctx, driver.definition())

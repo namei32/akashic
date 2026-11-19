@@ -78,6 +78,15 @@ class UpdateModel:
 
 
 @dataclass(frozen=True, slots=True)
+class ExtendModelReasoningEfforts:
+    """Add declared efforts to a manually configured chat model without rebinding it."""
+
+    expected_revision: int
+    model_id: str
+    efforts: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class RemoveModel:
     """移除模型选择，后续聊天引用跟随默认模型；历史事实不变。"""
 
@@ -132,6 +141,7 @@ ModelChange: TypeAlias = (
     | AddModel
     | VerifyModel
     | UpdateModel
+    | ExtendModelReasoningEfforts
     | RemoveModel
     | SetDefaultModel
     | SyncModels

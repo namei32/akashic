@@ -48,6 +48,7 @@ from .settings import (
     CancelConnectionAuth,
     CreateConnectionWithModel,
     DisableConnection,
+    ExtendModelReasoningEfforts,
     FinishConnectionAuth,
     ModelChange,
     MODEL_SETTINGS,
@@ -260,6 +261,13 @@ class UpdateModelPayload(_Payload):
     image_input: bool
 
 
+class ExtendModelReasoningEffortsPayload(_Payload):
+    type: Literal["extend_model_reasoning_efforts"]
+    expected_revision: int = Field(ge=0)
+    model_id: str = Field(min_length=1, max_length=128)
+    efforts: list[str] = Field(min_length=1, max_length=16)
+
+
 class SyncModelsPayload(_Payload):
     type: Literal["sync_models"]
     expected_revision: int = Field(ge=0)
@@ -298,6 +306,7 @@ CommandPayload = Annotated[
     | VerifyModelPayload
     | RemoveModelPayload
     | UpdateModelPayload
+    | ExtendModelReasoningEffortsPayload
     | SetDefaultPayload
     | SyncModelsPayload
     | StartAuthPayload
@@ -547,6 +556,8 @@ def _command(payload: CommandPayload) -> ModelChange:
             max_output_tokens=payload.max_output_tokens,
             image_input=payload.image_input,
         )
+    if isinstance(payload, ExtendModelReasoningEffortsPayload):
+        return ExtendModelReasoningEfforts(payload.expected_revision, payload.model_id, tuple(payload.efforts))
     if isinstance(payload, SetDefaultPayload):
         return SetDefaultModel(
             payload.expected_revision,
