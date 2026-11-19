@@ -9,7 +9,7 @@ type Snapshot = {
   control: { paused: boolean; control_version: number };
   consent: { enabled: boolean; target: Target | null; consent_version: number };
   config: { input_ref: string; producer: Producer };
-  wake: { enabled: boolean | null; ready: boolean; reason: string; values: { delivery: Target | null; timezone: string };
+  wake: { enabled: boolean | null; ready: boolean; reason: string; values: { delivery: Target | null; timezone: string; active_sources?: {enabled: boolean; window_days: number; max_sessions: number} };
     targets?: (Target & { label: string })[] };
   memory_ready: boolean;
   latest: { outcome: string; fired_at: string; memory_status: string | null; delivery_status: string | null; reason: string | null } | null;
@@ -176,7 +176,8 @@ export function InitiativePage({ctx}: {ctx: WebHostContextV1}) {
     {!data ? <p role="status">{error ? "主动联系状态暂不可用。" : "正在读取主动联系状态…"}</p> : <>
       <section aria-labelledby="initiative-target"><div className="initiative-section-heading"><div><h2 id="initiative-target">联系目标与记忆授权</h2>
         <p>当前目标：<strong>{targetName}</strong></p></div><span className="initiative-state">{authorized ? "已授权" : "未授权"}</span></div>
-        <p>授权后，可将这个对话的近期内容和所属范围内召回的记忆交给模型，判断是否主动联系；材料可能保存在内部执行记录中，消息会发往上面的目标。</p>
+        <p>授权后，可将聊天依据会话的近期内容和所属范围内召回的记忆交给模型，判断是否主动联系。
+          默认只使用目标会话；使用其他会话还须单独开启下方说明的自动取材。材料可能保存在内部执行记录中，消息仍发往上面的目标。</p>
         {data.consent.enabled && !authorized && <p className="initiative-hint">已有授权属于其他目标。更换目标不会自动转移授权。</p>}
         {data.wake.enabled !== true && <p className="initiative-hint">请先在功能设置中启用 Wake 并保存接收目标。</p>}
         {data.wake.enabled === true && !data.wake.ready && data.wake.reason && <p className="initiative-hint">{data.wake.reason}</p>}
@@ -187,6 +188,12 @@ export function InitiativePage({ctx}: {ctx: WebHostContextV1}) {
           {data.consent.enabled && <button type="button" disabled={stale || !!pending.revoke || !!busy.revoke}
             onClick={() => create("revoke", "memory-consent", {enabled: false, expected_version: data.consent.consent_version})}>撤销记忆授权</button>}
         </div>
+      </section>
+      <section aria-labelledby="initiative-sources"><h2 id="initiative-sources">聊天依据</h2>
+        <p>{data.wake.values.active_sources?.enabled
+          ? `已开启按用户活跃度取材：最近 ${data.wake.values.active_sources.window_days} 天，每次最多 ${data.wake.values.active_sources.max_sessions} 个同范围私人 Web 会话。`
+          : "自动会话取材未开启，仅以接收目标会话为聊天依据。"}</p>
+        <p className="initiative-footnote">在“功能设置 → 主动联系设置”中更改开关、排除或优先会话；不会改变消息发送目标。记忆使用仍需单独授权。</p>
       </section>
       <section aria-labelledby="initiative-schedule"><div className="initiative-section-heading"><div><h2 id="initiative-schedule">定时机会</h2>
         <p>按目标对话的时区 {data.wake.values.timezone || "系统时区"} 计算。停机期间错过的机会不会补发。</p></div>

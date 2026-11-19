@@ -28,8 +28,14 @@
 归档请求失效，不重新选择来源。跨 owner 检查不构成 Session 删除与发布的全局
 事务，也不能撤回已经开始的外部效果。缺少用户证据可安静结束；provider、存储
 或解析故障不得伪装成无话可说。配置的正式采用仍走宿主流程，不直接修改文件。
-隔离验收入口为 `scripts/active_sources_scenario.py --provider akasha`；旧合同回归入口
-为 `scripts/drift_memory_wake_scenario.py --provider akasha`。代码及场景不代表正式部署。
+前端入口为“功能设置 → 主动联系设置”：独立默认关闭的开关、统计窗口与来源数量、
+逐会话自动/优先/排除选择，均通过 Wake 既有配置回执生效；关闭时保留来源选项并
+递增授权版本。“主动联系”页只显示当前聊天依据，不另存一套策略。
+隔离后端验收入口为 `scripts/active_sources_scenario.py --provider akasha`；前端真实
+浏览器到配置换代及 Drift 取材验收为 `scripts/active_sources_ui_scenario.py --output
+<私有目录> --chromium <浏览器路径>`。旧合同回归入口为
+`scripts/drift_memory_wake_scenario.py --provider akasha`。本地固定模型只验证链路，
+不证明真实模型的自然交流效果；代码及场景不代表正式部署。
 
 ## 1. 目标与目前的差距
 
