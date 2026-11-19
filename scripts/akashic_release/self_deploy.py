@@ -123,17 +123,19 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
-async def _arm_stop(request: dict[str, Any], current: dict[str, str]) -> None:
-    """返回接单前保留同一调用的最终送达凭据。"""
+async def stop_rpc(workspace: Path, method: str, params: dict[str, Any]) -> Any:
     from akashic_sdk import AsyncAkashic
     from plugins.gateway.cli import find_endpoint, read_token
 
-    workspace = Path(current["AKASHIC_WORKSPACE"])
     endpoint = find_endpoint(workspace)
     async with await AsyncAkashic.connect(endpoint, workspace_token=read_token(workspace, endpoint)) as client:
-        await client.request(
-            "runtime/prepare-stop", {**request["stop"], "arm_only": True}
-        )
+        return await client.request(method, params)
+
+
+async def _arm_stop(request: dict[str, Any], current: dict[str, str]) -> None:
+    """返回接单前保留同一调用的最终送达凭据。"""
+    await stop_rpc(Path(current["AKASHIC_WORKSPACE"]), "runtime/prepare-stop",
+                   {**request["stop"], "arm_only": True})
 
 
 async def _prepare_stop(
