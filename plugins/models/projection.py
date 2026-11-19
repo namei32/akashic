@@ -55,8 +55,9 @@ def response_facts(
     wire_tool_calls: Mapping[str, Mapping[str, object]] = {},
     content_refs: tuple[tuple[str, int], ...] = (),
     content_transformed: bool = False,
+    binding_id: str | None = None,
 ) -> ContentPart:
-    """只保存调用账指针与协议重放所需事实，计费数据仍由 Model store 拥有。"""
+    """保存协议重放所需事实，计费数据仍由 ModelsStore 拥有。"""
     if response.call_record_id is None:
         raise ValueError("模型响应尚未结算调用记录")
     indices = tuple(call_indices)
@@ -88,6 +89,12 @@ def response_facts(
         facts["content_refs"] = content_refs
     if content_transformed:
         facts["content_transformed"] = True
+    if binding_id is not None:
+        facts["replay"] = {
+            "version": 1,
+            "binding_id": binding_id,
+            "provider_metadata": None if content_transformed else response.provider_metadata,
+        }
     if reminder_input_id is not None:
         if not reminder_input_id:
             raise ValueError("reminder Input 身份不能为空")
@@ -120,7 +127,9 @@ def check_facts(part: ContentPart) -> ContentReferences:
     old_fields = {"call_record_id", "tool_ids", "thinking", "continuation"}
     new_fields = old_fields | {"wire_tool_calls", "reminder"}
     reminder_identity_fields = {"reminder_input_id", "reminder_sha256"}
-    if set(value) - {"content_refs", "content_transformed"} not in (old_fields, new_fields, new_fields | reminder_identity_fields):
+    if set(value) - {"content_refs", "content_transformed", "replay"} not in (
+        old_fields, new_fields, new_fields | reminder_identity_fields,
+    ):
         raise ValueError("model.facts 字段无效")
     if not isinstance(value["call_record_id"], str) or not value["call_record_id"]:
         raise ValueError("model.facts 缺少调用记录")
@@ -128,6 +137,19 @@ def check_facts(part: ContentPart) -> ContentReferences:
         _ = ModelRequest.read_content_refs(value["content_refs"])
     if "content_transformed" in value and type(value["content_transformed"]) is not bool:
         raise ValueError("内容投影标记必须是 bool")
+    replay = None
+    if "replay" in value:
+        replay = value["replay"]
+        if (
+            not isinstance(replay, Mapping)
+            or set(replay) != {"version", "binding_id", "provider_metadata"}
+            or type(replay["version"]) is not int
+            or replay["version"] != 1
+            or not isinstance(replay["binding_id"], str)
+            or not replay["binding_id"]
+            or (replay["provider_metadata"] is not None and not isinstance(replay["provider_metadata"], Mapping))
+        ):
+            raise ValueError("模型历史重放数据无效")
     ids = value["tool_ids"]
     if not isinstance(ids, Mapping):
         raise ValueError("模型工具 ID 必须按 Output 位置记录")
@@ -186,6 +208,8 @@ def check_facts(part: ContentPart) -> ContentReferences:
             or not isinstance(continuation["payload"], Mapping)
         ):
             raise ValueError("模型 continuation 无效")
+        if replay is not None and continuation["binding_id"] != replay["binding_id"]:
+            raise ValueError("continuation 不属于记录中的模型")
     return ContentReferences()
 
 
@@ -277,7 +301,13 @@ class MessageProjection:
                     "name": original.name,
                     "arguments": original.arguments,
                 }
-        facts = response_facts(
+        if response.call_record_id is None:
+            raise ValueError("模型响应尚未结算调用记录")
+        binding_id = self._model.descriptor.binding_id
+        receipt = self._read_call(response.call_record_id)
+        if receipt["state"] != "success" or receipt["binding"]["binding_id"] != binding_id:
+            raise ValueError("模型响应不属于当前已结算调用")
+        return response_facts(
             response,
             call_indices,
             reminder=reminder,
@@ -285,14 +315,8 @@ class MessageProjection:
             wire_tool_calls=wire,
             content_refs=content_refs,
             content_transformed=content_transformed,
+            binding_id=binding_id,
         )
-        assert response.call_record_id is not None
-        receipt = self._read_call(response.call_record_id)
-        if receipt["state"] != "success" or (
-            receipt["binding"]["binding_id"] != self._model.descriptor.binding_id
-        ):
-            raise ValueError("模型响应不属于当前已结算调用")
-        return facts
 
     def render(
         self,
@@ -334,6 +358,7 @@ class MessageProjection:
         if len(keep) != len(self._keep_input_ids) or not keep <= fold.inputs:
             raise ValueError("保留输入必须是当前来源的真实 Input，且不能重复")
         latest_input = fold.latest_input
+        history_recovery = any(seq > after_seq or identity in keep for identity, seq in fold.recovery.items())
         current_reminder_identity: tuple[str, str] | None = None
         if current_reminder_input_id is not None:
             if current_reminder_input_id != latest_input:
@@ -350,7 +375,7 @@ class MessageProjection:
         # 摘要明确开启新请求；原 opaque 保存在日志，只续接同一摘要后的响应。
         # 换模型、思考强度或注册表版本后 binding 不同：opaque 只属于原 binding，
         # 按当前完整消息投影开始请求，不把用户的切换变成会话故障。
-        if fresh or continuation_transformed or summary_reference is not None and (
+        if fresh or history_recovery or continuation_transformed or summary_reference is not None and (
             continuation_summary != summary_reference or continuation_seq <= after_seq
         ) or continuation is not None and continuation.binding_id != self._model.descriptor.binding_id:
             continuation = None
@@ -371,6 +396,7 @@ class MessageProjection:
             request = ModelRequest(
                 messages=rows, continuation=None if changed_content else continuation,
                 content_refs=content_refs, content_transformed=changed_content,
+                history_recovery=history_recovery,
             )
         except BaseException:
             self._view = None
@@ -609,6 +635,15 @@ class MessageProjection:
                 {"role": "tool", "tool_call_id": identity, "content": result_blocks}
             )
             msg_used.append(observation.message_id)
+        if message.message_id in fold.recovery:
+            blocks.append({"type": "text", "text": "历史模型调用回执不可用。以下是已保存的工具调用和结果，仅作为历史记录。"})
+            for call, observation_row in zip(calls, observations, strict=True):
+                blocks.append({"type": "text", "text": "历史工具调用 " + json.dumps(
+                    call["function"], ensure_ascii=False, separators=(",", ":"),
+                )})
+                blocks.extend(observation_row["content"])
+            calls.clear()
+            observations.clear()
         if blocks or calls:
             row: dict[str, Any] = {
                 "role": "user" if isinstance(body, Input) else "assistant",
@@ -675,9 +710,11 @@ class MessageProjection:
         # 调用账 owner 批量读取窄字段；插件自带 reader 保持原调用合同。
         read_call = self._read_call
         if isinstance(read_call, ModelCallReader):
-            fold.receipts.update(read_call.replay(
-                tuple(value["call_record_id"] for value in fold.recorded.values())
-            ))
+            ids = tuple(dict.fromkeys(value["call_record_id"] for value in fold.recorded.values()
+                                      if "replay" not in value))
+            if ids:
+                receipts = read_call.replay(ids)
+                fold.receipts.update((call_id, receipts.get(call_id)) for call_id in ids)
         for message in messages:
             self._fold_main(fold, message, inherited)
         fold.count = len(messages)
@@ -730,17 +767,21 @@ class MessageProjection:
                 for ref in value.get("content_refs", ()):
                     fold.content_refs.add(tuple(ref))
 
-    def _fold_receipt(self, fold: _Fold, call_id: str) -> Mapping[str, Any]:
-        """成功结算的回执不可变，每条记录在折叠生命周期内只读一次。"""
-        receipt = fold.receipts.get(call_id)
-        if receipt is None:
+    def _fold_receipt(self, fold: _Fold, call_id: str) -> Mapping[str, Any] | None:
+        """查询已提交历史的回执；缺行由投影恢复，SQL 和编码错误照常报告。"""
+        if call_id not in fold.receipts:
             read_call = self._read_call
             if isinstance(read_call, ModelCallReader):
-                receipt = read_call.replay((call_id,))[call_id]
+                receipt = read_call.replay((call_id,)).get(call_id)
             else:
-                receipt = read_call(call_id)
+                try:
+                    receipt = read_call(call_id)
+                except KeyError as error:
+                    if error.args != (call_id,):
+                        raise
+                    receipt = None
             fold.receipts[call_id] = receipt
-        return receipt
+        return fold.receipts[call_id]
 
     def _fold_main(
         self,
@@ -761,13 +802,22 @@ class MessageProjection:
         value = fold.recorded.get(message.message_id)
         if value is None:
             return
-        receipt = self._fold_receipt(fold, value["call_record_id"])
-        if receipt["state"] != "success":
-            raise ValueError("已提交模型事实必须引用成功结算的真实调用")
-        if receipt["binding"]["binding_id"] == self._model.descriptor.binding_id:
-            metadata = receipt.get("provider_metadata")
-            if metadata is not None and not value.get("content_transformed", False):
-                fold.response_metadata[message.message_id] = metadata
+        replay = value.get("replay")
+        binding_id, metadata = None, None
+        if replay is not None:
+            binding_id, metadata = replay["binding_id"], replay["provider_metadata"]
+        else:
+            receipt = self._fold_receipt(fold, value["call_record_id"])
+            if receipt is None or receipt["state"] == "started":
+                fold.recovery[message.message_id] = message.seq
+            else:
+                if receipt["state"] != "success":
+                    raise ValueError("已提交模型事实必须引用成功结算的真实调用")
+                binding_id = receipt["binding"]["binding_id"]
+                metadata = receipt.get("provider_metadata")
+        if (metadata is not None and binding_id == self._model.descriptor.binding_id
+                and not value.get("content_transformed", False)):
+            fold.response_metadata[message.message_id] = metadata
         previous = inherited.get(message.message_id)
         if previous is None or previous[0] is not message:
             indices = {
@@ -780,12 +830,12 @@ class MessageProjection:
         state = value["continuation"]
         message_continuation = (
             None
-            if state is None
+            if state is None or message.message_id in fold.recovery
             else ModelContinuation(state["binding_id"], state["payload"])
         )
         if (
             message_continuation is not None
-            and message_continuation.binding_id != receipt["binding"]["binding_id"]
+            and message_continuation.binding_id != binding_id
         ):
             raise ValueError("continuation 不属于记录中的模型")
         if message.source == self._source and message.message_id not in fold.abandoned:
@@ -816,7 +866,7 @@ class _Fold:
     __slots__ = (
         "count", "prefix", "inputs", "latest_input",
         "abandoned", "abandoned_calls", "facts", "recorded", "results",
-        "receipts", "response_metadata", "content_refs",
+        "receipts", "recovery", "response_metadata", "content_refs",
         "continuation", "cont_summary", "cont_seq", "cont_transformed",
     )
 
@@ -830,7 +880,8 @@ class _Fold:
         self.facts: dict[str, tuple[Message, Mapping[str, Any] | None]] = {}
         self.recorded: dict[str, Mapping[str, Any]] = {}
         self.results: dict[CallRef, Message] = {}
-        self.receipts: dict[str, Mapping[str, Any]] = {}
+        self.receipts: dict[str, Mapping[str, Any] | None] = {}
+        self.recovery: dict[str, int] = {}
         self.response_metadata: dict[str, Mapping[str, Any]] = {}
         self.content_refs: set[tuple[str, int]] = set()
         self.continuation: ModelContinuation | None = None

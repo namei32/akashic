@@ -204,9 +204,6 @@ class ModelCallReader:
                     else json.loads(row["provider_metadata"])
                 ),
             })
-        for identity in call_ids:
-            if identity not in records:
-                raise KeyError(identity)
         # 只保留当前窗口的成功回执；在途状态仍需重读，外部写入使整个缓存失效。
         self._replay_cache = (revision, {
             identity: record for identity, record in records.items() if record["state"] == "success"
