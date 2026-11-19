@@ -58,6 +58,21 @@ async def run(folder: Path, case: str, *, second_provider: bool = False) -> dict
             text = ("invalid summary" if case in {"soft_failure", "hard_failure"} else preamble
                     + "\n".join(heading + "\nRecorded progress." + filler for heading in HEADINGS[:1]) + "\n"
                     + "\n".join(heading + "\nRecorded progress." for heading in HEADINGS[1:])) if summary else "work completed"
+            if summary and case.startswith("heading_"):
+                if case == "heading_backticks":
+                    code = "```bash\n# restart comment\nsleep 10\n```"
+                else:
+                    # A shorter or differently typed fence must not close this block.
+                    code = "~~~~bash\n# restart comment\n~~~\n```\n## Next Steps\n~~~~"
+                if case == "heading_unclosed":
+                    code = code.removesuffix("\n~~~~")
+                text = text.replace("Recorded progress.", code, 1)
+                if case == "heading_extra":
+                    text += "\n## Unexpected"
+                elif case == "heading_missing":
+                    text = text.replace("## Critical Context", "Critical Context")
+                elif case == "heading_reordered":
+                    text = text.replace("## Goal", "## Critical Context", 1)
             body = json.dumps({"text": text}).encode()
             # parent_only 的首个业务请求失败，留下一个没有新已结算批次的会话尾部；
             # provider_rejection 的首个业务请求被 provider 以容量明确拒绝。
@@ -121,7 +136,8 @@ async def run(folder: Path, case: str, *, second_provider: bool = False) -> dict
                 writer(Output).append("earlier-final", Output((ContentPart(
                     "text", "earlier finished" + "o" * 45_000 * (case == "huge_batch")),), "complete"))
             writer(Input).append("old-input", Input((ContentPart("text", "original task"),)))
-            padding = {"hard_failure": 6500, "provider_rejection": 500}.get(case, 5500)
+            invalid_heading = case in {"heading_extra", "heading_missing", "heading_reordered", "heading_unclosed"}
+            padding = 6500 if invalid_heading else {"hard_failure": 6500, "provider_rejection": 500}.get(case, 5500)
             for index in range(1 if case == "huge_batch" else 6):
                 identity = f"old-call-{index}"
                 # huge_batch：巨大参数、多段结果与巨大历史回复各一，摘要资料都须有界。
@@ -190,11 +206,14 @@ async def run(folder: Path, case: str, *, second_provider: bool = False) -> dict
             assert after_rows[:len(original_rows)] == original_rows
             assert rows[:len(before)] == before
             business = [request for request in requests if "[Source messages]" not in str(request["messages"])]
-            if case == "hard_failure":
+            if case == "hard_failure" or invalid_heading:
                 assert not business and not summaries
                 reason = next(row.body.reason for row in rows if isinstance(row.body, Control) and row.body.action == "failure")
                 assert reason is not None
                 assert "本次请求被阻断" in reason and "窗口 10,000" in reason
+                if invalid_heading:
+                    expected = "摘要代码围栏未闭合" if case == "heading_unclosed" else "固定标题合同"
+                    assert expected in reason
             else:
                 assert len(business) == 1 + (case == "provider_rejection") and "implement now" in str(business[-1])
                 assert "context.notice" not in str(business[0]) and "上下文压缩失败" not in str(business[0])
@@ -288,7 +307,8 @@ async def main() -> None:
     with tempfile.TemporaryDirectory(prefix="compaction-workflow-") as path:
         for case in ("split_turn", "open_turn", "short_tail", "deep_cut", "long_summary", "stubborn_summary",
                      "rewrite_failure", "huge_batch", "parent_only", "small_window", "provider_rejection",
-                     "soft_failure", "hard_failure"):
+                     "soft_failure", "hard_failure", "heading_backticks", "heading_tildes",
+                     "heading_extra", "heading_missing", "heading_reordered", "heading_unclosed"):
             folder = Path(path) / case
             folder.mkdir()
             print(json.dumps(await run(folder, case), ensure_ascii=False), flush=True)
