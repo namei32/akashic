@@ -480,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
             result = read_json(host.record_path(args.request_id))
             observation = subprocess.run(
                 ["systemctl", "--user", "show", result["request"]["unit"], "-p", "LoadState,ActiveState,Result"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, env=_user_environment(),
             )
             result["worker"] = observation.stdout.strip() or observation.stderr.strip()
         case _:
