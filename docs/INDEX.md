@@ -69,6 +69,7 @@
 | 新产品方向 | [路线草案](design/akashic-future-roadmap-issue-drafts.md) → 对应现行需求；草案不是实现授权 | 按已批准范围定位 |
 
 Session 与 Models 提交的故障保证见 [0099 WAL NORMAL](decisions/0099-ledger-commits-use-wal-normal.md)；工具与送达恢复仍沿原 owner 协议。
+模型历史回放与缺失调用账恢复见 [0143](decisions/0143-model-output-carries-replay-facts.md)。
 默认消息工具调用与 ReAct 重启恢复按 [0100](decisions/0100-message-tool-calls-recover-at-turn-granularity.md)：未结工具报告未知，模型使用当前材料发新请求。
 
 派生向量拆分见 [0106](decisions/0106-derived-vectors-use-separate-storage.md)，丢库补算见 [0107](decisions/0107-restore-missing-vectors-before-reading-memory.md)。
