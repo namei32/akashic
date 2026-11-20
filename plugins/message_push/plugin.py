@@ -19,6 +19,7 @@ from .boundary import (
 )
 from .tool import MessagePush, PushInput
 from .restart import register_restart
+from .release_report import register_release_report
 
 api_version = 3
 name = "message_push"
@@ -50,6 +51,7 @@ _RESTART_DEPS = (
 async def apply(ctx: Context) -> None:
     """普通工具注册不取得附件、Message writer 或发送资源。"""
     catalog = ctx.require(TOOLS)
+    await register_release_report(ctx)
     _ = await catalog.declare_group(ctx, always_on=True, description=desc)
 
     @asynccontextmanager
