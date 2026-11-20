@@ -15,6 +15,7 @@ import sys
 import tempfile
 from typing import Any, cast
 from uuid import uuid4
+from websockets.asyncio.client import connect as web_connect
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "sdk/python/src")]
@@ -29,8 +30,8 @@ from scripts.install_plugin_distribution import ensure_bundle, extract_core
 from scripts.verify_self_deploy_runtime import configure_model, start_model_server
 
 
-def run(*argv: str, cwd: Path | None = None) -> str:
-    return subprocess.check_output(argv, cwd=cwd, text=True, timeout=300).strip()
+def run(*argv: str, cwd: Path | None = None, timeout: float = 300) -> str:
+    return subprocess.check_output(argv, cwd=cwd, text=True, timeout=timeout).strip()
 
 
 def commit(repo: Path, message: str) -> str:
@@ -45,14 +46,23 @@ def releases(folder: Path, wheels: Path) -> list[tuple[str, Path, Path]]:
     run("git", "clone", "--shared", "--quiet", str(ROOT), str(repo))
     run("git", "checkout", "--quiet", "--detach", run("git", "-C", str(ROOT), "rev-parse", "HEAD"), cwd=repo)
     for name in ("scripts/akashic_release/cli.py", "scripts/akashic_release/self_deploy.py",
-                 "scripts/akashic_release/wsl.py", "plugins/standard_tools/skills/deploy-akashic/SKILL.md"):
+                 "scripts/akashic_release/wsl.py", "scripts/build_plugin_distribution.py",
+                 "scripts/install_plugin_distribution.py", "scripts/release_boot_probe.py",
+                 "plugins/delivery/api.py", "plugins/delivery/contract.py", "plugins/gateway/runtime_stop.py",
+                 "plugins/message_push/plugin.py", "plugins/message_push/release_report.py",
+                 "plugins/standard_tools/skills/deploy-akashic/SKILL.md"):
         shutil.copyfile(ROOT / name, repo / name)
+    contract = repo / "plugins/jobs/contract.py"
+    original_contract = contract.read_text()
+    contract.write_text(original_contract + "\nRELEASE_PROBE_API = 1\n")
     commits = [commit(repo, "Isolated bootstrap")]
     jobs = repo / "plugins/jobs/plugin.py"
     text = jobs.read_text()
     for version in ("9.0.2", "9.0.3"):
         jobs.write_text(re.sub(r'^version = .+$', f'version = "{version}"', text, flags=re.M))
         commits.append(commit(repo, f"Jobs {version}"))
+    contract.write_text(original_contract)
+    commits.append(commit(repo, "Remove the interface consumed by the retained external plugin"))
 
     def package(sha: str) -> tuple[str, Path, Path]:
         destination = folder / sha
@@ -73,7 +83,7 @@ def external(folder: Path) -> list[tuple[str, Path]]:
     result = []
     for version in ("1.0.0", "2.0.0"):
         (source / "plugin.py").write_text(
-            f'api_version = 3\nname = "release_probe"\nversion = "{version}"\n'
+            f'from plugins.jobs.contract import RELEASE_PROBE_API\napi_version = 3\nname = "release_probe"\nversion = "{version}"\n'
             'async def apply(ctx):\n    pass\n'
         )
         sha = commit(source, version)
@@ -127,7 +137,76 @@ async def plugins(host: Host) -> dict[str, Any]:
         return {row["plugin_id"]: row for row in status["plugins"] if row.get("state") == "active"}
 
 
-async def scenario(folder: Path, compiled: list[tuple[str, Path, Path]], probe: list[tuple[str, Path]]) -> None:
+def callback_fixture(body: dict[str, Any], submit_command: str) -> dict[str, Any] | None:
+    if not body.get("tools") or not any("wsl-callback-submit" in str(row.get("content")) for row in body["messages"]):
+        return None
+    history = body["messages"]
+    calls = {call["id"] for row in history for call in row.get("tool_calls", [])}
+    callback = any("通知回执 job:" in str(row.get("content")) for row in history)
+    if "fixture-callback-submit" in calls or ("fixture-start-build" in calls and not callback):
+        return {"role": "assistant", "content": "本回合结束。"}
+    command = submit_command if callback else "/usr/bin/sleep 2"
+    return {"role": "assistant", "content": None, "tool_calls": [{
+        "id": "fixture-callback-submit" if callback else "fixture-start-build", "type": "function",
+        "function": {"name": "shell", "arguments": json.dumps({"command": command, "description": "release fixture",
+                    "login": False, "run_in_background": not callback, "yield_time_ms": 50 if not callback else 10000})}}]}
+
+
+async def report_items(host: Host, session: str, request_id: str, expected: str) -> list[dict[str, Any]]:
+    async with asyncio.timeout(30):
+        while True:
+            async with await connect(host) as client:
+                page = await client.message_read(session, limit=100)
+            matches = [item for item in page["items"] if item["source"] == "release_report"
+                       and request_id in str(item["body"]["parts"])]
+            if any(expected in str(item["body"]["parts"]) for item in matches):
+                return matches
+            await asyncio.sleep(0.2)
+
+
+async def rejected_callback(host: Host, folder: Path, target: str) -> None:
+    session = "akashic:" + uuid4().hex
+    (folder / "next.json").write_text(json.dumps(["submit", "--commit", target]))
+    secret = host.workspace / "web-auth/secret"
+    headers = {"Authorization": "Bearer " + secret.read_text().strip()} if secret.exists() else {}
+    async with web_connect(f"ws://127.0.0.1:{host.port}/ws", additional_headers=headers, proxy=None) as web:
+        await web.send(json.dumps({"type": "message.send", "request_id": "wsl-callback-submit", "session_id": session,
+                                   "text": "wsl-callback-submit"}))
+        async with asyncio.timeout(35):
+            while True:
+                matches = [path for path in (host.root / "run/self-deploy").glob("*.json")
+                           if read_json(path)["request"]["stop"]["session_id"] == session]
+                if matches:
+                    path, = matches
+                    state = read_json(path)
+                    if state["status"] == "failed":
+                        break
+                await asyncio.sleep(0.2)
+        assert "job:shell-" in state["error"] and "最终 Output provider" in state["error"], state
+        assert len(await report_items(host, session, path.stem, "最终 Output provider")) == 1
+    print("CALLBACK rejected before worker, reported to the original Web session", flush=True)
+
+
+async def desktop_notice(host: Host, request_id: str) -> None:
+    queue = host.root / "desktop-notifications"
+    async with asyncio.timeout(20):
+        while True:
+            matches = [p for p in queue.glob("*.json") if request_id in read_json(p)["text"]]
+            if matches:
+                notice, = matches
+                break
+            await asyncio.sleep(0.2)
+    if host.desktop_notifications:
+        script = ROOT / "integrations/wsl_release_notifications/Watch-ReleaseNotifications.ps1"
+        script_path = run("wslpath", "-w", str(script))
+        queue_path = run("wslpath", "-w", str(queue))
+        command = f"& ([ScriptBlock]::Create((Get-Content -LiteralPath '{script_path}' -Raw))) -Queue '{queue_path}' -Once"
+        await asyncio.to_thread(run, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command, timeout=75)
+        assert notice.with_suffix(".ack").is_file(), "Windows did not confirm displaying the isolated release notification"
+        print("DESKTOP Windows confirmed displaying the release failure", flush=True)
+
+
+async def scenario(folder: Path, compiled: list[tuple[str, Path, Path]], probe: list[tuple[str, Path]], *, desktop: bool) -> None:
     state, root, home = folder / "state", folder / "releases", folder / "home"
     for path in (state, root, home):
         path.mkdir()
@@ -137,7 +216,8 @@ async def scenario(folder: Path, compiled: list[tuple[str, Path, Path]], probe: 
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-    write_json(profile, {"root": str(root), "state": str(state), "unit": unit, "port": port})
+    write_json(profile, {"root": str(root), "state": str(state), "unit": unit, "port": port,
+                         "desktop_notifications": desktop})
     host = Host(profile)
     (folder / "shell.py").write_text(
         "import json,os,sys\nfrom pathlib import Path\n"
@@ -176,7 +256,9 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         host.publish(base, _plan(host, folder / "initial.json", []), base_dist)
     write_json(host.launch_path, {"commit": base})
     cli = [sys.executable, "-B", str(ROOT / "scripts/akashic_release/cli.py"), "wsl", "--profile", str(profile)]
-    server, model_port = await start_model_server(folder, command=f"{sys.executable} -B {folder / 'shell.py'}")
+    command = f"{sys.executable} -B {folder / 'shell.py'}"
+    server, model_port = await start_model_server(folder, command=command,
+                                                 scripted_reply=lambda body: callback_fixture(body, command))
     try:
         with unit_file.open("x") as stream:
             stream.write(unit_text)
@@ -199,6 +281,16 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         print("HOT active without restarting", flush=True)
 
         builtin, _, _ = compiled[1]
+        await rejected_callback(host, folder, builtin)
+        assert host.ready() == first | {"root": host.selection.read()}
+        incompatible, _, _ = compiled[3]
+        old = host.ready()
+        bad_session = "programmatic:wsl-incompatible"
+        bad_job, bad = await submit(host, folder, ["submit", "--commit", incompatible], bad_session, status="failed_preflight")
+        assert "RELEASE_PROBE_API" in bad["error"] and "release_probe@local" in bad["error"], bad
+        assert host.ready() == old and "publication" not in bad
+        assert len(await report_items(host, bad_session, bad_job.stem, "RELEASE_PROBE_API")) == 1
+        print("COMPATIBILITY detected the retained plugin failure before stopping, notified original session", flush=True)
         wrong = folder / "stale-plan.json"
         old = host.ready()
         write_json(wrong, {"schema_version": 1, "expected_root_ref": "0" * 64, "targets": []})
@@ -207,7 +299,9 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         assert host.ready() == old
         print("PREFLIGHT refused a stale Root without restarting", flush=True)
         builtin_session = "programmatic:wsl-builtin"
-        _, before = await submit(host, folder, ["submit", "--commit", builtin], builtin_session)
+        builtin_job, before = await submit(host, folder, ["submit", "--commit", builtin], builtin_session)
+        assert before["preflight"]["boot_probe"]["conversation"] == "passed"
+        assert len(await report_items(host, builtin_session, builtin_job.stem, "发布成功")) == 1
         snapshot = await plugins(host)
         assert snapshot["jobs@release"]["version"] == "9.0.2"
         assert snapshot["release_probe@local"]["input_ref"] == hot_input
@@ -226,10 +320,14 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         job, failed = await submit(host, folder, ["submit", "--commit", mixed, "--plan", str(plan), "--inputs", str(folder)],
                                    "programmatic:wsl-mixed", status="selected_not_started")
         assert host.selection.read() == failed["publication"]["new_root_ref"]
+        if desktop:
+            await desktop_notice(host, job.stem)
         # Recreate the durable launch state immediately after publication and before activation.
         write_json(host.launch_path, {"commit": builtin, "blocked": job.stem})
         hold.unlink()
         await asyncio.to_thread(run, *cli, "resume", job.stem)
+        assert len(await report_items(host, "programmatic:wsl-mixed", job.stem, "发布失败")) >= 1
+        print("REPORT replayed the original failure after chat recovered", flush=True)
         after = await plugins(host)
         assert after["jobs@release"]["version"] == "9.0.3" and after["release_probe@local"]["version"] == "2.0.0"
         assert host.selection.read() == failed["publication"]["new_root_ref"]
@@ -250,6 +348,7 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
                               "programmatic:wsl-rollback", status="selected_not_started")
         hold.unlink()
         await asyncio.to_thread(run, *cli, "rollback", job.stem, "--compatible-data")
+        await report_items(host, "programmatic:wsl-rollback", job.stem, "已回退")
         restored = await plugins(host)
         assert restored["jobs@release"]["version"] == "9.0.2" and restored["release_probe@local"]["version"] == "1.0.0"
         assert host.ready()["sourceCommit"] == builtin
@@ -259,6 +358,9 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         print("ROLLBACK recovered directly from a failed startup", flush=True)
     finally:
         await server.cleanup()
+        for path in (host.root / "run/self-deploy").glob("*.json"):
+            subprocess.run(["systemctl", "--user", "stop", f"akashic-wsl-report-{path.stem}.timer"],
+                           capture_output=True, check=False, timeout=10)
         if unit_file.exists():
             try:
                 run("systemctl", "--user", "stop", unit)
@@ -276,13 +378,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wheels", type=Path)
     parser.add_argument("--reuse", type=Path, help="Reuse built fixture releases in an earlier evidence directory")
+    parser.add_argument("--desktop", action="store_true", help="Show an actual failure notification on this Windows desktop")
     args = parser.parse_args()
     folder = Path(tempfile.mkdtemp(prefix="ak-wsl-"))
     print("EVIDENCE", folder, flush=True)
     if args.reuse:
         fixture = args.reuse.resolve(strict=True)
-        commits = run("git", "-C", str(fixture / "source"), "log", "-3", "--reverse", "--format=%H").splitlines()
+        commits = run("git", "-C", str(fixture / "source"), "log", "-4", "--reverse", "--format=%H").splitlines()
         compiled = [(sha, fixture / sha / "distribution", fixture / sha / "core") for sha in commits]
     else:
         compiled = releases(folder, args.wheels.resolve(strict=True))
-    asyncio.run(scenario(folder, compiled, external(folder)))
+    asyncio.run(scenario(folder, compiled, external(folder), desktop=args.desktop))

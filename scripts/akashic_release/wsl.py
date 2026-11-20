@@ -25,6 +25,8 @@ from plugins.gateway.runtime_stop import StopParams
 from scripts.akashic_release.manifest import read_json, release_lock, write_json
 from scripts.akashic_release.self_deploy import _request_path, _user_environment, stop_rpc
 from scripts.install_plugin_distribution import extract_core, load_deployment_plan, verify_distribution
+from scripts.release_boot_probe import failed_plugins
+from scripts.akashic_release import wsl_reports
 
 DEFAULT_PROFILE = Path("/etc/akashic/wsl-release.json")
 BRIDGE = "/usr/local/libexec/akashic-wsl-service"
@@ -60,6 +62,7 @@ class Host:
         self.unit: str = settings["unit"]
         self.repository = settings.get("repository")
         self.system = self.unit == "akashic.service"
+        self.desktop_notifications = settings.get("desktop_notifications", self.system) is True
         if not self.system and not re.fullmatch(r"akashic-wsl-[a-z0-9-]+\.service", self.unit):
             raise ValueError("服务必须是受管的 Akashic WSL unit")
         if self.system and (self.profile.stat().st_uid != 0 or self.profile.stat().st_mode & 0o022):
@@ -202,6 +205,11 @@ class Host:
                 return await stop_rpc(self.workspace, method, params)
         return asyncio.run(request())
 
+    def chat_ready(self) -> bool:
+        opener = build_opener(ProxyHandler({}))
+        with opener.open(f"http://127.0.0.1:{self.port}/api/shell/state", timeout=3) as response:
+            return json.load(response)["chatReady"] is True
+
     def submit(self, args: argparse.Namespace) -> dict[str, Any]:
         if args.inputs is not None and args.plan is None:
             raise ValueError("--inputs 只能和 --plan 一起使用")
@@ -230,8 +238,10 @@ class Host:
                 if record["status"] not in {"accepted", "preflight", "active"}:
                     raise RuntimeError(f"原请求处于 {record['status']}，请查询状态")
                 return {"requestId": request_id, "status": record["status"], "targetCommit": release["commit"]}
-            write_json(path, {"request": request, "status": "submitting"})
+            record = {"request": request, "status": "submitting", "notify": True}
+            write_json(path, record)
             try:
+                wsl_reports.watch(self, request_id)
                 self.rpc("runtime/prepare-stop", {**request["stop"], "arm_only": True})
                 subprocess.run([
                     "systemd-run", "--user", "--collect", f"--unit={unit}", "--property=Type=exec",
@@ -241,22 +251,29 @@ class Host:
                 ], check=True, env=_user_environment(), stdin=subprocess.DEVNULL,
                     capture_output=True, text=True, timeout=30)
             except Exception as error:
-                write_json(path, {"request": request, "status": "failed", "error": str(error)})
+                detail = (error.stderr or str(error)).strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+                write_json(path, {**record, "status": "failed", "error": detail})
                 raise
-            write_json(path, {"request": request, "status": "accepted"})
+            write_json(path, {**record, "status": "accepted"})
         return {"requestId": request_id, "status": "accepted", "targetCommit": release["commit"]}
 
     def publish(self, commit: str, plan: Path, inputs: Path, *, preflight: bool = False,
-                backup: Path | None = None) -> dict[str, Any]:
+                backup: Path | None = None, boot_probe: bool = False) -> dict[str, Any]:
         release = self.release(commit)
         core, dist = Path(release["core"]), Path(release["distribution"])
-        result = run(release["python"], "-B", str(core / "scripts/install_plugin_distribution.py"),
+        result = subprocess.run([release["python"], "-B", str(core / "scripts/install_plugin_distribution.py"),
                      "--distribution", str(dist), "--bundle", str(dist / "bundles/base.toml"),
                      "--workspace", str(self.workspace), "--plugins-home", str(self.state / "plugin-home"),
                      "--config", str(self.state / "config.toml"), "--publish", "--plan", str(plan),
                      "--inputs", str(inputs), *(("--preflight-only",) if preflight else ()),
-                     *(("--backup-dir", str(backup)) if backup else ()), timeout=600)
-        return json.loads(result)
+                     *(("--boot-probe",) if boot_probe else ()),
+                     *(("--backup-dir", str(backup)) if backup else ())],
+                     capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        if result.returncode:
+            raise RuntimeError(result.stderr.rstrip().splitlines()[-1] if result.stderr.strip() else "发行版安装器退出失败")
+        return json.loads(result.stdout)
 
     def activate(self, commit: str, root: str) -> dict[str, Any]:
         if self.selection.read() != root:
@@ -272,16 +289,13 @@ class Host:
                 if ready["sourceCommit"] != commit or ready["root"] != root:
                     raise RuntimeError("运行的源码或 Root 不符")
                 snapshot = self.rpc("plugin/status", {}, timeout=3)
-                if snapshot["selection_ref"] != root or any(
-                    row.get("enabled") is True and row.get("selected_ref") is not None
-                    and (row.get("state") != "active"
-                    or row.get("input_ref") != row.get("selected_ref")) for row in snapshot["plugins"]
-                ):
-                    raise RuntimeError("选中插件尚未全部激活")
-                opener = build_opener(ProxyHandler({}))
-                with opener.open(f"http://127.0.0.1:{self.port}/api/shell/state", timeout=3) as response:
-                    if not json.load(response)["chatReady"]:
-                        raise RuntimeError("Web Chat 尚未就绪")
+                if snapshot["selection_ref"] != root:
+                    raise RuntimeError("运行中插件组合与发布回执不符")
+                failing = failed_plugins(snapshot)
+                if failing:
+                    raise RuntimeError("选中插件尚未全部激活：" + json.dumps(failing, ensure_ascii=False)[:1250])
+                if not self.chat_ready():
+                    raise RuntimeError("Web Chat 尚未就绪")
                 write_json(self.root / "active.json", ready)
                 write_json(self.launch_path, {"commit": commit})
                 return ready
@@ -318,7 +332,7 @@ class Host:
                         raise RuntimeError("清单与当前 Root 不符，首次历史归属转换须走离线入口")
                 write_json(folder / "plan.json", {"schema_version": 1, "expected_root_ref": old["root"], "targets": targets})
                 inputs = Path(request["inputs"] or self.release(request["commit"])["distribution"])
-                record["preflight"] = self.publish(request["commit"], folder / "plan.json", inputs, preflight=True)
+                record["preflight"] = self.publish(request["commit"], folder / "plan.json", inputs, preflight=True, boot_probe=True)
                 self.capture_previous(folder, targets)
                 write_json(path, record)
                 ack = self.rpc("runtime/prepare-stop", stop, timeout=stop["timeout_s"] + 5)
@@ -388,9 +402,13 @@ class Host:
             if args.command == "resume":
                 if record["status"] != "selected_not_started":
                     raise RuntimeError("继续启动需要完整发布回执，先核对实际 Root 与迁移账本")
+                wsl_reports.preserve(self, args.request_id, record)
+                wsl_reports.watch(self, args.request_id)
                 return self.finish(path, record)
             if record["status"] not in {"publishing", "selected_not_started", "active", "rolling_back"}:
                 raise RuntimeError("当前阶段没有可恢复的发布选择")
+            wsl_reports.preserve(self, args.request_id, record)
+            wsl_reports.watch(self, args.request_id)
             current, old = self.selection.read(), record["request"]["old"]
             if current is None:
                 raise RuntimeError("实例缺少已提交的插件组合")
@@ -423,6 +441,7 @@ class Host:
                 write_json(path, record)
                 root = receipt["new_root_ref"]
             record.update(status="rolled_back", ready=self.activate(old["sourceCommit"], root))
+            record.pop("error", None)
             write_json(path, record)
             return record
 
@@ -436,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("request_id")
         if verb == "rollback":
             command.add_argument("--compatible-data", action="store_true", required=True)
+    commands.add_parser("report").add_argument("request_id", nargs="?")
     submit = commands.add_parser("submit")
     submit.add_argument("--commit", required=True)
     submit.add_argument("--plan", type=Path)
@@ -476,6 +496,15 @@ def main(argv: list[str] | None = None) -> int:
             result = host.rpc("plugin/update", {"update_id": args.update_id})
         case "worker":
             result = host.worker(args.request_id)
+        case "report":
+            host.require_independent()
+            if args.request_id:
+                result = wsl_reports.reconcile(host, args.request_id)
+                if result.get("chat"):
+                    wsl_reports.stop_timer(args.request_id)
+            else:
+                result = {path.stem: wsl_reports.reconcile(host, path.stem)
+                          for path in (host.root / "run/self-deploy").glob("*.json") if read_json(path).get("notify")}
         case "status":
             result = read_json(host.record_path(args.request_id))
             observation = subprocess.run(
