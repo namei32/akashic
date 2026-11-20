@@ -1,0 +1,7 @@
+[Unit]
+Description=Reconcile pending Akashic WSL deployment reports
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/akashic-release wsl report
+TimeoutStartSec=120
