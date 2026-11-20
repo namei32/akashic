@@ -54,8 +54,10 @@ class FinalOutputDelivery:
         if self._providers.get(source) is provider:
             del self._providers[source]
 
+    def require_source(self, source: str) -> None:
+        if source not in self._providers:
+            raise ValueError(f"没有来源 {source!r} 的最终 Output provider")
+
     async def wait(self, reader: MessageReader, turn: FinalOutputTurn) -> None:
-        provider = self._providers.get(turn.source)
-        if provider is None:
-            raise ValueError(f"没有来源 {turn.source!r} 的最终 Output provider")
-        await provider.wait(reader, turn)
+        self.require_source(turn.source)
+        await self._providers[turn.source].wait(reader, turn)

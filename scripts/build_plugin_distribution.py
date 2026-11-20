@@ -43,6 +43,7 @@ CORE_PATHS = (
     "sdk/python",
     "skills",
     "scripts/install_plugin_distribution.py",
+    "scripts/release_boot_probe.py",
     "scripts/distribution_runtime.py",
     "scripts/start.py",
     "docker/host-runtime",

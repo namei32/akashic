@@ -923,7 +923,7 @@ def _prepare_distribution_environments(
 def publish_distribution(
     *, distribution: Path, workspace: Path, plugins_home: Path,
     config_path: Path, plan: Path, inputs: Path,
-    backup_dir: Path | None = None, preflight_only: bool = False,
+    backup_dir: Path | None = None, preflight_only: bool = False, boot_probe: bool = False,
 ) -> dict[str, Any]:
     """更新内置 preset 和指定外置输入；先完成 Core 与内置迁移。"""
     digest, expected_root, requested, adoption = load_deployment_plan(plan)
@@ -986,6 +986,9 @@ def publish_distribution(
                     "distribution_ids": [key for key, source in candidate.items() if source.distribution_source],
                 }
                 if preflight_only:
+                    if boot_probe:
+                        from scripts.release_boot_probe import start_probe
+                        result["boot_probe"] = start_probe(staged, distribution, workspace, plugins_home, candidate, targets)
                     return result
                 if backup_dir is not None:
                     state = workspace.parent
@@ -1172,7 +1175,11 @@ def main() -> None:
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--inputs", type=Path)
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--boot-probe", action="store_true")
     args = parser.parse_args()
+
+    if args.boot_probe and not (args.publish and args.preflight_only):
+        parser.error("--boot-probe 需要 --publish --preflight-only")
 
     if sum((args.verify_only, args.ensure_bundle, args.publish)) > 1:
         parser.error("--verify-only、--ensure-bundle、--publish 互斥")
@@ -1183,7 +1190,7 @@ def main() -> None:
             distribution=args.distribution, workspace=args.workspace,
             plugins_home=args.plugins_home, config_path=args.config,
             plan=args.plan, inputs=args.inputs, backup_dir=args.backup_dir,
-            preflight_only=args.preflight_only,
+            preflight_only=args.preflight_only, boot_probe=args.boot_probe,
         )
         print(json.dumps(result, ensure_ascii=False))
         return

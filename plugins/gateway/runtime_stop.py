@@ -65,6 +65,11 @@ async def prepare_stop(ctx: Context, params: StopParams) -> dict[str, object]:
             except LookupError as error:
                 raise ValueError("停止请求的控制连接已结束") from error
             asyncio.get_running_loop().call_later(params.timeout_s, claim.abort)
+        if call.source != "programmatic":
+            with ctx.borrow(FINAL_OUTPUT_DELIVERY) as delivery:
+                if delivery is None:
+                    raise RuntimeError("停止请求缺少最终回复投递能力")
+                delivery.require_source(call.source)
         return {"bootId": gate.boot_id, "state": "armed"}
     # 同一停止只允许一个 waiter；重放接单由宿主任务记录处理。
     gate.check_open()
