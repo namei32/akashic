@@ -346,6 +346,8 @@ WSL 复用 Shell 的调用身份、送达凭据、排空与正常关闭回执。
 
 停止后，启动入口会暂时阻止新进程读到未结算的组合。有完整发布回执时，用 `wsl resume REQUEST_ID` 继续启动和验收。回到旧版本时先确认旧代码和旧插件都能读取当前数据，再执行 `wsl rollback REQUEST_ID --compatible-data`。旧外置制品与旧发行版一同发布。回执缺失且实际 Root 已变化时，先核对发布指针和迁移账本。数据库恢复与向前修复仍按对应数据 owner 的合同执行。
 
+若排空后、调用 systemd 停止前写入停机回执失败，宿主先尝试取消同一请求的停止准备，让原 boot 恢复接单，再尽力落失败回执。若停机失败发生在迁移和发布阶段之前，宿主核对原 systemd invocation 已退出、workspace 生命周期锁空闲，以及启动指针和 Root 仍指向旧版。条件满足时，宿主通过现有启动入口重新启动旧版，核对新 boot、旧 Root、插件激活和 Web Chat。发布任务仍以 `failed_stop` 结算，恢复结果另存，原会话会收到失败原因和旧版是否已恢复的报告。重试时在停机前复用安装器的账本检查，发现插件清理等未结算记录就取消排空并保留当前实例。进入发布阶段后的故障按发布回执处理。
+
 接单时先验证原来源的最终回复投递能力。来自无最终回复 provider 的后台作业回调会在启动 worker 前被拒绝。在线预检按正式安装器选出的候选组合启动一次性 Core，使用临时 HOME、配置和状态，复制保留的外置制品，切断外部网络并隔开正式状态目录。真实 Web Chat 使用隔离网络内的测试模型验证接发。实际停止前再次核对原 boot 和 Root。
 
 每个请求由独立 systemd 计时器从宿主回执生成结果，成功、失败和恢复分别记录。报告通过本机 Gateway 追加到原会话，并按回执身份去重。聊天不可用时写入 `<release-root>/desktop-notifications/`，恢复后再次补发。将 [持续检查的用户 unit](../../integrations/wsl_release_notifications/akashic-release-report.timer) 及同名 service 安装进 `~/.config/systemd/user/` 并启用 timer，可以跨 WSL 重启继续读回执。正式 profile 默认生成桌面发件箱，隔离 profile 可显式设 `desktop_notifications`。

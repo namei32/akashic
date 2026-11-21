@@ -20,7 +20,9 @@ from urllib.error import URLError
 from urllib.request import ProxyHandler, build_opener
 
 from agent.plugins.files import encode_tree, tree_entries
+from agent.plugins.reload_journal import check_pending_publication
 from agent.plugins.selection import PluginSelection
+from bootstrap.workspace_lock import WorkspaceMaintenanceLock
 from plugins.gateway.runtime_stop import StopParams
 from scripts.akashic_release.manifest import read_json, release_lock, write_json
 from scripts.akashic_release.self_deploy import _request_path, _user_environment, stop_rpc
@@ -281,6 +283,11 @@ class Host:
         write_json(self.launch_path, {"commit": commit, "root": root})
         if self.service()["ActiveState"] not in {"active", "activating"}:
             self.control("start")
+        ready = self.wait_for_activation(commit, root)
+        write_json(self.launch_path, {"commit": commit})
+        return ready
+
+    def wait_for_activation(self, commit: str, root: str, *, previous_boot_id: str | None = None) -> dict[str, Any]:
         deadline = time.monotonic() + 60
         last = "服务未就绪"
         while time.monotonic() < deadline:
@@ -288,6 +295,8 @@ class Host:
                 ready = self.ready()
                 if ready["sourceCommit"] != commit or ready["root"] != root:
                     raise RuntimeError("运行的源码或 Root 不符")
+                if ready["bootId"] == previous_boot_id:
+                    raise RuntimeError("仍是停机前的 boot")
                 snapshot = self.rpc("plugin/status", {}, timeout=3)
                 if snapshot["selection_ref"] != root:
                     raise RuntimeError("运行中插件组合与发布回执不符")
@@ -297,7 +306,6 @@ class Host:
                 if not self.chat_ready():
                     raise RuntimeError("Web Chat 尚未就绪")
                 write_json(self.root / "active.json", ready)
-                write_json(self.launch_path, {"commit": commit})
                 return ready
             except (OSError, URLError, RuntimeError, TimeoutError) as error:
                 last = str(error)
@@ -305,6 +313,28 @@ class Host:
                     break
                 time.sleep(0.3)
         raise RuntimeError(f"启动验收未完成：{last}")
+
+    def restore_old_after_stop_failure(self, old: dict[str, Any]) -> dict[str, Any]:
+        """Called under the release lock, before any publication or migration."""
+        commit, root = old["sourceCommit"], old["root"]
+        status = self.service()
+        # systemd can clear the invocation when the stopped unit is collected.
+        if (status["InvocationID"] not in {"", old["invocation"]}
+                or status["ActiveState"] not in {"inactive", "failed"}
+                or status["MainPID"] != "0" or status["ControlGroup"]):
+            return {"status": "skipped", "error": "无法确认原 systemd invocation 已退出"}
+        maintenance = WorkspaceMaintenanceLock(self.workspace)
+        maintenance.acquire()
+        try:
+            if (not isinstance(root, str) or self.selection.read() != root
+                    or read_json(self.launch_path) != {"commit": commit}):
+                return {"status": "skipped", "error": "启动指针或插件组合与原版本不符"}
+        finally:
+            # The original launcher must be able to acquire these same locks.
+            maintenance.release()
+        self.control("start")
+        ready = self.wait_for_activation(commit, root, previous_boot_id=old["bootId"])
+        return {"status": "restored", "ready": ready}
 
     def worker(self, request_id: str) -> dict[str, Any]:
         self.require_independent()
@@ -338,24 +368,42 @@ class Host:
                 ack = self.rpc("runtime/prepare-stop", stop, timeout=stop["timeout_s"] + 5)
                 if ack["state"] != "drained" or ack["bootId"] != old["bootId"] or self.ready() != old:
                     raise RuntimeError("原实例未完成排空，或者发布基线已变化")
+                check_pending_publication(self.workspace)
+                record["status"] = "stopping"
+                write_json(path, record)
             except Exception as error:
                 try:
                     self.rpc("runtime/cancel-stop", stop, timeout=5)
                 except Exception as cancel_error:
                     record["cancelError"] = str(cancel_error)
                 record.update(status="failed_preflight", error=str(error))
-                write_json(path, record)
+                try:
+                    write_json(path, record)
+                except OSError as receipt_error:
+                    error.add_note(f"无法保存失败回执: {receipt_error}")
                 raise
-            record["status"] = "stopping"
-            write_json(path, record)
             try:
                 self.control("stop", old["invocation"])
-                closed = read_json(self.workspace / "runtime/closed" / f"{old['bootId']}.json")
+                try:
+                    closed = read_json(self.workspace / "runtime/closed" / f"{old['bootId']}.json")
+                except FileNotFoundError as error:
+                    raise RuntimeError("旧实例退出后缺少正常关闭回执") from error
                 service = self.service()
                 if (closed != {"pid": old["pid"], "bootId": old["bootId"], "state": "closed",
                                 "rootIdentity": ack["rootIdentity"]}
                         or service["ActiveState"] != "inactive" or service["Result"] != "success"):
                     raise RuntimeError("未取得同一旧实例的关闭回执")
+            except Exception as error:
+                record.update(status="recovering_old", stop_error=str(error))
+                write_json(path, record)
+                try:
+                    recovery = self.restore_old_after_stop_failure(old)
+                except Exception as recovery_error:
+                    recovery = {"status": "failed", "error": str(recovery_error)}
+                record.update(status="failed_stop", error=record.pop("stop_error"), recovery=recovery)
+                write_json(path, record)
+                raise
+            try:
                 write_json(self.launch_path, {"commit": old["sourceCommit"], "blocked": request_id})
                 record["status"] = "publishing"
                 write_json(path, record)

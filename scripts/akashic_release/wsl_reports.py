@@ -47,10 +47,12 @@ def reconcile(host: Host, request_id: str) -> dict[str, Any]:
         record = read_json(path)
         request = record["request"]
         phase, error = record["status"], record.get("error")
-        if phase not in {"active", "rolled_back", "failed", "failed_preflight"} and not error:
+        if phase not in {"active", "rolled_back", "failed", "failed_preflight", "failed_stop"} and not error:
             if time.time() - path.stat().st_mtime < 35 or unit_state(request["unit"]) in {"active", "activating", "deactivating"}:
                 return {"status": "waiting", "phase": phase}
             error = "宿主 worker 已退出，缺少完整发布回执"
+            if stop_error := record.get("stop_error"):
+                error = f"{stop_error}。{error}"
         folder = host.root / "notices" / request_id
         enqueue(host, request_id, record, folder, error)
         deliveries = sorted(folder.glob("*.json"), key=lambda file: file.stat().st_mtime_ns)
@@ -70,10 +72,13 @@ def enqueue(host: Host, request_id: str, record: dict[str, Any], folder: Path, e
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         running = "未知"
     selected = record.get("rollback" if phase == "rolled_back" else "publication", {}).get("new_root_ref")
+    recovery = record.get("recovery", {})
     if phase == "active" and not error:
         title = "Akashic 发布成功"
     elif phase == "rolled_back" and not error:
         title = "Akashic 已回退"
+    elif phase == "failed_stop" and recovery.get("status") == "restored":
+        title = "Akashic 发布失败，旧版已恢复"
     else:
         title = "Akashic 发布失败"
     if not host.system:
@@ -84,6 +89,8 @@ def enqueue(host: Host, request_id: str, record: dict[str, Any], folder: Path, e
         text += f"\n已提交插件组合 {selected[:12]}。"
     if detail:
         text += f"\n原因：{detail}"
+    if recovery_error := recovery.get("error"):
+        text += f"\n未能自动恢复旧版：{str(recovery_error)[:400]}"
     write_json(receipt, {"title": title, "text": text, "chat": False})
 
 
