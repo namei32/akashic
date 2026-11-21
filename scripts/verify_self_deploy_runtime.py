@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from aiohttp import web
 from typing import Any, cast
@@ -66,7 +66,7 @@ def prepare_workspace() -> tuple[Path, Path, Path]:
 
 async def start_model_server(
     sandbox: Path, *, command: str | None = None, host: str = "127.0.0.1", port: int = 0,
-    scripted_reply: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+    scripted_reply: Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]] | None = None,
 ) -> tuple[web.AppRunner, int]:
     """控制外部 HTTP 模型响应；内部组件使用真实实现。"""
     requests = []
@@ -81,7 +81,7 @@ async def start_model_server(
         (sandbox / "requests.json").write_text(json.dumps(requests))
         messages = body["messages"]
         tools = body.get("tools", [])
-        scripted = None if scripted_reply is None else scripted_reply(body)
+        scripted = None if scripted_reply is None else await scripted_reply(body)
         if scripted is not None:
             message = scripted
             finish = "tool_calls" if message.get("tool_calls") else "stop"

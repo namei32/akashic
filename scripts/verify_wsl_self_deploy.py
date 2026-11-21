@@ -30,6 +30,11 @@ from scripts.install_plugin_distribution import ensure_bundle, extract_core
 from scripts.verify_self_deploy_runtime import configure_model, start_model_server
 
 
+RECEIPT_FAILURE_SESSION = "programmatic:wsl-stop-receipt"
+RECEIPT_FAILURE_INPUT = "Submit the fixture release with a stop receipt write failure."
+AFTER_RECEIPT_FAILURE = "Confirm that this instance accepts new work."
+
+
 def run(*argv: str, cwd: Path | None = None, timeout: float = 300) -> str:
     return subprocess.check_output(argv, cwd=cwd, text=True, timeout=timeout).strip()
 
@@ -84,7 +89,15 @@ def external(folder: Path) -> list[tuple[str, Path]]:
     for version in ("1.0.0", "2.0.0"):
         (source / "plugin.py").write_text(
             f'from plugins.jobs.contract import RELEASE_PROBE_API\napi_version = 3\nname = "release_probe"\nversion = "{version}"\n'
-            'async def apply(ctx):\n    pass\n'
+            'async def apply(ctx):\n'
+            '    marker = ctx.runtime.data_dir / "fail-stop-once"\n'
+            '    def setup():\n'
+            '        def cleanup():\n'
+            '            if marker.exists():\n'
+            '                marker.unlink()\n'
+            '                raise RuntimeError("isolated plugin cleanup failure")\n'
+            '        return cleanup\n'
+            '    await ctx.effect(setup, label="release probe cleanup")\n'
         )
         sha = commit(source, version)
         bundle = folder / f"probe-{version}.bundle"
@@ -150,6 +163,80 @@ def callback_fixture(body: dict[str, Any], submit_command: str) -> dict[str, Any
         "id": "fixture-callback-submit" if callback else "fixture-start-build", "type": "function",
         "function": {"name": "shell", "arguments": json.dumps({"command": command, "description": "release fixture",
                     "login": False, "run_in_background": not callback, "yield_time_ms": 50 if not callback else 10000})}}]}
+
+
+def request_for_session(host: Host, session: str) -> Path | None:
+    paths = [path for path in (host.root / "run/self-deploy").glob("*.json")
+             if read_json(path)["request"]["stop"]["session_id"] == session]
+    assert len(paths) <= 1
+    return paths[0] if paths else None
+
+
+async def scripted_reply(host: Host, body: dict[str, Any], command: str) -> dict[str, Any] | None:
+    if not body.get("tools"):
+        return None
+    messages = body["messages"]
+    if any(AFTER_RECEIPT_FAILURE in str(message.get("content")) for message in messages if message["role"] == "user"):
+        return {"role": "assistant", "content": "Admission restored."}
+    if (any(RECEIPT_FAILURE_INPUT in str(message.get("content")) for message in messages if message["role"] == "user")
+            and any(message["role"] == "tool" for message in messages)):
+        async with asyncio.timeout(90):
+            while True:
+                path = request_for_session(host, RECEIPT_FAILURE_SESSION)
+                if path is not None and read_json(path).get("preflight", {}).get("boot_probe", {}).get("conversation") == "passed":
+                    path.parent.chmod(0o500)
+                    break
+                await asyncio.sleep(0.1)
+        return {"role": "assistant", "content": "Ready to stop."}
+    return callback_fixture(body, command)
+
+
+async def verify_receipt_write_failure(host: Host, folder: Path, commit: str, history_session: str) -> None:
+    old = host.ready()
+    selection = (host.workspace / "runtime/plugin-stable.json").read_bytes()
+    receipt_dir = host.root / "run/self-deploy"
+    mode = receipt_dir.stat().st_mode & 0o777
+    (folder / "next.json").write_text(json.dumps(["submit", "--commit", commit]))
+    async with await connect(host) as client:
+        history = (await client.message_read(history_session, limit=100))["items"]
+        await client.request("programmatic/session/admit", {"session_id": RECEIPT_FAILURE_SESSION, "persist_memory": False})
+        async with await client.session_follow(RECEIPT_FAILURE_SESSION) as feed:
+            try:
+                await client.request("programmatic/message/send", {"session_id": RECEIPT_FAILURE_SESSION,
+                                     "message_id": RECEIPT_FAILURE_SESSION + ":input", "text": RECEIPT_FAILURE_INPUT})
+                async with asyncio.timeout(115):
+                    async for _ in feed.events():
+                        page = await client.message_read(RECEIPT_FAILURE_SESSION, limit=100)
+                        if any("Ready to stop." in str(item["body"].get("parts")) for item in page["items"]):
+                            break
+                    path = request_for_session(host, RECEIPT_FAILURE_SESSION)
+                    assert path is not None and receipt_dir.stat().st_mode & 0o777 == 0o500
+                    record = read_json(path)
+                    unit = record["request"]["unit"]
+                    while (await asyncio.to_thread(run, "systemctl", "--user", "show", unit, "-p",
+                                                    "ActiveState", "--value")).strip() in {"active", "activating"}:
+                        await asyncio.sleep(0.1)
+                    journal = await asyncio.to_thread(run, "journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat")
+                    assert "PermissionError" in journal and "无法保存失败回执" in journal, journal
+                    assert read_json(path) == record and record["status"] == "preflight" and "publication" not in record
+            finally:
+                receipt_dir.chmod(mode)
+        assert host.ready() == old and host.chat_ready()
+        assert not (host.workspace / "runtime/closed" / f"{old['bootId']}.json").exists()
+        assert (host.workspace / "runtime/plugin-stable.json").read_bytes() == selection
+        assert read_json(host.launch_path) == {"commit": old["sourceCommit"]}
+        assert (await client.message_read(history_session, limit=100))["items"] == history
+        new_session = "programmatic:wsl-admission-restored"
+        await client.request("programmatic/session/admit", {"session_id": new_session, "persist_memory": False})
+        async with await client.session_follow(new_session) as feed:
+            await client.request("programmatic/message/send", {"session_id": new_session,
+                                 "message_id": new_session + ":input", "text": AFTER_RECEIPT_FAILURE})
+            async with asyncio.timeout(20):
+                async for _ in feed.events():
+                    result = await client.message_read(new_session, limit=100)
+                    if any("Admission restored." in str(item["body"].get("parts")) for item in result["items"]):
+                        break
+    print("STOP RECEIPT FAILURE reopened admission on the same boot and completed fresh chat", flush=True)
 
 
 async def report_items(host: Host, session: str, request_id: str, expected: str) -> list[dict[str, Any]]:
@@ -258,7 +345,7 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
     cli = [sys.executable, "-B", str(ROOT / "scripts/akashic_release/cli.py"), "wsl", "--profile", str(profile)]
     command = f"{sys.executable} -B {folder / 'shell.py'}"
     server, model_port = await start_model_server(folder, command=command,
-                                                 scripted_reply=lambda body: callback_fixture(body, command))
+                                                 scripted_reply=lambda body: scripted_reply(host, body, command))
     try:
         with unit_file.open("x") as stream:
             stream.write(unit_text)
@@ -298,6 +385,9 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
                      "programmatic:wsl-stale", status="failed_preflight")
         assert host.ready() == old
         print("PREFLIGHT refused a stale Root without restarting", flush=True)
+
+        await verify_receipt_write_failure(host, folder, builtin, bad_session)
+
         builtin_session = "programmatic:wsl-builtin"
         builtin_job, before = await submit(host, folder, ["submit", "--commit", builtin], builtin_session)
         assert before["preflight"]["boot_probe"]["conversation"] == "passed"
@@ -320,6 +410,7 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         job, failed = await submit(host, folder, ["submit", "--commit", mixed, "--plan", str(plan), "--inputs", str(folder)],
                                    "programmatic:wsl-mixed", status="selected_not_started")
         assert host.selection.read() == failed["publication"]["new_root_ref"]
+        assert "recovery" not in failed
         if desktop:
             await desktop_notice(host, job.stem)
         # Recreate the durable launch state immediately after publication and before activation.
@@ -356,6 +447,37 @@ ExecStart={sys.executable} -B -m scripts.akashic_release.wsl --profile {profile}
         assert any("deploy-akashic" in str(message.get("content")) and "原生 WSL" in str(message.get("content"))
                    for request in requests for message in request["messages"] if message["role"] in {"system", "developer"})
         print("ROLLBACK recovered directly from a failed startup", flush=True)
+
+        # A real cleanup failure can leave the plugin journal pending. Run this case last.
+        async with await connect(host) as client:
+            earlier = (await client.message_read(bad_session, limit=100))["items"]
+        old = host.ready()
+        marker = host.workspace / "plugin-data/release_probe-local/fail-stop-once"
+        marker.touch(exist_ok=False)
+        failed_stop_session = "programmatic:wsl-stop-failure"
+        stop_job, failed_stop = await submit(host, folder, ["submit", "--commit", mixed],
+                                             failed_stop_session, status="failed_stop")
+        assert not marker.exists() and "关闭回执" in failed_stop["error"]
+        assert not (host.workspace / "runtime/closed" / f"{old['bootId']}.json").exists()
+        assert "publication" not in failed_stop and "rollback" not in failed_stop
+        assert failed_stop["recovery"]["status"] == "restored", failed_stop
+        recovered = host.ready()
+        assert failed_stop["recovery"]["ready"] == recovered
+        assert recovered["bootId"] != old["bootId"] and recovered["invocation"] != old["invocation"]
+        assert recovered["sourceCommit"] == old["sourceCommit"] and recovered["root"] == old["root"]
+        assert read_json(host.launch_path) == {"commit": old["sourceCommit"]}
+        assert read_json(host.root / "active.json") == recovered
+        assert len(await report_items(host, failed_stop_session, stop_job.stem, "发布失败，旧版已恢复")) == 1
+        async with await connect(host) as client:
+            assert (await client.message_read(bad_session, limit=100))["items"] == earlier
+        print("STOP FAILURE restored the old release without publication and reported it to the same session", flush=True)
+
+        retry_job, retry = await submit(host, folder, ["submit", "--commit", mixed],
+                                         "programmatic:wsl-stop-failure-retry", status="failed_preflight")
+        assert "尚未结算" in retry["error"] and "publication" not in retry
+        assert host.ready() == recovered
+        assert len(await report_items(host, "programmatic:wsl-stop-failure-retry", retry_job.stem, "尚未结算")) == 1
+        print("STOP RETRY refused another shutdown while the cleanup journal was pending", flush=True)
     finally:
         await server.cleanup()
         for path in (host.root / "run/self-deploy").glob("*.json"):
