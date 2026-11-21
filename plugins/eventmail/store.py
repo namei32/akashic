@@ -846,6 +846,20 @@ class EventMailStore:
             else _parse_datetime(str(row["deadline"]))
         )
 
+    def due_alerts(self, now: datetime) -> tuple[Mapping[str, object], ...]:
+        instant = _aware_utc(now)
+        with self._transaction(write=False) as connection:
+            rows = connection.execute("""
+                SELECT projection.source_id, projection.event_id, projection.mail_id,
+                       envelope.payload_json, envelope.observed_at
+                FROM alert_projection AS projection JOIN mail_envelopes AS envelope USING(mail_id)
+                WHERE projection.status='pending' AND projection.not_before<=?
+                  AND (projection.expires_at IS NULL OR projection.expires_at>?)
+                ORDER BY projection.not_before,envelope.seq
+            """, (instant, instant)).fetchall()
+        return tuple({"ref": {key: str(row[key]) for key in ("source_id", "event_id", "mail_id")},
+                      "payload": _decode_payload(row["payload_json"]), "observed_at": row["observed_at"]} for row in rows)
+
     def peek_alert(self, now: datetime) -> Mapping[str, object] | None:
         """只读最早到期候选的身份，让来源先保存准确请求再领取。"""
         instant = _aware_utc(now)
