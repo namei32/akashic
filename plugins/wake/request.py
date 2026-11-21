@@ -68,6 +68,7 @@ class Request(BaseModel):
     memory_blocked: str = ""
     source_policy: str = ""
     source_config_revision: str = ""
+    watch_private: bool = False
     source_evidence: tuple[SourceEvidence, ...] = ()
     source_rejections: tuple[dict[str, str], ...] = Field(default=(), max_length=20)
     memory_source_session: str = ""

@@ -15,10 +15,11 @@ from plugins.eventmail.contract import EVENTMAIL_DELIVERY_V2 as EVENTMAIL_DELIVE
 from core.common.file_io import run_file_io
 
 from .store import EventMailStore
+from .contract import WATCH_ALERTS
 
 api_version = 3
 name = "eventmail"
-version = "4.1.0"
+version = "4.2.0"
 desc = "Immutable Content, Alert, and Context mailbox"
 author = "Akashic Core"
 inject = ()
@@ -419,6 +420,10 @@ async def apply(ctx: Context) -> None:
         _ContextSourceServices(store, io, lambda: ctx.emit(EVENTMAIL_CHANGED, None)),
     )
     _ = await ctx.provide(EVENTMAIL_WAKE, _WakeServices(store, io))
+    async def alerts(now: datetime) -> tuple[Mapping[str, object], ...]:
+        return await run_file_io(lambda: store.due_alerts(now))
+
+    await ctx.provide(WATCH_ALERTS, ctx.entrypoint(alerts))
     _ = await ctx.provide(EVENTMAIL_DELIVERY, _DeliveryServices(store, io))
 
 
