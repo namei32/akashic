@@ -12,7 +12,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from default_memory_scenario import run
-from drift_memory_wake_scenario import TARGET, configure as configure_wake, wait_for_tool_clock
+from drift_memory_wake_scenario import TARGET, configure as configure_wake, wait_for_tool_clock, watch_reply
 
 
 def configure(sources: Path, workspace: Path) -> None:
@@ -122,6 +122,9 @@ async def scenario(folder: Path) -> dict[str, object]:
     present.mkdir()
     absent.mkdir()
     async def chat(payload):
+        classification = watch_reply(payload)
+        if classification is not None:
+            return classification
         if "share_content" not in json.dumps(payload.get("tools", [])):
             return None
         return {"id": "wake-fixture", "object": "chat.completion", "model": "memory-fixture",

@@ -6,8 +6,7 @@ from datetime import datetime
 
 from agent.plugin_composition import Context
 from agent.plugin_composition.plugin_config import PLUGIN_CONFIG
-from plugins.drift.contract import DRIFT_CHANGED, DRIFT_DELIVERY_V2, DRIFT_WAKE_V3
-from plugins.timer.contract import TIMERS
+from plugins.drift.contract import DRIFT_CHANGED, DRIFT_DELIVERY_V2, DRIFT_WAKE_V3, INITIATIVE_CLOCK, InitiativeClock
 from plugins.wake.contract import WAKE_CONTACT, WAKE_MEMORY_READY
 
 from core.common.file_io import run_file_io
@@ -15,12 +14,12 @@ from core.common.file_io import run_file_io
 from .store import DriftStore
 from .controls import mount, mount_configuration
 from .initiative import Initiative
-from .producer import follow
+from .producer import offer
 from .schema import ProducerConfig
 
 api_version = 3
 name = "drift"
-version = "3.1.0"
+version = "3.2.0"
 desc = "Durable Drift proposal state"
 author = "Akashic Core"
 inject = ()
@@ -83,6 +82,14 @@ async def apply(ctx: Context) -> None:
     config = ProducerConfig.model_validate(ctx.config)
     if config.auto_propose:
         async def producer(child: Context) -> None:
-            await child.spawn(follow(child, config, initiative), name="drift-producer")
-        dependencies = (TIMERS, WAKE_CONTACT, WAKE_MEMORY_READY) if config.memory_assisted else (TIMERS, WAKE_CONTACT)
+            async def tick(now: datetime, purpose: str) -> None:
+                await offer(child, config, initiative, now, purpose)
+            clock = InitiativeClock(config.interval_seconds, child.entrypoint(tick))
+            class ClockPort:
+                def open(self, consumer: Context) -> InitiativeClock:
+                    if consumer.require_runtime_identity(INITIATIVE_CLOCK, self).plugin_id != "watch":
+                        raise PermissionError("只有值班 owner 可以请求定时机会")
+                    return clock
+            await child.provide(INITIATIVE_CLOCK, ClockPort())
+        dependencies = (WAKE_CONTACT, WAKE_MEMORY_READY) if config.memory_assisted else (WAKE_CONTACT,)
         await ctx.inject(dependencies, producer, name="producer")

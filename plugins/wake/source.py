@@ -230,6 +230,8 @@ class Source:
         await ctx.require(DELIVERY).open(ctx).wait_idle(request.sink["name"], request.sink["address"])
         if not task.active:
             raise asyncio.CancelledError
+        if request.watch_private:
+            start_guard = self._private_guard(request, start_guard)
         async with start_guard() if start_guard is not None else nullcontext(None) as reason:
             _check_initiative_guard(reason)
             if phase_message is None:
@@ -629,6 +631,9 @@ class Source:
         """通知正文与原 Sink 一起提交；未知或拒绝回执不冒充领域已送达。"""
         target = request.target
         ctx = self.ctx
+        if request.watch_private:
+            start_guard = self._private_guard(request, start_guard)
+            publish_guard = self._private_guard(request, publish_guard)
         delivery = ctx.require(DELIVERY).open(ctx)
         reader = ctx.require(MESSAGE_CATALOG).reader(target.session_id)
         sink = request.sink
@@ -658,6 +663,28 @@ class Source:
         else:
             receipt = await delivery.send(message.message_id, sink["name"], start_guard=start_guard)
         return receipt.status == "delivered"
+
+    def _private_guard(self, request: Request, inner: StartGuard | None) -> StartGuard:
+        @asynccontextmanager
+        async def checked() -> AsyncIterator[str | None]:
+            target = request.target
+            from .api import Config
+            config = Config.model_validate(self.ctx.config)
+            if config.enabled is not True or config.delivery != target:
+                yield "target_unavailable"
+                return
+            with self.ctx.borrow(private_target_key(target.channel)) as verifier:
+                if verifier is None:
+                    yield "private_provider_unavailable"
+                    return
+                proof = verifier.guard(target.recipient, target.session_id)
+            async with proof as private:
+                if not private:
+                    yield "target_unavailable"
+                else:
+                    async with inner() if inner is not None else nullcontext(None) as reason:
+                        yield reason
+        return checked
 
     async def _alert(self, task: Task, request: Request, reader: MessageReader) -> str:
         """告警始终匹配原 envelope，领取后的过期与确认也核对实际发送状态。"""
@@ -701,7 +728,8 @@ class Source:
         def start_guard():
             return domain.alert_start(ref, expires_at, self.now)
 
-        if not await self._notify(task, request, value.message, start_guard=start_guard):
+        if not await self._notify(task, request, value.message, start_guard=start_guard,
+                                  publish_guard=start_guard if request.watch_private else None):
             receipt = delivery.receipt(request.notification_id, request.sink["name"])
             if receipt is not None and receipt.status == "rejected":
                 if await domain.change_alert(ref, request.accepted, "expire", self.now()):

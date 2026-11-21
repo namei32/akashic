@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import asynccontextmanager
 from functools import partial
 from importlib import import_module
 
 from agent.plugin_composition import (
-    RUNTIME_STARTED,
-    RUNTIME_STOPPING,
     Context,
     ServiceKey,
 )
@@ -20,7 +17,6 @@ from plugins.ledger.contract import (
     SESSION_ADMISSION,
 )
 from agent.plugin_composition.tasks import TASKS
-from plugins.timer.contract import TIMERS
 from plugins.ui.contract import UI
 from plugins.models.contract import MODEL_CONTENT, MODEL_SELECTION
 from plugins.models.contract import MODEL_CATALOG
@@ -33,14 +29,12 @@ from ._boundary import (
     DELIVERY,
     DELIVERY_READ,
     DELIVERY_SENDERS,
-    SEMANTIC_INTEREST,
     TOOLS,
     ToolRef,
 )
 from .api import (
     DRIFT_DELIVERY,
     DRIFT_WAKE,
-    EVENTMAIL_CHANGED,
     EVENTMAIL_DELIVERY,
     EVENTMAIL_WAKE,
     Config,
@@ -49,13 +43,13 @@ from .program import REPLY_EXECUTE, SOURCE_CHECK, run
 from .request import WAKE_PROGRAM, WAKE_TOOLS_VIEW, check_phase, check_request
 from .runtime import DashboardView, Runtime
 from .tools import SCHEMAS, DecisionTool
-from .contract import WAKE_CONTACT, WAKE_MEMORY_READY, WakeContact
+from .contract import SCOPED_CONTACT, ScopedContact, WAKE_CONTACT, WAKE_MEMORY_READY, WakeContact
 from .initiative_memory import GLOBAL_PROMPT_REPLY, memory_key
 from plugins.drift.contract import DRIFT_CHANGED
 
 api_version = 3
 name = "wake"
-version = "4.1.0"
+version = "4.2.0"
 desc = "内部消息完成初筛、调查与告警，真实送达后确认原职责"
 function_inject = (
     MODEL_SELECTION, MODEL_CONTENT, MODEL_CATALOG,
@@ -74,27 +68,11 @@ function_inject = (
     EVENTMAIL_DELIVERY,
     DRIFT_WAKE,
     DRIFT_DELIVERY,
-    TIMERS,
-    SEMANTIC_INTEREST,
     DELIVERY_READ,
     ALL_TOOLS,
 )
 
 WAKE_DASHBOARD = ServiceKey[Callable[[], DashboardView | None]]("wake.dashboard.v1")
-
-
-async def _stop_watcher(watcher: asyncio.Task[None]) -> None:
-    """Drain a watcher without replaying a completed business failure as stop failure."""
-
-    cancel_requested = watcher.cancel() if not watcher.done() else False
-    try:
-        await watcher
-    except asyncio.CancelledError:
-        if asyncio.current_task().cancelling():
-            raise
-    except Exception:
-        if cancel_requested:
-            raise
 
 
 async def start_function(ctx: Context) -> None:
@@ -152,28 +130,16 @@ async def start_function(ctx: Context) -> None:
     _ = await ctx.provide(WAKE_TOOLS_VIEW, catalog.view(*refs))
     _ = await ctx.provide(WAKE_PROGRAM, partial(run, ctx))
 
-    runtime: Runtime | None = None
-    watcher: asyncio.Task[None] | None = None
-
-    async def start(_event: object) -> None:
-        nonlocal runtime, watcher
-        runtime = Runtime(ctx, config)
-        watcher = await ctx.spawn(runtime.follow(), name="wake")
-
-    async def stop(_event: object) -> None:
-        nonlocal runtime
-        if watcher is not None:
-            await _stop_watcher(watcher)
-        runtime = None
-
-    def changed(_event: object) -> None:
-        if runtime is not None:
-            runtime.changed.set()
-
-    _ = await ctx.on(RUNTIME_STARTED, start)
-    _ = await ctx.on(RUNTIME_STOPPING, stop)
-    _ = await ctx.on(EVENTMAIL_CHANGED, changed)
-    _ = await ctx.on(DRIFT_CHANGED, changed)
+    runtime = Runtime(ctx, config)
+    scoped = ScopedContact(
+        WakeContact(target.channel, target.recipient, target.session_id, config.timezone),
+        ctx.entrypoint(runtime.recover), ctx.entrypoint(runtime.dispatch))
+    class ContactPort:
+        def open(self, consumer: Context) -> ScopedContact:
+            if consumer.require_runtime_identity(SCOPED_CONTACT, self).plugin_id != "watch":
+                raise PermissionError("只有值班 owner 可以接纳主动请求")
+            return scoped
+    await ctx.provide(SCOPED_CONTACT, ContactPort())
 
 
 

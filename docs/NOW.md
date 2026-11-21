@@ -81,9 +81,10 @@ systemd unit 与 release 路径耦合需要独立复核；当前是评审风险�
 - 由维护者继续确认 [`design/persistence-state-map.md`](design/persistence-state-map.md) 的 INT-009、INT-010、INT-012～INT-014，以及旧消息编辑和 turns retention；INT-001～INT-008、INT-011 已提升为 projectneed 条款。
 - 把已确认的持久化状态地图转成机器可读备份 manifest，补齐目录快照、global companion state 和隔离恢复演练；确认 snapshot 能启动只读 runtime，并读取会话、记忆、调度、插件数据和主动流程连续性。
 
-## P1 · Drift 主动意图与工作执行
+## P1 · Watch 主动联系的发布验收
 
-按 [Drift 设计](design/drift-initiative.md) 设计并接入 Source/Reply 工作执行。尚需验证授权工作产物与正式渠道投递；已实现的范围内记忆交流不替代这些验收。
+按 [0144](decisions/0144-watch-scoped-contact.md) 验收升级后的插件选择、原授权和待结算回执。
+隔离验证不代替正式部署或渠道送达；不再推进无人值守的通用工具执行。
 
 ## P2 · PTY resize 既有规格差距
 

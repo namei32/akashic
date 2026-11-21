@@ -17,7 +17,6 @@ from plugins.delivery.contract import (
     DELIVERY_SENDERS,
     SenderDefinition,
 )
-from plugins.akasha.contract import SEMANTIC_INTEREST
 from plugins.ledger.contract import Input
 from plugins.gateway.contract import RpcMethod
 from .contract import WAKE_MEMORY_READY
@@ -35,8 +34,6 @@ class Settings:
         self.ctx, self.model, self.function = ctx, model, function
         self.models: Callable[[], ModelCatalogSnapshot] | None = None
         self.senders: Callable[[], tuple[Any, ...]] | None = None
-        self.interest: Callable[[], str | None] | None = None
-        self.interest_decision: Callable[[], bool | None] | None = None
 
     def targets(self) -> list[dict[str, str]]:
         if self.senders is None:
@@ -74,11 +71,6 @@ class Settings:
             blocked = bool(missing)
             if missing:
                 reason = "缺少前置能力：" + "、".join(missing)
-            elif self.interest is None:
-                reason, blocked = "Akasha 兴趣能力未安装或不可用", True
-            elif self.interest() is not None:
-                reason = self.interest() or "Akasha 不可用"
-                blocked = self.interest_decision is not None and self.interest_decision() is not True
             elif model is None or selected_model is None or model.model(selected_model).availability != 'available':
                 reason = "请先选择默认聊天模型"
             elif not self.targets():
@@ -158,15 +150,4 @@ async def mount(ctx: Context, model: type[BaseModel], function: FiberHandle) -> 
             settings.senders = child.entrypoint(child.require(DELIVERY_SENDERS).candidates)
             return lambda: setattr(settings, "senders", None)
         await child.effect(attach, label="sender-options")
-    async def interest(child: Context):
-        def attach():
-            service = child.require(SEMANTIC_INTEREST)
-            settings.interest = child.entrypoint(service.status)
-            settings.interest_decision = child.entrypoint(service.decision)
-            def stop():
-                settings.interest = None
-                settings.interest_decision = None
-            return stop
-        await child.effect(attach, label="interest-status")
     await ctx.inject((DELIVERY_SENDERS,), senders, name="sender-options")
-    await ctx.inject((SEMANTIC_INTEREST,), interest, name="interest-status")

@@ -30,6 +30,11 @@ def _view(context: DashboardContext) -> DashboardView:
 
 def _latest_initiative(view: DashboardView) -> dict[str, object] | None:
     attempt = next((item for item in view.list_attempts(50) if item.get("owner") == "drift"), None)
+    runs = view.list_runs(50)
+    newest = next((item for item in runs if item.get("owner") == "drift"), None)
+    if newest is not None and (attempt is None or str(newest.get("started_at")) > str(attempt.get("fired_at"))):
+        attempt = {"attempt_id": newest.get("run_id"), "fired_at": newest.get("started_at"),
+                   "completed_at": newest.get("completed_at"), "outcome": "awaiting_receipt"}
     if attempt is None:
         return None
     identity = attempt.get("attempt_id")
@@ -37,7 +42,7 @@ def _latest_initiative(view: DashboardView) -> dict[str, object] | None:
     latest.update(memory_status=None, delivery_status=None, reason=None)
     if not isinstance(identity, str):
         return latest
-    run = next((item for item in view.list_runs(50) if item.get("run_id") == identity), None)
+    run = next((item for item in runs if item.get("run_id") == identity), None)
     detail = run.get("decision_detail") if run else None
     if isinstance(detail, str):
         if detail == "主动机会、授权或记忆材料已失效":
@@ -56,6 +61,13 @@ def _latest_initiative(view: DashboardView) -> dict[str, object] | None:
     delivery = flow.get("delivery")
     if isinstance(delivery, Mapping) and isinstance(delivery.get("status"), str):
         latest["delivery_status"] = delivery["status"]
+        if latest["outcome"] == "awaiting_receipt":
+            if delivery["status"] == "delivered":
+                latest["outcome"] = "shared"
+            elif delivery["status"] in {"rejected", "failed"}:
+                latest["outcome"] = delivery["status"]
+            elif run is not None and run.get("decision") in {"defer", "skip"}:
+                latest["outcome"] = "model_skip" if run["decision"] == "skip" else "deferred"
     messages = flow.get("messages")
     if isinstance(messages, list):
         for message in messages:

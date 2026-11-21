@@ -1,8 +1,9 @@
 """Read-only contact selected by the active Wake function."""
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
-from agent.plugin_composition import ServiceKey
+from agent.plugin_composition import Context, ServiceKey
+from typing import Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,3 +20,17 @@ class WakeContact:
 WAKE_CONTACT = ServiceKey[Callable[[], WakeContact]]("wake.contact.v1")
 # Published only when Wake can safely consume memory-assisted opportunities.
 WAKE_MEMORY_READY = ServiceKey[object]("wake.memory-initiative.v1")
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedContact:
+    target: WakeContact
+    recover: Callable[[], Awaitable[None]]
+    dispatch: Callable[[str, str, Mapping[str, object]], Awaitable[str]]
+
+
+class ContactService(Protocol):
+    def open(self, consumer: Context) -> ScopedContact: ...
+
+
+SCOPED_CONTACT = ServiceKey[ContactService]("wake.scoped-contact.v1")

@@ -987,6 +987,10 @@ add、cancel 和 reschedule 先构造 candidate，持久化成功后才替换内
 
 ### PRO-001 主动流程的空、跳过和失败可区分
 
+主动联系由 [0144 · 受限 Watch](decisions/0144-watch-scoped-contact.md) 决定时机。
+新流程用值班记录及逐事件去向替代 PRO-005 的旧 Wake Timer attempt 与 PRO-006 的质量池准入；
+既有记录、授权及领取/回执仍由原 owner 保存。停用 Watch 不得触发旧循环作为后备。
+
 sensor、session、context 和 store 故障不得伪装成“无事件”。decision、dedupe、presence 和成功状态只在真实送达后提交；合法 skip 带 reason，内部错误可观察。
 
 ### PRO-002 主动、Wake 和 Drift 状态必须连续恢复
