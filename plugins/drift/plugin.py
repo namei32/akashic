@@ -19,7 +19,7 @@ from .schema import ProducerConfig
 
 api_version = 3
 name = "drift"
-version = "3.2.0"
+version = "3.2.1"
 desc = "Durable Drift proposal state"
 author = "Akashic Core"
 inject = ()
@@ -87,7 +87,7 @@ async def apply(ctx: Context) -> None:
             clock = InitiativeClock(config.interval_seconds, child.entrypoint(tick))
             class ClockPort:
                 def open(self, consumer: Context) -> InitiativeClock:
-                    if consumer.require_runtime_identity(INITIATIVE_CLOCK, self).plugin_id != "watch":
+                    if consumer.require_runtime_identity(INITIATIVE_CLOCK, self).plugin_id not in {"watch", "watch@release"}:
                         raise PermissionError("只有值班 owner 可以请求定时机会")
                     return clock
             await child.provide(INITIATIVE_CLOCK, ClockPort())

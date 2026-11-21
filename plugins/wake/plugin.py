@@ -49,7 +49,7 @@ from plugins.drift.contract import DRIFT_CHANGED
 
 api_version = 3
 name = "wake"
-version = "4.2.0"
+version = "4.2.1"
 desc = "内部消息完成初筛、调查与告警，真实送达后确认原职责"
 function_inject = (
     MODEL_SELECTION, MODEL_CONTENT, MODEL_CATALOG,
@@ -136,7 +136,7 @@ async def start_function(ctx: Context) -> None:
         ctx.entrypoint(runtime.recover), ctx.entrypoint(runtime.dispatch))
     class ContactPort:
         def open(self, consumer: Context) -> ScopedContact:
-            if consumer.require_runtime_identity(SCOPED_CONTACT, self).plugin_id != "watch":
+            if consumer.require_runtime_identity(SCOPED_CONTACT, self).plugin_id not in {"watch", "watch@release"}:
                 raise PermissionError("只有值班 owner 可以接纳主动请求")
             return scoped
     await ctx.provide(SCOPED_CONTACT, ContactPort())
