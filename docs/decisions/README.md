@@ -180,3 +180,4 @@
 
 - [0142 · Wake 固定主动记忆提供者](0142-wake-freezes-initiative-memory-provider.md)：implemented for review；Akasha 的范围快照和短保护延续 Drift 的目标授权及送达协议。
 - [0143 · 已提交的模型输出携带续聊所需事实](0143-model-output-carries-replay-facts.md) 规定模型历史回放、旧回执缺失恢复和消息保全。
+- [0144 · Watch 接管主动联系](0144-watch-scoped-contact.md)：替换触发器与判读器，不采用上游的后台通用执行权。

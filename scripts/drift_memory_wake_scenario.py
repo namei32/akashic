@@ -5,6 +5,7 @@ import argparse
 import asyncio
 from datetime import UTC, datetime, timedelta
 import json
+import re
 from pathlib import Path
 import shutil
 import sqlite3
@@ -108,15 +109,33 @@ async def apply(ctx):
 
 def configure(sources: Path, workspace: Path) -> None:
     for name in ("sources", "conversation", "react", "reply_program", "tool_search",
-                 "drift", "wake", "eventmail", "timer", "delivery_policy"):
+                 "drift", "wake", "watch", "eventmail", "timer", "delivery_policy"):
         shutil.copytree(ROOT / "plugins" / name, sources / name, ignore=shutil.ignore_patterns("__pycache__"))
     delivery_sources(sources)
     (sources / "scenario_private_target").mkdir()
     (sources / "scenario_private_target/plugin.py").write_text(PROOF)
     save_config(workspace / "plugin-data/wake-builtin", {"enabled": True, "delivery": TARGET, "timezone": "UTC"})
     save_config(workspace / "plugin-data/drift-builtin", {"auto_propose": False})
+    save_config(workspace / "plugin-data/watch-builtin", {"interval_seconds": 10})
     save_config(workspace / "plugin-data/context-builtin", {
         "prompt_sources": {"trusted-global": "scenario_private_target"}})
+
+
+def watch_reply(payload):
+    names = [tool["function"]["name"] for tool in payload.get("tools", [])]
+    if "decide" in names:
+        assert names == ["decide"]
+        assert "coffee without sugar" not in json.dumps(payload)
+        lines = re.findall(r"^#([a-f0-9]{64}) (.*)$", payload["messages"][-1]["content"], re.MULTILINE)
+        assert lines, payload
+        items = [{"id": event, "to": "inbox" if "later-card" in line else "log" if "log-card" in line else "wake",
+                  "why": "受限值班分类"} for event, line in lines]
+        return {"id": "watch-decision", "object": "chat.completion", "model": "memory-fixture",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": None,
+                    "tool_calls": [{"id": "decision", "type": "function", "function": {"name": "decide",
+                    "arguments": json.dumps({"items": items})}}]},
+                    "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
+    return None
 
 
 async def scenario(memory_source: Path | None, *, provider: str = "default_memory") -> dict[str, object]:
@@ -125,6 +144,16 @@ async def scenario(memory_source: Path | None, *, provider: str = "default_memor
     decision = ["share"]
 
     async def chat(payload):
+        classification = watch_reply(payload)
+        if classification is not None:
+            return classification
+        names = [tool["function"]["name"] for tool in payload.get("tools", [])]
+        if names == ["share_alert"]:
+            return {"id": "alert-fixture", "object": "chat.completion", "model": "memory-fixture",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": "alert-call", "type": "function", "function": {"name": "share_alert",
+                         "arguments": json.dumps({"message": "个人来源提醒"})}}]}, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
         if "share_content" not in json.dumps(payload.get("tools", []), ensure_ascii=False):
             return None
         model_requests.append(payload)
@@ -312,13 +341,12 @@ async def scenario(memory_source: Path | None, *, provider: str = "default_memor
         await propose("invalid-decision", 3)
         release.set()
         await wait_state("invalid-decision", "await_change")
-        attempts = workspace / "plugin-data/wake-builtin/wake.sqlite3"
+        attempts = workspace / "plugin-data/watch-builtin/watch.sqlite3"
         async with asyncio.timeout(10):
             while True:
                 with sqlite3.connect(attempts) as db:
-                    invalid = db.execute("SELECT a.outcome FROM wake_attempts a JOIN wake_runs r ON a.attempt_id=r.run_id "
-                                         "WHERE r.decision_detail=? AND a.outcome!='checking'",
-                                         ("Drift 没有提交唯一有效决定",)).fetchone()
+                    invalid = db.execute("SELECT outcome FROM decisions WHERE json_extract(ref,'$.proposal_id')=? AND outcome IS NOT NULL",
+                                         ("invalid-decision",)).fetchone()
                 if invalid:
                     break
                 await asyncio.sleep(.05)
@@ -332,9 +360,8 @@ async def scenario(memory_source: Path | None, *, provider: str = "default_memor
         async with asyncio.timeout(10):
             while True:
                 with sqlite3.connect(attempts) as db:
-                    failed = db.execute("SELECT a.outcome FROM wake_attempts a JOIN wake_runs r ON a.attempt_id=r.run_id "
-                                        "WHERE r.decision_detail=? AND a.outcome='failed'",
-                                        ("Drift 没有提交唯一有效决定",)).fetchone()
+                    failed = db.execute("SELECT outcome FROM decisions WHERE json_extract(ref,'$.proposal_id')=? AND outcome IS NOT NULL",
+                                        ("model-failure",)).fetchone()
                 if failed:
                     break
                 await asyncio.sleep(.05)
@@ -366,7 +393,27 @@ async def scenario(memory_source: Path | None, *, provider: str = "default_memor
             admissions = db.execute("SELECT count(*) FROM owner_records WHERE owner=? AND key LIKE ?",
                                     ("plugin:wake", "memory-recall:%")).fetchone()[0]
         assert admissions == 6, admissions
-        return {"scoped_prompt": True, "revoked_and_forgotten_do_not_publish": True,
+        from plugins.eventmail.contract import EVENTMAIL_ALERT_SOURCE, EVENTMAIL_CONTENT_SOURCE
+        timer_source = root.context.require(EVENTMAIL_ALERT_SOURCE).bind("lol_tracker")
+        feed = root.context.require(EVENTMAIL_CONTENT_SOURCE).bind("watch-fixture")
+        now = datetime.now(UTC)
+        try:
+            await feed.submit("two", [{"item_id": title, "revision": "1", "payload": {"title": title}}
+                                      for title in ("later-card", "log-card")])
+            await timer_source.report(event_id="legacy-report", payload={"title": "旧报告告警"}, observed_at=now)
+            async with asyncio.timeout(25):
+                while await timer_source.status(event_id="legacy-report") != "delivered":
+                    await asyncio.sleep(.1)
+            await timer_source.report(event_id="legacy-report", payload={"title": "旧报告告警"}, observed_at=now)
+            with sqlite3.connect(attempts) as db:
+                routes = dict(db.execute("SELECT title,route FROM decisions WHERE kind='content'"))
+            assert routes == {"later-card": "inbox", "log-card": "log"}, routes
+            assert len(sent.read_text().splitlines()) == 2
+        finally:
+            timer_source.close()
+            feed.close()
+        return {"watch_routes": routes, "legacy_alert_delivered": True,
+                "scoped_prompt": True, "revoked_and_forgotten_do_not_publish": True,
                 "pause_resume_reuses_decision": True, "fresh_opportunity_delivered_once": True,
                 "skip_does_not_publish": True, "invalid_decision_is_deferred": True,
                 "nonretryable_model_failure_reported": True, "unscoped_event_defers": True,

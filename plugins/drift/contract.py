@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
 from contextlib import AbstractAsyncContextManager
-from agent.plugin_composition import EmitEventKey, ServiceKey
+from agent.plugin_composition import Context, EmitEventKey, ServiceKey
 
 
 class DriftWakeServicesV3(Protocol):
@@ -48,3 +49,16 @@ DRIFT_CHANGED = EmitEventKey[None]("drift.initiative.changed.v1")
 
 
 DRIFT_DELIVERY_V2 = ServiceKey[DriftDeliveryServicesV2]("drift.delivery.v2")
+
+
+@dataclass(frozen=True, slots=True)
+class InitiativeClock:
+    interval_seconds: int
+    offer: Callable[[datetime, str], Awaitable[None]]
+
+
+class ClockService(Protocol):
+    def open(self, consumer: Context) -> InitiativeClock: ...
+
+
+INITIATIVE_CLOCK = ServiceKey[ClockService]("drift.scoped-clock.v1")

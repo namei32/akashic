@@ -41,7 +41,7 @@ async def run(ctx: Context, task: Task, reader: MessageReader, request: Request)
         return {"source": "wake", "session_id": request.session_id}
 
     try:
-        if phase.stage == "drift" and (request.memory_assisted or request.source_policy):
+        if request.watch_private or (phase.stage == "drift" and (request.memory_assisted or request.source_policy)):
             if GLOBAL_PROMPT_REPLY is None:
                 raise PromptUnavailable("范围受限的模型执行不可用")
             selected = ctx.borrow(GLOBAL_PROMPT_REPLY)
@@ -79,7 +79,7 @@ async def run(ctx: Context, task: Task, reader: MessageReader, request: Request)
                 ),
                 exclude_material_kinds=(
                     frozenset({"recall", "profile"})
-                    if phase.stage in {"investigate", "alert"} or (phase.stage == "drift" and (request.memory_assisted or request.source_policy))
+                    if request.watch_private or phase.stage in {"investigate", "alert"} or (phase.stage == "drift" and (request.memory_assisted or request.source_policy))
                     else frozenset()
                 ),
                 prompt_hints=(HINTS[phase.stage],),

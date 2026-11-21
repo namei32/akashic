@@ -34,10 +34,11 @@ async def run(folder: Path) -> None:
     target = {"channel": "test", "recipient": "room", "session_id": "test:room"}
 
     def configure(sources: Path) -> None:
-        for name in ("drift", "wake", "eventmail", "timer", "delivery_policy"):
+        for name in ("drift", "wake", "watch", "eventmail", "timer", "delivery_policy"):
             shutil.copytree(ROOT / "plugins" / name, sources / name,
                             ignore=shutil.ignore_patterns("__pycache__"))
         delivery_sources(sources)
+        save_config(workspace / "plugin-data/watch-builtin", {"interval_seconds": 10})
         save_config(workspace / "plugin-data/wake-builtin",
                     {"enabled": True, "delivery": target, "timezone": "UTC"})
         save_config(workspace / "plugin-data/drift-builtin",
@@ -49,7 +50,12 @@ async def run(folder: Path) -> None:
             "class Driver:\n        max_tool_schemas = None\n        wake_done = False\n        alert_done = False")
         code = code.replace(
             'if len(calls) == 1:\n                return LLMResponse(None, [ToolCall("provider-call", "write_evidence", {})])',
-            '''if "share_content" in str(request.tools) and not self.wake_done:
+            '''if "decide" in str(request.tools):
+                import re
+                ids = re.findall(r"^#([0-9a-f]{64}) ", request.messages[-1]["content"], re.MULTILINE)
+                return LLMResponse(None, [ToolCall("classify", "decide", {
+                    "items": [{"id": event, "to": "wake", "why": "已配置机会"} for event in ids]})])
+            if "share_content" in str(request.tools) and not self.wake_done:
                 self.wake_done = True
                 (ctx.data_root / "wake-entered").write_text("started")
                 while not (ctx.data_root / "wake-release").exists():
@@ -59,6 +65,12 @@ async def run(folder: Path) -> None:
                 self.alert_done = True
                 return LLMResponse(None, [ToolCall("alert-call", "share_alert", {"message": "测试告警"})])''')
         code = code.replace('await ctx.provide(ServiceKey("fixture.calls"), calls)', '''
+    from plugins.channels.contract import private_target_key
+    class Proof:
+        @asynccontextmanager
+        async def guard(self, recipient, session_id):
+            yield recipient == "room" and session_id == "test:room"
+    await ctx.provide(private_target_key("test"), Proof())
     from plugins.models.contract import MODEL_CATALOG
     from plugins.akasha.contract import SEMANTIC_INTEREST
     class Catalog:
@@ -72,6 +84,7 @@ async def run(folder: Path) -> None:
     await ctx.provide(MODEL_CATALOG, Catalog())
     await ctx.provide(SEMANTIC_INTEREST, Interest())
     await ctx.provide(ServiceKey("fixture.calls"), calls)''')
+        code = code.replace("    class Target:", "        independent_execution = execution\n    class Target:")
         provider.write_text(code)
 
     async with application(folder, replying=True, extra_sources=configure) as (log, host), AsyncExitStack() as cleanup:
@@ -110,6 +123,10 @@ async def run(folder: Path) -> None:
         fibers = {fiber["name"]: fiber for item in relevant for fiber in item["composition"]["fibers"]}
         assert fibers["drift/producer"]["state"] == "active", fibers["drift/producer"]
         assert fibers["wake/function"]["state"] == "active", fibers["wake/function"]
+        async with asyncio.timeout(15):
+            while not any(row.source == "conversation" and row.author == "assistant"
+                          for row in log.reader(target["session_id"]).snapshot()):
+                await asyncio.sleep(.05)
         before = tuple(log.reader(target["session_id"]).snapshot())
         assert original in before
         sent = workspace / "plugin-data/test_sender-builtin/sent.jsonl"
@@ -120,12 +137,11 @@ async def run(folder: Path) -> None:
                 await asyncio.sleep(0.2)
         await call("pause", request_id="pause-during-model", expected_version=0)
         (model_data / "wake-release").touch()
-        attempts = workspace / "plugin-data/wake-builtin/wake.sqlite3"
         async with asyncio.timeout(10):
             while True:
-                with sqlite3.connect(attempts) as db:
-                    outcome = db.execute("SELECT outcome FROM wake_attempts WHERE owner='drift'").fetchone()
-                if outcome is not None and outcome[0] == "deferred":
+                with sqlite3.connect(database) as db:
+                    outcome = db.execute("SELECT status FROM proposals WHERE proposal_id LIKE 'initiative:%'").fetchone()
+                if outcome == ("ready_for_delivery",):
                     break
                 await asyncio.sleep(0.1)
         assert not sent.exists() or not sent.read_text().strip()
@@ -137,7 +153,7 @@ async def run(folder: Path) -> None:
             await alert.report(event_id="alert", payload={"text": "需要注意的测试事件"}, observed_at=datetime.now(UTC))
         finally:
             alert.close()
-        async with asyncio.timeout(10):
+        async with asyncio.timeout(25):
             while not sent.exists() or len(sent.read_text().splitlines()) < 1:
                 await asyncio.sleep(0.1)
         await host.terminate_all()
@@ -150,7 +166,7 @@ async def run(folder: Path) -> None:
         calls = restored_root.context.require(ServiceKey("fixture.calls"))
         assert calls == []
         await call("resume", request_id="resume-after-alert", expected_version=1)
-        async with asyncio.timeout(10):
+        async with asyncio.timeout(25):
             while len(sent.read_text().splitlines()) < 2:
                 await asyncio.sleep(0.1)
         entries = [json.loads(line) for line in sent.read_text().splitlines()]
@@ -174,14 +190,14 @@ async def run(folder: Path) -> None:
         (model_data / "wake-release").unlink(missing_ok=True)
         before_expiry = tuple(log.reader(target["session_id"]).snapshot())
         now = datetime.now(UTC)
-        expiry = now + timedelta(seconds=10)
+        expiry = now + timedelta(seconds=22)
         opportunity = store.propose(
             "scenario:expire-during-model", "1",
             {"kind": "conversation", "valid_until": expiry.isoformat()}, now, initiative_target=target,
         )
         assert opportunity["inserted"] is True
         restored_root.context.emit(DRIFT_CHANGED, None)
-        async with asyncio.timeout(8):
+        async with asyncio.timeout(18):
             while not (model_data / "wake-entered").exists():
                 await asyncio.sleep(0.05)
         await asyncio.sleep(max(0, (expiry - datetime.now(UTC)).total_seconds()) + 0.1)
