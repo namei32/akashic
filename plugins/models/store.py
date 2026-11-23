@@ -178,8 +178,10 @@ class ModelCallReader:
 
             yield read
 
-    def replay(self, call_ids: tuple[str, ...]) -> Mapping[str, Mapping[str, Any]]:
-        """读取结算、binding 和调用协议扩展，不向投影提供完整响应。"""
+    def replay(
+        self, call_ids: tuple[str, ...], *, allow_missing: bool = False,
+    ) -> Mapping[str, Mapping[str, Any]]:
+        """读取回执的重放字段。允许缺行时，只返回存在的回执。"""
         if not call_ids:
             self._replay_cache = (None, {})
             return {}
@@ -219,9 +221,10 @@ class ModelCallReader:
                     else json.loads(row["provider_metadata"])
                 ),
             })
-        for identity in call_ids:
-            if identity not in records:
-                raise KeyError(identity)
+        if not allow_missing:
+            for identity in call_ids:
+                if identity not in records:
+                    raise KeyError(identity)
         # 只保留当前窗口的成功回执；在途状态仍需重读，外部写入使整个缓存失效。
         self._replay_cache = (revision, {
             identity: record for identity, record in records.items() if record["state"] == "success"
