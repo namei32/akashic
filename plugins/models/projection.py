@@ -178,7 +178,8 @@ def check_facts(part: ContentPart) -> ContentReferences:
     old_fields = {"call_record_id", "tool_ids", "thinking", "continuation"}
     new_fields = old_fields | {"wire_tool_calls", "reminder"}
     reminder_identity_fields = {"reminder_input_id", "reminder_sha256"}
-    if set(value) - {"content_refs", "content_transformed", "generation_rejection"} not in (old_fields, new_fields, new_fields | reminder_identity_fields):
+    optional_fields = {"content_refs", "content_transformed", "generation_rejection", "replay"}
+    if set(value) - optional_fields not in (old_fields, new_fields, new_fields | reminder_identity_fields):
         raise ValueError("model.facts 字段无效")
     if "generation_rejection" in value and value["generation_rejection"] not in ("length", "malformed_function_call"):
         raise ValueError("模型生成拒绝类型无效")
@@ -188,6 +189,19 @@ def check_facts(part: ContentPart) -> ContentReferences:
         _ = ModelRequest.read_content_refs(value["content_refs"])
     if "content_transformed" in value and type(value["content_transformed"]) is not bool:
         raise ValueError("内容投影标记必须是 bool")
+    replay = None
+    if "replay" in value:
+        replay = value["replay"]
+        if (
+            not isinstance(replay, Mapping)
+            or set(replay) != {"version", "binding_id", "provider_metadata"}
+            or type(replay["version"]) is not int
+            or replay["version"] != 1
+            or not isinstance(replay["binding_id"], str)
+            or not replay["binding_id"]
+            or (replay["provider_metadata"] is not None and not isinstance(replay["provider_metadata"], Mapping))
+        ):
+            raise ValueError("模型历史重放数据无效")
     ids = value["tool_ids"]
     if not isinstance(ids, Mapping):
         raise ValueError("模型工具 ID 必须按 Output 位置记录")
@@ -246,6 +260,8 @@ def check_facts(part: ContentPart) -> ContentReferences:
             or not isinstance(continuation["payload"], Mapping)
         ):
             raise ValueError("模型 continuation 无效")
+        if replay is not None and continuation["binding_id"] != replay["binding_id"]:
+            raise ValueError("continuation 不属于记录中的模型")
     return ContentReferences()
 
 
@@ -753,8 +769,7 @@ class MessageProjection:
                 row["provider_metadata"] = response_metadata[message.message_id]
             # 思考内容属于产出它的模型：换模型后严格 provider 会拒收未知字段；需要该字段的 driver 自己回填空值。
             if (model_facts is not None and model_facts["thinking"] is not None and not hidden
-                    and _same_model(self._fold_receipt(fold, model_facts["call_record_id"])["binding"],
-                                    self._model.descriptor)):
+                    and message.message_id in fold.same_model_outputs):
                 row["reasoning_content"] = model_facts["thinking"]
             msg_rows.append(row)
             msg_rows.extend(observations)
@@ -825,9 +840,9 @@ class MessageProjection:
         # 调用账 owner 批量读取窄字段；插件自带 reader 保持原调用合同。
         read_call = self._read_call
         if isinstance(read_call, ModelCallReader):
-            fold.receipts.update(read_call.replay(
-                tuple(value["call_record_id"] for value in fold.recorded.values())
-            ))
+            call_ids = tuple(dict.fromkeys(value["call_record_id"] for value in fold.recorded.values()))
+            receipts = read_call.replay(call_ids, allow_missing=True)
+            fold.receipts.update((call_id, receipts.get(call_id)) for call_id in call_ids)
         for message in messages:
             self._fold_main(fold, message, inherited)
         fold.count = len(messages)
@@ -880,17 +895,21 @@ class MessageProjection:
                 for ref in value.get("content_refs", ()):
                     fold.content_refs.add(tuple(ref))
 
-    def _fold_receipt(self, fold: _Fold, call_id: str) -> Mapping[str, Any]:
-        """成功结算的回执不可变，每条记录在折叠生命周期内只读一次。"""
-        receipt = fold.receipts.get(call_id)
-        if receipt is None:
+    def _fold_receipt(self, fold: _Fold, call_id: str) -> Mapping[str, Any] | None:
+        """查询回执并保存结果，缺行由历史投影处理。"""
+        if call_id not in fold.receipts:
             read_call = self._read_call
             if isinstance(read_call, ModelCallReader):
-                receipt = read_call.replay((call_id,))[call_id]
+                receipt = read_call.replay((call_id,), allow_missing=True).get(call_id)
             else:
-                receipt = read_call(call_id)
+                try:
+                    receipt = read_call(call_id)
+                except KeyError as error:
+                    if error.args != (call_id,):
+                        raise
+                    receipt = None
             fold.receipts[call_id] = receipt
-        return receipt
+        return fold.receipts[call_id]
 
     def _fold_main(
         self,
@@ -911,24 +930,44 @@ class MessageProjection:
         value = fold.recorded.get(message.message_id)
         if value is None:
             return
-        receipt = self._fold_receipt(fold, value["call_record_id"])
-        if receipt["state"] != "success":
+        call_id = value["call_record_id"]
+        receipt = self._fold_receipt(fold, call_id)
+        replay = value.get("replay")
+        if replay is not None and receipt is not None and replay["binding_id"] != receipt["binding"]["binding_id"]:
+            raise ValueError("模型历史重放绑定与调用记录不符")
+        descriptor = self._model.descriptor
+        if receipt is not None and receipt["state"] == "success":
+            binding = receipt["binding"]
+            binding_id = binding["binding_id"]
+            same_model = _same_model(binding, descriptor)
+            metadata = receipt.get("provider_metadata")
+            if binding_id == descriptor.binding_id:
+                estimated = receipt.get("estimated_input_tokens")
+                usage = receipt.get("usage")
+                actual = None if usage is None else usage["input_tokens"]
+                if message.source == self._source and estimated is not None and actual is not None:
+                    if type(estimated) is not int or estimated <= 0 or type(actual) is not int or actual < 0:
+                        raise ValueError("模型 token 校准记录损坏")
+                    # 字符估算最多差约 3 倍（1 字符 1 token）。远超它的 usage 与请求大小无关：压缩后比例只会更离谱，
+                    # 用它校准会让每条输入都付一次摘要费。这里不看窗口，静默超窗（200 + 超窗 usage）仍能触发压缩。
+                    fold.token_calibration = None if actual > estimated * _MAX_USAGE_RATIO else (estimated, actual)
+        elif replay is not None and (receipt is None or receipt["state"] == "started"):
+            binding_id = replay["binding_id"]
+            same_model = binding_id == descriptor.binding_id
+            metadata = None
+        elif receipt is None:
+            raise KeyError(call_id)
+        else:
             raise ValueError("已提交模型事实必须引用成功结算的真实调用")
-        if receipt["binding"]["binding_id"] == self._model.descriptor.binding_id:
-            estimated = receipt.get("estimated_input_tokens")
-            usage = receipt.get("usage")
-            actual = None if usage is None else usage["input_tokens"]
-            if message.source == self._source and estimated is not None and actual is not None:
-                if type(estimated) is not int or estimated <= 0 or type(actual) is not int or actual < 0:
-                    raise ValueError("模型 token 校准记录损坏")
-                # 字符估算最多差约 3 倍（1 字符 1 token）。远超它的 usage 与请求大小无关：压缩后比例只会更离谱，
-                # 用它校准会让每条输入都付一次摘要费。这里不看窗口，静默超窗（200 + 超窗 usage）仍能触发压缩。
-                fold.token_calibration = None if actual > estimated * _MAX_USAGE_RATIO else (estimated, actual)
-        # 原生部件（Gemini thoughtSignature）属于产出它的模型，不随重启或保存设置失效；校准仍跟实例走。
-        metadata = receipt.get("provider_metadata")
-        # Input transforms clear opaque continuation, not this new response's native parts.
-        if metadata is not None and _same_model(receipt["binding"], self._model.descriptor):
-            fold.response_metadata[message.message_id] = metadata
+        if same_model:
+            fold.same_model_outputs.add(message.message_id)
+            # 原生部件（Gemini thoughtSignature）属于产出它的模型，不随重启或保存设置失效；校准仍跟实例走。
+            if (metadata is None and replay is not None and binding_id == descriptor.binding_id
+                    and not value.get("content_transformed", False)):
+                metadata = replay["provider_metadata"]
+            # Input transforms clear opaque continuation, not this new response's native parts.
+            if metadata is not None:
+                fold.response_metadata[message.message_id] = metadata
         previous = inherited.get(message.message_id)
         if previous is None or previous[0] is not message:
             indices = {
@@ -946,7 +985,7 @@ class MessageProjection:
         )
         if (
             message_continuation is not None
-            and message_continuation.binding_id != receipt["binding"]["binding_id"]
+            and message_continuation.binding_id != binding_id
         ):
             raise ValueError("continuation 不属于记录中的模型")
         if message.source == self._source and message.message_id not in fold.abandoned:
@@ -989,7 +1028,7 @@ class _Fold:
     __slots__ = (
         "count", "prefix", "inputs", "latest_input",
         "abandoned", "abandoned_calls", "rejected", "facts", "recorded", "results",
-        "receipts", "response_metadata", "content_refs", "token_calibration",
+        "receipts", "same_model_outputs", "response_metadata", "content_refs", "token_calibration",
         "continuation", "cont_summary", "cont_seq", "cont_transformed",
     )
 
@@ -1004,7 +1043,8 @@ class _Fold:
         self.facts: dict[str, tuple[Message, Mapping[str, Any] | None]] = {}
         self.recorded: dict[str, Mapping[str, Any]] = {}
         self.results: dict[CallRef, Message] = {}
-        self.receipts: dict[str, Mapping[str, Any]] = {}
+        self.receipts: dict[str, Mapping[str, Any] | None] = {}
+        self.same_model_outputs: set[str] = set()
         self.response_metadata: dict[str, Mapping[str, Any]] = {}
         self.content_refs: set[tuple[str, int]] = set()
         self.token_calibration: tuple[int, int] | None = None
