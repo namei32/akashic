@@ -3,24 +3,44 @@ import type { ComponentType, MouseEvent, ReactNode } from "react";
 export type WebUiDisposer = () => void;
 export type WebMountCardinality = "single" | "list";
 
+/** 明暗偏好：固定亮、固定暗，或随系统外观切换。 */
+export type ThemeMode = "light" | "dark" | "system";
+
 export interface ThemeDefinition {
   readonly id: string;
   readonly label: string;
+  readonly family: string;
   readonly status: "stable" | "experimental";
   readonly colorScheme: "light" | "dark";
+  readonly material: Readonly<Record<string, string>>;
+}
+
+/** 一套配色：同一组色相关系下的一个亮色主题和一个暗色主题。 */
+export interface ThemeFamily {
+  readonly id: string;
+  readonly label: string;
+  readonly light: ThemeDefinition;
+  readonly dark: ThemeDefinition;
 }
 
 export interface ThemeSelection {
   readonly requestedThemeId: string;
   readonly effectiveThemeId: string;
+  readonly family: string;
+  readonly mode: ThemeMode;
   readonly unavailable: boolean;
 }
 
 export function currentTheme(): ThemeDefinition;
 export function subscribeTheme(listener: () => void): WebUiDisposer;
 export function themes(): readonly ThemeDefinition[];
+/** 在当前配色里切换亮与暗。 */
 export function cycleTheme(): ThemeSelection;
+export function themeFamilies(): readonly ThemeFamily[];
+export function themeSelection(): ThemeSelection;
+export function setThemePreference(familyId: string, mode: ThemeMode): ThemeSelection;
 export function useTheme(): ThemeDefinition;
+export function useThemeSelection(): ThemeSelection;
 
 export interface MaterialButtonProps {
   children: ReactNode;
@@ -89,7 +109,42 @@ export interface WebMountRegistration {
   register(entry: WebEntry): WebUiDisposer;
 }
 
+export interface WebResourceOptions {
+  /** The host reads it once while idle after startup, so the first page open already has a value. */
+  warm?: boolean;
+}
+
+export interface WebRefreshOptions {
+  /**
+   * Start a new read instead of joining one already in flight. Use it after a write: a read that began
+   * before the write could return the old state. Superseded reads never replace `current`.
+   */
+  fresh?: boolean;
+}
+
+/**
+ * Data owned by a web module rather than by one rendered page: create it in `activate(ctx)`,
+ * read `current` synchronously in `render`, and call `refresh()` to revalidate in the background.
+ * Values are kept in memory only; a read whose JSON equals the current value keeps the old object and does not notify.
+ */
+export interface WebResource<T> {
+  /** Last successful value; undefined before the first read. */
+  readonly current: T | undefined;
+  /** Error of the latest failed read; cleared by the next success. `current` keeps the previous value. */
+  readonly error: Error | undefined;
+  /** Notified when `current` or `error` changes. */
+  subscribe(listener: () => void): WebUiDisposer;
+  /** Joins a read already in flight unless `fresh`; `current` keeps its value until a read succeeds. */
+  refresh(options?: WebRefreshOptions): Promise<T>;
+  /** Accept a value the module already holds (for example a write's response); it supersedes reads in flight. */
+  set(value: T): void;
+}
+
 export interface WebHostContextV1 {
+  readonly data: {
+    /** `key` is unique within the module; `load` receives a signal aborted when the module is disposed. */
+    resource<T>(key: string, load: (signal: AbortSignal) => Promise<T>, options?: WebResourceOptions): WebResource<T>;
+  };
   readonly http: {
     request(path: string, init?: RequestInit): Promise<Response>;
     /** Build one exact-generation WebSocket URL for this module's dashboard route. */

@@ -9,7 +9,6 @@ import io
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -43,18 +42,26 @@ CORE_PATHS = (
     "sdk/python",
     "skills",
     "scripts/install_plugin_distribution.py",
-    "scripts/release_boot_probe.py",
     "scripts/distribution_runtime.py",
     "scripts/start.py",
+    "scripts/first_install.py",
+    "scripts/akashic_release/__init__.py",
+    "scripts/akashic_release/extra.py",
+    "scripts/akashic_release/manifest.py",
+    "scripts/akashic_release/model.py",
+    "scripts/akashic_release/snapshot.py",
+    "scripts/akashic_release/wheels.py",
     "docker/host-runtime",
 )
 
-_BUNDLE_PATHS = tuple(Path("bundles") / (mode + ".toml") for mode in ("base", "headless", "minimal", "companion-preview"))
+_BUNDLE_PATHS = tuple(Path("bundles") / (mode + ".toml") for mode in ("base", "headless", "minimal", "absorbed"))
 _RUNTIME_WIRING = (
     ("docker/host-runtime/Dockerfile.distribution", "Dockerfile.distribution"),
     ("docker/host-runtime/distribution-entrypoint.sh", "distribution-entrypoint.sh"),
 )
 _GENERATED_PLUGIN_UI_FILES = (
+    "plugin_ui.js",
+    "plugin_ui.css",
     "web_module.js",
     "web_module.css",
     "message_ui.js",
@@ -171,19 +178,15 @@ def _run_web_command(
             )
 
 
-def _build_web_assets(
+def build_web_assets(
     repository: Path,
     commit: str,
     temporary: Path,
 ) -> tuple[Path | None, Path | None, dict[str, object]]:
     """在一次性完整源码目录构建 Web，不向调用方 checkout 写入产物。"""
 
-    required = (
-        "package.json",
-        "package-lock.json",
-        "frontend/chat/vite.config.ts",
-        "frontend/dashboard/vite.config.ts",
-    )
+    # 外壳和聊天应用归 ui、akashic_clients 所有，npm run build 自己把产物放进所属插件；这里不点名插件。
+    required = ("package.json", "package-lock.json")
     missing = [path for path in required if _git_file(repository, commit, path) is None]
     if missing:
         return None, None, {"enabled": False, "missing_source_paths": missing}
@@ -206,18 +209,8 @@ def _build_web_assets(
         ),
     }
     _run_web_command(["npm", "ci", "--ignore-scripts"], cwd=source, env=env)
-    _run_web_command(["npm", "run", "build:dashboard"], cwd=source, env=env)
-    _run_web_command(["npm", "run", "build:chat"], cwd=source, env=env)
-    _run_web_command(["npm", "run", "build:web-plugins"], cwd=source, env=env)
+    _run_web_command(["npm", "run", "build"], cwd=source, env=env)
     asset_root = source / "static"
-    required_outputs = (asset_root / "dashboard", asset_root / "chat")
-    if any(not path.is_dir() for path in required_outputs):
-        raise RuntimeError(
-            "Web 资产构建没有产生 static/dashboard 与 static/chat: "
-            + ", ".join(str(path) for path in required_outputs)
-        )
-    if any(not any(path.iterdir()) for path in required_outputs):
-        raise RuntimeError("Web 资产构建产生了空的静态目录")
 
     def version(command: list[str]) -> str:
         return subprocess.run(
@@ -230,29 +223,14 @@ def _build_web_assets(
             text=True,
         ).stdout.strip()
 
-    shutil.copytree(asset_root / "dashboard", source / "plugins/ui/static/dashboard")
-    shutil.copytree(asset_root / "chat", source / "plugins/akashic_clients/static/chat")
     return asset_root, source / "plugins", {
         "enabled": True,
         "source_commit": commit,
-        "source_paths": [
-            "frontend/chat",
-            "frontend/dashboard",
-            "frontend/plugins",
-            "frontend/theme",
-            "packages",
-            "plugins",
-            "scripts/build-web-plugins.mjs",
-        ],
-        "build_commands": [
-            "npm ci --ignore-scripts",
-            "npm run build:dashboard",
-            "npm run build:chat",
-            "npm run build:web-plugins",
-        ],
+        "source_paths": ["frontend", "packages", "plugins", "scripts", "package.json", "package-lock.json"],
+        "build_commands": ["npm ci --ignore-scripts", "npm run build"],
         "node_version": version(["node", "--version"]),
         "npm_version": version(["npm", "--version"]),
-        "file_count": sum(1 for path in asset_root.rglob("*") if path.is_file()),
+        "file_count": sum(1 for path in asset_root.rglob("*") if path.is_file()) if asset_root.is_dir() else 0,
     }
 
 
@@ -334,6 +312,29 @@ def _copy_runtime_wiring(
     return copied
 
 
+# 把固定提交的插件目录和同次构建的前端产物落到 package 目录；发行 bundle 与 release 分支共用。
+def stage_plugin_package(
+    repository: Path,
+    commit: str,
+    root: str,
+    package: Path,
+    generated_plugins_root: Path | None,
+) -> None:
+    archive = git(repository, "archive", "--format=tar", commit + ":" + root)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as stream:
+        stream.extractall(package, filter="data")
+    if generated_plugins_root is None:
+        return
+    generated_plugin = generated_plugins_root / Path(root).name
+    for name in _GENERATED_PLUGIN_UI_FILES:
+        generated = generated_plugin / name
+        if generated.is_file():
+            (package / name).write_bytes(generated.read_bytes())
+    static = generated_plugin / "static"
+    if static.is_dir():
+        shutil.copytree(static, package / "static", dirs_exist_ok=True)
+
+
 def _bundle_plugin(
     repository: Path,
     commit: str,
@@ -345,19 +346,7 @@ def _bundle_plugin(
 ) -> dict[str, str]:
     with tempfile.TemporaryDirectory(prefix="akashic-plugin-source-") as directory:
         package = Path(directory)
-        archive = git(repository, "archive", "--format=tar", commit + ":" + root)
-        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as stream:
-            stream.extractall(package, filter="data")
-        if generated_plugins_root is not None:
-            generated_plugin = generated_plugins_root / Path(root).name
-            for name in _GENERATED_PLUGIN_UI_FILES:
-                generated = generated_plugin / name
-                if generated.is_file():
-                    (package / name).write_bytes(generated.read_bytes())
-        if generated_plugins_root is not None:
-            static = generated_plugins_root / Path(root).name / "static"
-            if static.is_dir():
-                shutil.copytree(static, package / "static", dirs_exist_ok=True)
+        stage_plugin_package(repository, commit, root, package, generated_plugins_root)
         manifest = load_static_plugin_manifest(package)
         if manifest.name in names:
             raise ValueError(f"发布插件名称重复: {manifest.name}")
@@ -445,7 +434,7 @@ def build(repository: Path, revision: str, output: Path) -> dict[str, object]:
 
     # 2. Web 构建完全在临时源码副本执行；把生成的静态目录交给实际插件制品。
     with tempfile.TemporaryDirectory(prefix="akashic-distribution-web-") as directory:
-        asset_root, generated_plugins_root, web = _build_web_assets(
+        asset_root, generated_plugins_root, web = build_web_assets(
             repository, commit, Path(directory)
         )
         core = _append_bytes(

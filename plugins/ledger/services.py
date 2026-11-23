@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack, AsyncExitStack
+from dataclasses import dataclass
+from typing import Any
 
 from core.common.file_io import run_file_io
 
@@ -13,7 +15,7 @@ from .log import (
     SessionAttributes as SessionAttributes,
     WriterExpired as WriterExpired,
 )
-from plugins.ledger.contract import Body, CallRef, ContentPart, ContentReferences, Control, Input, Output, ToolCall, ToolResult
+from plugins.ledger.contract import Actor, Body, CallRef, ContentPart, ContentReferences, Control, Input, Output, ToolCall, ToolResult
 
 
 from plugins.ledger.contract import (
@@ -58,6 +60,24 @@ class MessageWriters:
     def __init__(self, log: _MessageLog):
         self._log = log
         self._metadata: dict[str, tuple[Context, Callable[[Body], Mapping[str, object | None]]]] = {}
+        self._part_metadata: dict[str, _PartMetadataGrant] = {}
+        self._user_inputs: _UserInputs | None = None
+
+    async def claim_user_inputs(self, ctx: Context) -> _UserInputs:
+        """用户输入只有一个授权持有者；谁的输入算用户原话由持有者的登记规则决定。"""
+        if ctx.require(MESSAGE_WRITERS) is not self:
+            raise PermissionError("用户输入授权不属于当前 MessageWriters")
+        grant = _UserInputs(self)
+        def setup():
+            if self._user_inputs is not None:
+                raise ValueError("用户输入授权已有持有者")
+            self._user_inputs = grant
+            def release() -> None:
+                if self._user_inputs is grant:
+                    self._user_inputs = None
+            return release
+        _ = await ctx.effect(setup, label="ledger.user-inputs")
+        return grant
 
     async def register_metadata(
         self, ctx: Context, *, keys: frozenset[str],
@@ -69,7 +89,7 @@ class MessageWriters:
         if not keys:
             raise ValueError("metadata 注册需要明确的键")
         def setup():
-            conflicts = keys & self._metadata.keys()
+            conflicts = keys & (self._metadata.keys() | self._part_metadata_keys())
             if conflicts:
                 raise ValueError(f"Session metadata 已有 owner: {sorted(conflicts)}")
             grant = (ctx, update)
@@ -92,8 +112,31 @@ class MessageWriters:
         check_call: Callable[[ToolCall], None] | None = None,
         update_metadata: Callable[[Body], Mapping[str, object | None]] | None = None,
         check_metadata: Callable[[Mapping[str, object]], None] | None = None,
+        part_metadata: bool = False,
+        update_activity: bool = True,
     ) -> Callable[..., MessageWriter]:
         """固定身份、类型和检查器；打开时只选择 Session 和可选 exact call。"""
+        if author == Actor.USER:
+            raise PermissionError("用户输入只由来源注册表代为绑定；注册来源即声明其输入是用户输入")
+        return self._bind(ctx, author=author, source=source, body_types=body_types, content=content,
+                          check_call=check_call, update_metadata=update_metadata,
+                          check_metadata=check_metadata, part_metadata=part_metadata, update_activity=update_activity)
+
+    # 授权检查之后的实际绑定；用户输入授权也经此处，身份与元数据规则与其他作者一致。
+    def _bind(
+        self,
+        ctx: Context,
+        *,
+        author: str,
+        source: str,
+        body_types: tuple[type[Input] | type[Output] | type[ToolResult] | type[Control], ...],
+        content: Mapping[str, Callable[[ContentPart], ContentReferences]],
+        check_call: Callable[[ToolCall], None] | None = None,
+        update_metadata: Callable[[Body], Mapping[str, object | None]] | None = None,
+        check_metadata: Callable[[Mapping[str, object]], None] | None = None,
+        part_metadata: bool = False,
+        update_activity: bool = True,
+    ) -> Callable[..., MessageWriter]:
         log = self._log
         owner = ctx.require_runtime_identity(MESSAGE_WRITERS, self).plugin_id
         grants = {
@@ -102,11 +145,19 @@ class MessageWriters:
         }
         if update_metadata is not None and not grants:
             raise PermissionError("metadata 投影未登记给当前 owner")
+        parts = dict(self._part_metadata) if part_metadata else {}
         def project_metadata(body: Body) -> Mapping[str, object | None]:
             if any(self._metadata.get(key) is not grant for key, grant in grants.items()):
                 raise WriterExpired("metadata 授权已释放")
-            assert update_metadata is not None
-            return update_metadata(body)
+            # 1. 普通回调只能写自己登记的键；片段 owner 的键只能由对应片段派生。
+            changes = dict(update_metadata(body)) if update_metadata is not None else {}
+            if not changes.keys() <= grants.keys():
+                raise PermissionError(f"metadata 投影写入了未授权的键: {sorted(changes.keys() - grants.keys())}")
+            # 2. 片段投影各自校验 owner 授权与键集合。
+            changes.update(self._project_parts(parts, body))
+            return changes
+        projected = update_metadata is not None or bool(parts)
+        metadata_keys = frozenset(grants).union(*(grant.keys for grant in parts.values()))
         content = dict(content)
         body_types = tuple(body_types)
 
@@ -115,13 +166,65 @@ class MessageWriters:
             return log.writer(
                 session_id, author=author, source=source, body_types=body_types,
                 content=content, call_ref=call_ref, check_call=check_call,
-                metadata_keys=frozenset(grants),
-                update_metadata=project_metadata if update_metadata is not None else None,
+                metadata_keys=metadata_keys,
+                update_metadata=project_metadata if projected else None,
                 message_metadata_keys=frozenset({owner}),
-                check_metadata=check_metadata,
+                check_metadata=check_metadata, update_activity=update_activity,
             )
 
         return open
+
+    async def register_part_metadata(
+        self, ctx: Context, *, kind: str, keys: frozenset[str],
+        update: Callable[[ContentPart], Mapping[str, object | None]],
+    ) -> Effect:
+        """登记某个 kind 片段的会话元数据投影；卸载只释放内存登记。"""
+        if ctx.require(MESSAGE_WRITERS) is not self:
+            raise PermissionError("metadata 注册不属于当前 MessageWriters")
+        if not kind or not keys:
+            raise ValueError("片段 metadata 注册需要 kind 和明确的键")
+        def setup():
+            if kind in self._part_metadata:
+                raise ValueError(f"片段 metadata 已有 owner: {kind}")
+            conflicts = keys & (self._metadata.keys() | self._part_metadata_keys())
+            if conflicts:
+                raise ValueError(f"Session metadata 已有 owner: {sorted(conflicts)}")
+            grant = _PartMetadataGrant(keys, update)
+            self._part_metadata[kind] = grant
+            def cleanup() -> None:
+                if self._part_metadata.get(kind) is grant:
+                    del self._part_metadata[kind]
+            return cleanup
+        return await ctx.effect(setup, label="session-part-metadata:" + kind)
+
+    def _part_metadata_keys(self) -> frozenset[str]:
+        empty: frozenset[str] = frozenset()
+        return empty.union(*(grant.keys for grant in self._part_metadata.values()))
+
+    # 写入者 bind 时取到的片段投影：owner 已卸载则写入失效，投影越权写键则拒绝。
+    def _project_parts(
+        self, parts: Mapping[str, _PartMetadataGrant], body: Body,
+    ) -> Mapping[str, object | None]:
+        if not parts or not isinstance(body, Input):
+            return {}
+        changes: dict[str, object | None] = {}
+        for part in body.parts:
+            grant = parts.get(part.kind)
+            if grant is None:
+                continue
+            if self._part_metadata.get(part.kind) is not grant:
+                raise WriterExpired("片段 metadata 授权已释放")
+            delta = grant.update(part)
+            if not set(delta) <= grant.keys:
+                raise PermissionError(f"片段 metadata 投影越权: {part.kind}")
+            changes.update(delta)
+        return changes
+
+
+@dataclass(frozen=True, slots=True)
+class _PartMetadataGrant:
+    keys: frozenset[str]
+    update: Callable[[ContentPart], Mapping[str, object | None]]
 
 
 class OwnerState:
@@ -238,6 +341,9 @@ class SessionAdmission:
                 (store, initialize) for _, store, initialize in registered
             ))
 
+    def check_scope(self, dimension: str, value: str) -> None:
+        self._check_dimensions(SessionAttributes(scope=((dimension, value),)))
+
     def _check_dimensions(self, attributes: SessionAttributes) -> None:
         for name, value in attributes.scope:
             grant = self._dimensions.get(name)
@@ -252,3 +358,29 @@ class SessionAdmission:
         except ValueError:
             return False
         return True
+
+
+class _UserInputs:
+    """领取后的用户输入授权；释放后不能再绑定新的写入器。"""
+
+    def __init__(self, writers: MessageWriters) -> None:
+        self._writers = writers
+
+    def bind(
+        self, ctx: Context, *, source: str,
+        content: Mapping[str, Callable[[ContentPart], ContentReferences]],
+        part_metadata: bool = False,
+    ) -> Callable[..., MessageWriter]:
+        if self._writers._user_inputs is not self:  # pyright: ignore[reportPrivateUsage]
+            raise WriterExpired("用户输入授权已释放")
+        bound = self._writers._bind(  # pyright: ignore[reportPrivateUsage]
+            ctx, author=Actor.USER.value, source=source, body_types=(Input,),
+            content=content, part_metadata=part_metadata,
+        )
+
+        # 授权释放后不再打开新写入器；来源每次操作都重新打开，已打开的写入器只活一次操作。
+        def open(*args: Any, **kwargs: Any) -> MessageWriter:
+            if self._writers._user_inputs is not self:  # pyright: ignore[reportPrivateUsage]
+                raise WriterExpired("用户输入授权已释放")
+            return bound(*args, **kwargs)
+        return open

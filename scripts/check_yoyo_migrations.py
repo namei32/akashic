@@ -112,9 +112,24 @@ def _retired_path_reintroductions(base: str) -> list[str]:
     return problems
 
 
+# 已整体迁到 extra 仓库的插件：登记在 [tiers].external 且 plugins/<name> 已不在本仓库。
+# 它们的迁移源码随插件走，本仓库不再是基线；只删一部分仍按改动处理。
+def _moved_plugin_prefixes() -> tuple[str, ...]:
+    manifest = ROOT / "plugin_boundary.toml"
+    # extra 仓库没有层级表：那里的插件源码就是基线，不放行任何迁出。
+    if not manifest.is_file():
+        return ()
+    boundary = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    external = boundary.get("tiers", {}).get("external", [])
+    return tuple(f"plugins/{name}/" for name in external if not (ROOT / "plugins" / str(name)).exists())
+
+
 def violations(base: str) -> list[str]:
     """拒绝修改或删除基线中已发布的迁移源码与 catalog 声明。"""
     paths, catalogs = _registered_paths(base)
+    moved = _moved_plugin_prefixes()
+    paths = {path for path in paths if not path.startswith(moved)}
+    catalogs = [path for path in catalogs if not path.startswith(moved)]
     problems: list[str] = []
     for path in sorted(paths):
         current = ROOT / path
@@ -128,9 +143,12 @@ def violations(base: str) -> list[str]:
 def main() -> int:
     import argparse
 
+    global ROOT
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", required=True)
+    parser.add_argument("--root", type=Path, default=ROOT, help="要检查的 Git 仓库根；extra 仓库的 CI 用它指向自己")
     args = parser.parse_args()
+    ROOT = args.root.resolve()
     problems = violations(str(args.base))
     for problem in problems:
         print(problem)

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Literal, cast
 
 from fastapi import FastAPI, HTTPException
@@ -11,6 +12,12 @@ from pydantic import BaseModel, ConfigDict
 from agent.plugin_composition import Context, DashboardContext, ServiceKey
 from agent.plugin_composition.plugin_updates import PLUGIN_UPDATES
 from agent.plugin_composition.runtime_catalog import RUNTIME_CATALOG
+from core.common.file_io import run_file_io
+from plugins.host_execution.contract import HOST_STATUS
+from .deploy_status import read_deploy_snapshot
+from .installable import InstallBusy, PackageInstaller
+
+_STARTED_AT = datetime.now(UTC).isoformat()
 
 Phase = Literal["active", "pending", "failed", "disabled", "stopping", "loading"]
 Row = dict[str, object]
@@ -23,9 +30,16 @@ MANAGEMENT_ROOTS = frozenset({"ui", "shell-ui", "akashic_clients"})
 class PluginInventory:
     read: Callable[[], Row]
     set_enabled: Callable[[str, bool], Awaitable[Row]]
+    read_runtime_version: Callable[[], Awaitable[Row]]
+    installer: PackageInstaller
 
 
 INVENTORY = ServiceKey[PluginInventory]("shell-ui.plugin_inventory")
+
+
+class InstallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: str
 
 
 class EnabledRequest(BaseModel):
@@ -50,7 +64,19 @@ def bind(ctx: Context) -> PluginInventory:
             raise PermissionError("插件管理依赖它，不能停用")
         return await updates.set_enabled(ctx, plugin_id, enabled)
 
-    return PluginInventory(ctx.entrypoint(read), ctx.entrypoint(set_enabled))
+    async def read_runtime_version() -> Row:
+        with ctx.borrow(HOST_STATUS) as host_status:
+            bridge: Row = (
+                dict(host_status.snapshot())
+                if host_status is not None
+                else {"state": "disabled", "failures": 0, "code": None, "checked_at": None, "egress": None}
+            )
+        snapshot = await run_file_io(
+            lambda: read_deploy_snapshot(started_at=_STARTED_AT, history_limit=5)
+        )
+        return {"bridge": bridge, **snapshot}
+
+    return PluginInventory(ctx.entrypoint(read), ctx.entrypoint(set_enabled), ctx.entrypoint(read_runtime_version), PackageInstaller())
 
 
 # 合并宿主选择与运行目录：一行一个插件，只保留列表需要的事实。
@@ -67,6 +93,8 @@ def plugin_rows(plugins: list[Row], catalog: list[Row]) -> list[Row]:
     locked = _closure({plugin_id for plugin_id in fibers if plugin_id.split("@", 1)[0] in MANAGEMENT_ROOTS}, providers)
     rows: list[Row] = []
     for plugin in plugins:
+        if _is_patch_only(plugin):
+            continue
         plugin_id = cast(str, plugin["plugin_id"])
         own = fibers.get(plugin_id, [])
         missing = sorted({cast(str, key) for fiber in own for key in cast(list[object], fiber["missing_services"])})
@@ -85,11 +113,18 @@ def plugin_rows(plugins: list[Row], catalog: list[Row]) -> list[Row]:
             "enabled": enabled,
             "phase": _phase(plugin, enabled, bool(draining), error, missing),
             "error": error,
+            "disabled_reason": plugin.get("disabled_reason"),
             "missing_services": missing,
             "dependents": sorted(dependents.get(plugin_id, ())),
             "locked": "management-required" if plugin_id in locked else None,
         })
     return rows
+
+
+# 没装、发行版也不带、没有运行代也没有待清理的行，只是 patch 里写的停用记录，不算已装。
+def _is_patch_only(plugin: Row) -> bool:
+    return (not plugin.get("installed") and not plugin["distribution_available"] and plugin["state"] is None
+            and not plugin["draining_generations"] and not plugin["cleanup_pending"])
 
 
 def _closure(roots: set[str], edges: Mapping[str, set[str]]) -> set[str]:
@@ -124,6 +159,10 @@ def register(app: FastAPI, context: DashboardContext) -> None:
     async def list_plugins() -> Row:
         return context.require(INVENTORY).read()
 
+    @app.get("/api/dashboard/runtime-version")
+    async def runtime_version() -> Row:
+        return await context.require(INVENTORY).read_runtime_version()
+
     @app.post("/api/dashboard/plugins/{plugin_id}/enabled")
     async def set_enabled(plugin_id: str, request: EnabledRequest) -> Row:
         try:
@@ -132,3 +171,25 @@ def register(app: FastAPI, context: DashboardContext) -> None:
             raise HTTPException(403, str(error)) from error
         except (RuntimeError, ValueError) as error:
             raise HTTPException(409, str(error)) from error
+
+    @app.get("/api/dashboard/plugins/installable")
+    async def installable() -> Row:
+        try:
+            return await context.require(INVENTORY).installer.available()
+        except (RuntimeError, ValueError, OSError) as error:
+            raise HTTPException(502, str(error)) from error
+
+    @app.get("/api/dashboard/plugins/install")
+    async def install_status() -> Row:
+        return await context.require(INVENTORY).installer.status()
+
+    @app.post("/api/dashboard/plugins/install")
+    async def install(request: InstallRequest) -> Row:
+        try:
+            return await context.require(INVENTORY).installer.start(request.name)
+        except InstallBusy as error:
+            raise HTTPException(409, str(error)) from error
+        except LookupError as error:
+            raise HTTPException(404, str(error)) from error
+        except (RuntimeError, ValueError, OSError) as error:
+            raise HTTPException(502, str(error)) from error

@@ -1,20 +1,16 @@
 # 此层按 row id 整行替换；plugin-stable.json 仍是运行选择。
 schema_version = 1
 
-[rows."model_usage"]
-plugin = "model_usage@release"
-disabled = true
-
-[rows."companion"]
-plugin = "companion@release"
-disabled = true
-
 [rows."channels"]
 plugin = "channels@release"
 disabled = true
 
 [rows."ui"]
 plugin = "ui@release"
+disabled = true
+
+[rows."main_session"]
+plugin = "main_session@release"
 disabled = true
 
 [rows."shell-ui"]

@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+import hashlib
+from collections.abc import AsyncGenerator, Callable, Mapping
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Protocol, Self, cast, runtime_checkable
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from plugins.ledger.contract import MessageConflict, MessageReader, MessageWriter, OwnerRecord, OwnerStore, OwnerTransaction
-from plugins.ledger.contract import Body, Message, Output
+from plugins.ledger.contract import Body, ContentPart, Message, Output, PreparedAppend
 from plugins.ledger.contract import json_value
 from core.common.file_io import run_file_io
 
@@ -25,6 +27,7 @@ class Selection(BaseModel):
     recovery_owner: Text
     passive: bool
     sinks: tuple[Text, ...]
+    error: Text | None = None
 
 
 class Delivery(BaseModel):
@@ -67,15 +70,45 @@ def delivery_key(message_id: str, sink: str) -> str:
     return "delivery:" + json.dumps([message_id, sink], ensure_ascii=False, separators=(",", ":"))
 
 
+# 未终结发送的索引与发送记录同事务维护；恢复只读这个小区间，不随历史增长。
+_OPEN_PREFIX = "open:"
+_OPEN_STOP = "open;"
+_OPEN_INDEX = "open-index"
+_TERMINAL = frozenset({"delivered", "rejected", "failed"})
+# 不可选路消息只推进进程内游标；领先耐久值满这么多条才写回，重启重读量因此有界。
+_UNROUTABLE_PERSIST_GAP = 100
+
+
+def _open_key(message_id: str, sink: str) -> str:
+    return _OPEN_PREFIX + json.dumps([message_id, sink], ensure_ascii=False, separators=(",", ":"))
+
+
+def _identity(key: str, prefix: str) -> tuple[str, str]:
+    identities: object = json.loads(key[len(prefix):])
+    if not isinstance(identities, list):
+        raise ValueError("发送记录身份损坏")
+    values = cast(list[object], identities)
+    if len(values) != 2 or any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("发送记录身份损坏")
+    message_id, sink = cast(list[str], identities)
+    return message_id, sink
+
+
 class DeliveryRecords:
     """选路、prepared 与消费进度同事务提交；正文只按 Message 引用读取。"""
 
-    def __init__(self, state: OwnerStore, recovery_owner: str):
+    def __init__(self, state: OwnerStore, recovery_owner: str, *,
+                 notice_writer: Callable[[str], MessageWriter] | None = None):
         self._state = state
         self.recovery_owner = recovery_owner
+        self._notice_writer = notice_writer
         # cursor 只由本 owner 的消费事务单调推进；缓存只可能滞后，滞后由消费路径的
         # 已消费分支兼容（读回既有选择，不重复发送）。
         self._cursor_cache: dict[str, int] = {}
+        # 已知的耐久 cursor；本进程首次越过不可选路消息的会话也写回一次，
+        # 否则从不选路的会话每次启动都要从头重读全部历史。
+        self._durable_cursor: dict[str, int] = {}
+        self._unroutable_seen: set[str] = set()
 
     def selection(self, message_id: str) -> Selection | None:
         row = self._state.read("selection:" + message_id)
@@ -103,6 +136,7 @@ class DeliveryRecords:
         row = self._state.read(self._cursor_key(session_id))
         through = -1 if row is None else Cursor.model_validate(dict(row.value)).through_seq
         self._cursor_cache[session_id] = through
+        self._note_durable(session_id, through)
         return through
 
     def read(self, message_id: str, sink: str) -> tuple[OwnerRecord, Delivery]:
@@ -137,6 +171,36 @@ class DeliveryRecords:
                             sinks: tuple[Sink | Mapping[str, object], ...], *, passive: bool = False) -> Selection:
         fixed = _normalize_sinks(sinks)
         return await run_file_io(lambda: self._prepare_message(reader, message, fixed, passive=passive))
+
+    # A bad route is a durable zero-target selection, not an unconsumed queue head.
+    async def reject_async(self, reader: MessageReader, message: Message, reason: str) -> Selection:
+        self._check_message(reader, message, ())
+        async with self._notice(reader.session_id, message.message_id, "route", reason) as notice:
+            def commit(tx: OwnerTransaction) -> Selection:
+                if self.selection(message.message_id) is not None:
+                    return self.check_owner(message.message_id)
+                selected = Selection(session_id=reader.session_id, recovery_owner=self.recovery_owner,
+                                     passive=True, sinks=(), error=reason)
+                _ = tx.save("selection:" + message.message_id, selected.model_dump(mode="json"), expected_version=None)
+                if notice is not None:
+                    _ = tx.append_prepared(notice)
+                return selected
+            return await self._state.transact_async(commit)
+
+    # The notice shares the failure transaction and uses ordinary chat text on its own source.
+    @asynccontextmanager
+    async def _notice(self, session_id: str, message_id: str, attempt: str, reason: str | None) -> AsyncGenerator[PreparedAppend | None]:
+        if self._notice_writer is None or reason is None:
+            yield None
+            return
+        writer = self._notice_writer(session_id)
+        identity = hashlib.sha256(json.dumps([message_id, attempt]).encode()).hexdigest()
+        text = (f"[投递失败] 回复 {message_id} 未确认送达。{reason}\n"
+                "原回复已保留。请检查渠道后决定是否重新发送；结果未知时先核实，避免重复。")
+        try:
+            yield await writer.prepare_async("delivery-failure:" + identity, Output((ContentPart("text", text),), "complete"))
+        finally:
+            writer.expire()
 
     async def publish_async(self, writer: MessageWriter, message_id: str, body: Body,
                             sinks: tuple[Sink | Mapping[str, object], ...], *, passive: bool = False) -> tuple[Message, Selection]:
@@ -184,7 +248,7 @@ class DeliveryRecords:
     def _consume_batch(self, reader: MessageReader,
                        items: tuple[tuple[Message, tuple[Sink, ...] | None], ...],
                        *, passive: bool = False) -> tuple[Selection | None, ...]:
-        # 1. 不可能选路的消息只推进进程内游标；下一次持久提交一并写入。
+        # 1. 不可能选路的消息只推进游标，按 _advance_unroutable 的条件写回，不进本批事务。
         if self._advance_unroutable(reader, items):
             return (None,) * len(items)
         for message, sinks in items:
@@ -225,6 +289,7 @@ class DeliveryRecords:
         selections = self._state.transact(commit)
         if committed_through:
             self._cursor_cache[reader.session_id] = committed_through[-1]
+            self._note_durable(reader.session_id, committed_through[-1])
         return selections
 
     # 只有 complete Output 可能被选路；其余消息在不拥有选路权时无需持久化消费事实。
@@ -239,8 +304,33 @@ class DeliveryRecords:
         following = reader.read(after_seq=through, limit=1)
         if not following or following[0].message_id != items[0][0].message_id:
             raise MessageConflict("发送消费不能跳过消息")
-        self._cursor_cache[reader.session_id] = items[-1][0].seq
+        session_id = reader.session_id
+        through = items[-1][0].seq
+        self._cursor_cache[session_id] = through
+        if (session_id not in self._unroutable_seen
+                or through - self._durable_cursor.get(session_id, -1) >= _UNROUTABLE_PERSIST_GAP):
+            self._unroutable_seen.add(session_id)
+            self._persist_cursor(session_id, through)
         return True
+
+    # 只写回已越过的不可选路前缀；与消费事务一样按耐久值单调推进。
+    def _persist_cursor(self, session_id: str, through: int) -> None:
+        key = self._cursor_key(session_id)
+
+        def commit(tx: OwnerTransaction) -> int:
+            persisted = tx.read(key)
+            persisted_through = (-1 if persisted is None else
+                                 Cursor.model_validate(dict(persisted.value)).through_seq)
+            if through <= persisted_through:
+                return persisted_through
+            _ = tx.save(key, {"through_seq": through}, expected_version=None if persisted is None else persisted.version)
+            return through
+
+        self._note_durable(session_id, self._state.transact(commit))
+
+    # 耐久值只增不减：多个文件 I/O 线程在事务外交错更新时，旧值不能覆盖新值。
+    def _note_durable(self, session_id: str, through: int) -> None:
+        self._durable_cursor[session_id] = max(through, self._durable_cursor.get(session_id, -1))
 
     def _prepare(self, tx: OwnerTransaction, message: Message, sinks: tuple[Sink, ...], *, passive: bool = False) -> Selection:
         """同一消息的首次选路不可变；重复策略计算只采用原集合。"""
@@ -272,13 +362,33 @@ class DeliveryRecords:
             return
         value = Delivery(sink=sink, phase="prepared")
         _ = tx.save(key, value.model_dump(mode="json"), expected_version=None)
+        self._sync_open(tx, message_id, sink.name, value.phase)
+
+    # 索引项只表达"该发送尚未终结"；重试回到 prepared 时重新加入。
+    def _sync_open(self, tx: OwnerTransaction, message_id: str, sink: str, phase: str) -> None:
+        key = _open_key(message_id, sink)
+        row = tx.read(key)
+        if phase in _TERMINAL:
+            if row is not None:
+                tx.delete(key, expected_version=row.version)
+        elif row is None:
+            _ = tx.save(key, {}, expected_version=None)
 
 
     async def save_async(self, message_id: str, previous: OwnerRecord, delivery: Delivery, *,
                          on_commit: Callable[[OwnerRecord], None] | None = None) -> OwnerRecord:
-        return await self._state.transact_async(
-            lambda tx: self._save(tx, message_id, previous, delivery), on_commit=on_commit,
-        )
+        reason = None
+        if delivery.phase in {"failed", "rejected"}:
+            assert delivery.receipt is not None
+            reason = f"渠道 {delivery.sink.name}: {delivery.receipt.error or delivery.phase}"
+        async with self._notice(self.check_owner(message_id).session_id, message_id,
+                                f"{delivery.sink.name}:{previous.version}", reason) as notice:
+            def commit(tx: OwnerTransaction) -> OwnerRecord:
+                saved = self._save(tx, message_id, previous, delivery)
+                if notice is not None:
+                    _ = tx.append_prepared(notice)
+                return saved
+            return await self._state.transact_async(commit, on_commit=on_commit)
 
     async def cancel_prepared_async(self, message_id: str, sink: str, receipt: Receipt, *,
                                     on_commit: Callable[[bool], None]) -> bool:
@@ -303,6 +413,7 @@ class DeliveryRecords:
         row = tx.save(delivery_key(message_id, delivery.sink.name),
                       cast(Mapping[str, object], delivery.model_dump(mode="json")),
                       expected_version=previous.version)
+        self._sync_open(tx, message_id, delivery.sink.name, delivery.phase)
         key = "confirmed-message:" + message_id
         if delivery.confirmed_at is not None and tx.read(key) is None:
             confirmation = Confirmation(message_id=message_id, session_id=selection.session_id,
@@ -314,26 +425,37 @@ class DeliveryRecords:
 
     def pending(self) -> tuple[tuple[str, str], ...]:
         """恢复只枚举已固定的效果；不因新策略新增目的地。"""
+        # 1. 升级后首次恢复按全部发送记录补齐索引，此后只读索引区间。
+        if self._state.read(_OPEN_INDEX) is None:
+            self._state.transact(self._backfill_open)
+        keys: list[str] = []
+        stop = _OPEN_STOP
+        while page := self._state.scan(start=_OPEN_PREFIX, stop=stop, limit=1000):
+            keys.extend(key for key, _row in page)
+            stop = page[-1][0]
+        # 2. 索引只缩小候选；归属与阶段仍以原记录为准。
         pending: list[tuple[str, str]] = []
-        for key, _row in self._state.list():
-            if not key.startswith("delivery:"):
-                continue
-            identities: object = json.loads(key[len("delivery:"):])
-            if not isinstance(identities, list):
-                raise ValueError("发送记录身份损坏")
-            values = cast(list[object], identities)
-            if len(values) != 2 or any(not isinstance(value, str) or not value for value in values):
-                raise ValueError("发送记录身份损坏")
-            message_id, sink = cast(list[str], identities)
+        for key in sorted(keys):
+            message_id, sink = _identity(key, _OPEN_PREFIX)
             selection = self.selection(message_id)
             if selection is None:
                 raise ValueError("发送缺少首次选择")
             if selection.recovery_owner != self.recovery_owner:
                 continue
             _, delivery = self.read(message_id, sink)
-            if delivery.phase not in {"delivered", "rejected", "failed"}:
+            if delivery.phase not in _TERMINAL:
                 pending.append((message_id, sink))
         return tuple(pending)
+
+    # 在写事务内按全部发送记录重建索引，并以标记记录宣告索引完整。
+    def _backfill_open(self, tx: OwnerTransaction) -> None:
+        if tx.read(_OPEN_INDEX) is not None:
+            return
+        for key, row in self._state.list():
+            if key.startswith("delivery:"):
+                message_id, sink = _identity(key, "delivery:")
+                self._sync_open(tx, message_id, sink, read_delivery(row.value).phase)
+        _ = tx.save(_OPEN_INDEX, {"version": 1}, expected_version=None)
 
 
 @runtime_checkable

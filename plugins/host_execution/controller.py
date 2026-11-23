@@ -15,8 +15,11 @@ import stat
 import struct
 import sys
 import tempfile
+import threading
+import time
 from uuid import uuid4
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager
 from functools import cache
 from pathlib import Path, PurePosixPath
@@ -24,6 +27,7 @@ from collections.abc import Coroutine, Mapping
 from typing import Any, TypeVar, cast
 from urllib.parse import quote, urlencode, urlsplit
 
+from core.common.file_io import shield_until_done
 from plugins.host_execution.contract import (
     WorkloadLease,
     WorkloadMode,
@@ -33,13 +37,22 @@ from plugins.host_execution.contract import (
 _SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$")
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _IMAGE = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
+_IMAGE_PULL_TIMEOUT_S = 600.0
+_IMAGE_INSPECT_TIMEOUT_S = 30.0
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,511}$")
 _API_VERSION = "v1.47"
 _OWNER_LABEL = "com.akashic.workload"
 _HOST_GATEWAY = "host.docker.internal:host-gateway"
+# 声明了 host_egress 的 Workload 在这里看到 Host Bridge 的 SOCKS5 socket（socks.sock）。
+HOST_EGRESS_TARGET = "/run/akashic/host-egress"
 _USERNS_SECCOMP_PATH = Path(__file__).with_name("userns-seccomp.json")
 _T = TypeVar("_T")
 logger = logging.getLogger(__name__)
+
+
+# 启动失败且已核实没有留下容器或 lease；回包带 residual=none，Core 据此不再挂起这次请求。
+class _NoResidualStart(Exception):
+    pass
 
 
 class _UnixHttpConnection(http.client.HTTPConnection):
@@ -58,6 +71,10 @@ class DockerEngine:
 
     def __init__(self, socket_path: Path) -> None:
         self._socket_path = socket_path
+
+    @property
+    def socket_path(self) -> Path:
+        return self._socket_path
 
     async def request(
         self,
@@ -112,6 +129,134 @@ class DockerEngine:
             connection.close()
 
 
+class _OperationAborted(RuntimeError):
+    pass
+
+
+class _AbortableConnection(http.client.HTTPConnection):
+    """到 Docker 引擎的连接：socket 一创建就登记到所属操作，connect 之前和之后都能被中止。"""
+
+    def __init__(self, socket_path: Path, operation: "_ImageOperation", timeout: float) -> None:
+        super().__init__("docker", timeout=timeout)
+        self._socket_path = socket_path
+        self._operation = operation
+
+    def connect(self) -> None:
+        stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._operation.register(stream)
+        stream.settimeout(self.timeout)
+        stream.connect(str(self._socket_path))
+        self.sock = stream
+
+
+class _ImageOperation:
+    """一次 image_ensure：自己的中止标志、自己的 socket、自己的期限。计时器与控制器停止都只作用于这个对象，
+    所以上一次请求迟到的计时器回调不会碰到下一次请求。只保证期限到了请求返回失败，不承诺线程会被杀。"""
+
+    def __init__(self, socket_path: Path, total_seconds: float, inspect_seconds: float) -> None:
+        self._socket_path = socket_path
+        self._inspect_seconds = inspect_seconds
+        self._lock = threading.Lock()
+        self._aborted = False
+        self._socket: socket.socket | None = None
+        self._deadline = time.monotonic() + total_seconds
+        self._total = total_seconds
+        self._timer = threading.Timer(total_seconds, self.abort)
+        self._timer.daemon = True
+        self._running = False
+
+    def abort(self) -> None:
+        with self._lock:
+            self._aborted = True
+            stream = self._socket
+        if stream is not None:
+            try:
+                stream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def register(self, stream: socket.socket) -> None:
+        with self._lock:
+            if self._aborted:
+                stream.close()
+                raise _OperationAborted(self._message())
+            self._socket = stream
+
+    def _message(self) -> str:
+        return f"镜像操作超过 {self._total:.0f} 秒的总期限（或控制器正在停止），已中止"
+
+    def _check(self) -> None:
+        with self._lock:
+            aborted = self._aborted
+        if aborted or time.monotonic() >= self._deadline:
+            raise _OperationAborted(self._message())
+
+    def _timeout(self, limit: float) -> float:
+        return max(0.1, min(limit, self._deadline - time.monotonic()))
+
+    # 执行线程是否还活着：超时后线程可能没回来，控制器据此拒绝新的请求，任何时候最多一个幸存线程。
+    def alive(self) -> bool:
+        return self._running
+
+    def run(self, image: str) -> dict[str, object]:
+        self._running = True
+        self._timer.start()
+        try:
+            reference = quote(image, safe="")
+            status = self._request("GET", f"/images/{reference}/json", self._inspect_seconds, drain=True)
+            if status == 200:
+                return {"present": True, "pulled": False}
+            if status != 404:
+                raise RuntimeError(f"Docker 查询镜像失败（HTTP {status}）")
+            self._pull(reference)
+            return {"present": True, "pulled": True}
+        except OSError as error:
+            raise RuntimeError(self._message() if self._aborted else f"Docker 连接失败: {error}") from error
+        finally:
+            self._timer.cancel()
+            self._running = False
+
+    def _request(self, method: str, path: str, limit: float, *, drain: bool) -> int:
+        self._check()
+        connection = _AbortableConnection(self._socket_path, self, self._timeout(limit))
+        try:
+            connection.request(method, f"/{_API_VERSION}{path}")
+            self._check()
+            response = connection.getresponse()
+            if drain:
+                _ = response.read(1_048_576)
+            self._check()
+            return response.status
+        finally:
+            self._socket = None
+            connection.close()
+
+    # POST /images/create 的响应是逐行 JSON 进度：单行有大小上限，读到 error 就失败；读被中止打断不算完成。
+    def _pull(self, reference: str) -> None:
+        self._check()
+        connection = _AbortableConnection(self._socket_path, self, self._timeout(120.0))
+        try:
+            connection.request("POST", f"/{_API_VERSION}/images/create?fromImage={reference}")
+            self._check()
+            response = connection.getresponse()
+            if response.status != 200:
+                raise RuntimeError(f"Docker 拉取镜像失败（HTTP {response.status}）: {response.read(4096).decode('utf-8', errors='replace')}")
+            while True:
+                line = response.readline(1_048_576)
+                self._check()
+                if not line:
+                    return
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("error"):
+                    raise RuntimeError(f"拉取镜像失败: {str(record['error'])[:500]}")
+        finally:
+            self._socket = None
+            connection.close()
+
+
 class WorkloadControllerServer:
     """Validate requests and own all Docker effects for plugin Workloads."""
 
@@ -131,8 +276,10 @@ class WorkloadControllerServer:
         owner_container: str | None = None,
         owner_grace_seconds: float = 10.0,
         owner_poll_seconds: float = 2.0,
+        host_egress_dir: Path | None = None,
     ) -> None:
         self._workspace = workspace.resolve(strict=True)
+        self._host_egress_dir = host_egress_dir
         self._socket_path = socket_path
         self._engine = DockerEngine(docker_socket)
         self._state_path = state_path
@@ -172,6 +319,9 @@ class WorkloadControllerServer:
         self._closing = False
         self._requests: set[asyncio.Task[None]] = set()
         self._leases = self._load_leases()
+        self._image_active: str | None = None
+        self._image_operation: _ImageOperation | None = None
+        self._image_survivor: _ImageOperation | None = None
         self._stopped_path = self._state_path.with_suffix(".stopped.json")
         self._stopped = self._load_state(self._stopped_path)
         self._controller_id = uuid4().hex
@@ -271,6 +421,8 @@ class WorkloadControllerServer:
                 requests = tuple(self._requests)
                 for request in requests:
                     _ = request.cancel()
+                if self._image_operation is not None:
+                    self._image_operation.abort()
                 if requests:
                     results = await asyncio.gather(*requests, return_exceptions=True)
                 else:
@@ -402,11 +554,15 @@ class WorkloadControllerServer:
                 body = message.get("body")
                 if not isinstance(body, dict):
                     raise ValueError("Controller 请求 body 无效")
-                result = await _finish_effect(self._dispatch(action, body))
+                effect = self._dispatch(action, body)
+                # 镜像拉取可能很久：不屏蔽取消，控制器停止时要能中止它；其余效果仍先完成再响应取消。
+                result = await effect if action == "image_ensure" else await _finish_effect(effect)
                 response = {"ok": True, "body": result}
             except Exception as error:
                 message = str(error).strip() or type(error).__name__
                 response = {"ok": False, "error": message[:4096]}
+                if isinstance(error, _NoResidualStart):
+                    response["residual"] = "none"
             writer.write(
                 json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode(
                     "utf-8"
@@ -427,19 +583,67 @@ class WorkloadControllerServer:
         if action == "start":
             request = _start_request(body)
             async with self._plugin_access(request.plugin_id):
-                return await self._start(request)
+                try:
+                    return await self._start(request)
+                except Exception as error:
+                    if await self._start_left_nothing(request):
+                        raise _NoResidualStart(str(error).strip() or type(error).__name__) from error
+                    raise
         if action == "stop":
             if set(body) != {"lease"}:
                 raise ValueError("Controller stop schema 不匹配")
             lease = _lease(body.get("lease"))
             async with self._plugin_access(lease.plugin_id):
                 return await self._stop(lease)
+        if action == "image_ensure":
+            # 与启动 workload 同一条镜像引用规则（必须 sha256 digest 固定）；不占插件或维护锁，拉取期间其他请求照常处理。
+            if set(body) != {"image"}:
+                raise ValueError("Controller image_ensure schema 不匹配")
+            return await self._ensure_image(_required_text(body, "image"))
         if action == "cleanup_candidates":
             if set(body) != {"workspace_id"}:
                 raise ValueError("Controller cleanup schema 不匹配")
             async with self._maintenance():
                 return await self._cleanup_candidates(_required_text(body, "workspace_id"))
         raise ValueError(f"Controller action 无效: {action}")
+
+    # 确保镜像在本地：同一时间全局只允许一个（非阻塞：已有在途就立刻回"正在拉取"，不排队不等待）；
+    # 在专用单线程里做，不占默认线程池；整个过程有硬的总期限；取消（控制器停止）时主动中止，不等它完成。
+    async def _ensure_image(self, image: str) -> dict[str, object]:
+        if not _IMAGE.fullmatch(image):
+            raise ValueError("镜像必须使用 sha256 digest 固定")
+        if self._image_active is not None:
+            raise RuntimeError(f"正在拉取 {self._image_active}，稍后再试")
+        if self._image_survivor is not None and self._image_survivor.alive():
+            raise RuntimeError("上一次拉取仍未退出，稍后再试")
+        self._image_active = image
+        operation = _ImageOperation(self._engine.socket_path, _IMAGE_PULL_TIMEOUT_S, _IMAGE_INSPECT_TIMEOUT_S)
+        self._image_operation = operation
+        self._image_survivor = operation
+        # 每次操作一个新的单线程执行器：线程万一卡住，也不会拖住下一次请求；期限到了即使线程没回来，也在期限加宽限后返回失败。
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="image-ensure")
+        try:
+            future = asyncio.get_running_loop().run_in_executor(executor, operation.run, image)
+            return await asyncio.wait_for(future, timeout=_IMAGE_PULL_TIMEOUT_S + 5.0)
+        except asyncio.TimeoutError:
+            operation.abort()
+            raise RuntimeError(f"镜像操作超过 {_IMAGE_PULL_TIMEOUT_S:.0f} 秒的总期限，已中止") from None
+        except asyncio.CancelledError:
+            operation.abort()
+            raise
+        finally:
+            executor.shutdown(wait=False)
+            self._image_operation = None
+            self._image_active = None
+
+    # 启动失败后按稳定名核对现场；核对本身失败时不作结论，保持「结果未知」的保守语义。
+    async def _start_left_nothing(self, request: WorkloadStartRequest) -> bool:
+        try:
+            containers = await _finish_effect(self._find(request))
+        except Exception:
+            logger.exception("Workload start 失败后核对现场失败")
+            return False
+        return not containers and _lease_key(request) not in self._leases
 
     def _check_peer(self, writer: asyncio.StreamWriter) -> None:
         sock = writer.get_extra_info("socket")
@@ -555,10 +759,13 @@ class WorkloadControllerServer:
         if detail is not None:
             labels = _labels(detail)
             self._check_lease_labels(lease, labels)
+            # 宿主出口目录由所有声明它的 Workload 共用，不算这个容器独占的 mount。
+            shared = None if self._host_egress_dir is None else str(self._host_egress_dir)
             sources = tuple(
                 str(item.get("Source"))
                 for item in cast(list[dict[str, object]], detail.get("Mounts", []))
                 if item.get("Type") == "bind" and isinstance(item.get("Source"), str)
+                and item.get("Source") != shared
             )
             self._stopped[stop_key] = {
                 "lease": asdict(lease),
@@ -648,7 +855,7 @@ class WorkloadControllerServer:
             "Image": request.image,
             "User": f"{self._workload_uid}:{self._workload_gid}",
             "Labels": labels,
-            "ExposedPorts": {f"{number}/tcp": {} for _, number in request.ports},
+            "ExposedPorts": _exposed_ports(request),
             "HostConfig": {
                 "Mounts": mounts,
                 "Memory": memory * 1024 * 1024,
@@ -819,6 +1026,10 @@ class WorkloadControllerServer:
                 gid=self._workload_gid,
             )
             result.append((str(source), target, writable))
+        # 宿主出口：挂整个目录而不是 socket 文件，Bridge 重启重建 socket 后容器里仍看得到新的。
+        if request.host_egress and self._host_egress_dir is not None:
+            self._host_egress_dir.mkdir(parents=True, exist_ok=True)
+            result.append((str(self._host_egress_dir), HOST_EGRESS_TARGET, False))
         return tuple(result)
 
     def _check_request(self, request: WorkloadStartRequest) -> None:
@@ -841,6 +1052,8 @@ class WorkloadControllerServer:
             raise ValueError("Workload command 不能为空")
         if not isinstance(request.user_namespaces, bool):
             raise ValueError("Workload user_namespaces 无效")
+        if not isinstance(request.host_egress, bool):
+            raise ValueError("Workload host_egress 无效")
         if not request.ports or len({name for name, _ in request.ports}) != len(
             request.ports
         ):
@@ -862,6 +1075,10 @@ class WorkloadControllerServer:
         for name, number in request.loopback_ports:
             if name not in port_names or not 1024 <= number <= 65535:
                 raise ValueError("Workload loopback port 无效")
+        if len(set(request.udp_ports)) != len(request.udp_ports) or any(
+            not 1024 <= number <= 65535 for number in request.udp_ports
+        ):
+            raise ValueError("Workload udp port 无效")
         if len({name for name, _, _ in request.data}) != len(request.data):
             raise ValueError("Workload data name 重复")
         if len({target for _, target, _ in request.data}) != len(request.data):
@@ -926,7 +1143,7 @@ class WorkloadControllerServer:
             "Image": request.image,
             "Cmd": list(request.command),
             "User": f"{self._workload_uid}:{self._workload_gid}",
-            "ExposedPorts": {f"{number}/tcp": {} for _, number in request.ports},
+            "ExposedPorts": _exposed_ports(request),
         }
         expected_host: dict[str, object] = {
             "Memory": memory * 1024 * 1024,
@@ -1039,6 +1256,8 @@ def _start_request(raw: dict[str, object]) -> WorkloadStartRequest:
         "limits",
         "loopback_ports",
         "user_namespaces",
+        "udp_ports",
+        "host_egress",
     }
     if set(raw) != expected:
         raise ValueError(f"Workload start schema 不匹配: {sorted(set(raw) ^ expected)}")
@@ -1060,6 +1279,8 @@ def _start_request(raw: dict[str, object]) -> WorkloadStartRequest:
         limits=_limits(raw.get("limits")),
         loopback_ports=_ports(raw.get("loopback_ports")),
         user_namespaces=_required_bool(raw, "user_namespaces"),
+        udp_ports=_udp_ports(raw.get("udp_ports")),
+        host_egress=_required_bool(raw, "host_egress"),
     )
     if _required_text(raw, "spec_digest") != request.spec_digest:
         raise ValueError("Workload spec digest 与请求内容不一致")
@@ -1090,16 +1311,25 @@ def _userns_seccomp_option() -> str:
     return "seccomp=" + json.dumps(profile, separators=(",", ":"))
 
 
+def _exposed_ports(request: WorkloadStartRequest) -> dict[str, dict[str, str]]:
+    tcp: dict[str, dict[str, str]] = {f"{number}/tcp": {} for _, number in request.ports}
+    return tcp | {f"{number}/udp": {} for number in request.udp_ports}
+
+
 def _port_bindings(request: WorkloadStartRequest) -> dict[str, list[dict[str, str]]]:
-    """Publish declared formal ports only on the host loopback interface."""
+    """Publish formal TCP ports on loopback; UDP media ports keep their number on every host interface."""
 
     if request.mode != "formal":
         return {}
     host_ports = dict(request.loopback_ports)
-    return {
+    bindings = {
         f"{number}/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(host_ports[name])}]
         for name, number in request.ports
         if name in host_ports
+    }
+    return bindings | {
+        f"{number}/udp": [{"HostIp": "", "HostPort": str(number)}]
+        for number in request.udp_ports
     }
 
 
@@ -1189,6 +1419,14 @@ def _data(raw: object) -> tuple[tuple[str, str, bool], ...]:
             raise ValueError("Workload data entry 无效")
         result.append((item[0], item[1], item[2]))
     return tuple(result)
+
+
+def _udp_ports(raw: object) -> tuple[int, ...]:
+    if not isinstance(raw, list) or any(
+        not isinstance(item, int) or isinstance(item, bool) for item in raw
+    ):
+        raise ValueError("Workload udp ports 无效")
+    return tuple(raw)
 
 
 def _limits(raw: object) -> tuple[int, float, int]:
@@ -1306,19 +1544,7 @@ def _request_lease(
 async def _finish_effect(effect: Coroutine[Any, Any, _T]) -> _T:
     """Finish one Docker effect before restoring caller cancellation."""
 
-    task = asyncio.create_task(effect)
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                break
-            cancelled = True
-    result = task.result()
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
+    return await shield_until_done(asyncio.create_task(effect))
 
 
 def _labels(detail: dict[str, object]) -> dict[str, str]:
@@ -1430,6 +1656,7 @@ async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path
     parser.add_argument("--owner-container")
     parser.add_argument("--owner-grace-seconds", type=float, default=10.0)
     parser.add_argument("--owner-poll-seconds", type=float, default=2.0)
+    parser.add_argument("--host-egress-dir", type=Path)
     args = parser.parse_args(arguments)
     server = WorkloadControllerServer(
         workspace=args.workspace,
@@ -1445,6 +1672,7 @@ async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path
         owner_container=args.owner_container,
         owner_grace_seconds=args.owner_grace_seconds,
         owner_poll_seconds=args.owner_poll_seconds,
+        host_egress_dir=args.host_egress_dir,
     )
     await _serve_until_signal(server)
     return 0

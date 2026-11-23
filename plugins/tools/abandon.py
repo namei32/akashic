@@ -1,20 +1,60 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Hashable, Mapping
+import logging
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import replace
 from typing import cast
 
-from agent.plugin_composition.tasks import TaskAdmission, TaskSlot
+from agent.plugin_composition.tasks import Task, TaskAdmission, TaskSlot
+from core.common.file_io import run_file_io
 from .api import Denied, MessageReply, Result, durable_call_key
-from .execution import _fingerprint, finish
-from plugins.ledger.contract import MessageCatalog, MessageReader, OwnerStore, OwnerTransaction
-from plugins.ledger.contract import CallRef, ContentPart, Control, Message, Output, ToolCall, ToolResult
+from .execution import STOPPED_NOT_STARTED, _fingerprint, commit_message, finish
+from plugins.ledger.contract import MessageCatalog, MessageReader, OwnerRecord, OwnerStore, OwnerTransaction
+from plugins.ledger.contract import CallRef, ContentPart, Control, Message, Output, ToolCall, ToolResult, is_process_call_output
+from plugins.tools.contract import invoked_unrecorded
+
+logger = logging.getLogger(__name__)
 
 
-class LegacyReplyIdentityUnavailable(ValueError):
-    """旧回执使用自定义结果身份，但没有保存可恢复的明文身份。"""
+# 结果只可能在调用消息之后；流式扫描命中即停，不为每个被放弃的调用解码整段会话。
+def _existing_result(reader: MessageReader, call_ref: CallRef) -> ToolResult | None:
+    call = reader.get(call_ref.message_id)
+
+    def first(rows: Iterable[Message]) -> ToolResult | None:
+        for message in rows:
+            body = message.body
+            if isinstance(body, ToolResult) and body.call_ref == call_ref:
+                return body
+        return None
+
+    return reader.scan(first, after_seq=-1 if call is None else call.seq)
+
+
+# 旧回执无法解释时保留原记录，由调用消息身份追加明确的未知效果终态。
+def _reply_target(reply: MessageReply, record: OwnerRecord | None) -> MessageReply:
+    if record is None:
+        return reply
+    phase = record.value.get("phase")
+    if not isinstance(phase, str) or phase not in {"requested", "prepared", "started", "done"}:
+        raise ValueError("工具回执阶段无效")
+    if "reply_id" in record.value:
+        identity = record.value["reply_id"]
+        if not isinstance(identity, str):
+            raise ValueError("消息工具回执缺少结果身份")
+        target = replace(reply, message_id=identity)
+    else:
+        target = reply
+        result = record.value.get("result")
+        if record.value["phase"] == "done" and isinstance(result, Mapping):
+            identity = cast(Mapping[str, object], result).get("message_id")
+            if isinstance(identity, str):
+                target = replace(reply, message_id=identity)
+    call = target.request()
+    if record.value.get("request") != _fingerprint(call.binding_id, call.arguments, target):
+        raise ValueError("旧工具回执缺少可恢复的结果身份或与原请求不一致")
+    return target
 
 
 async def abandon_call(
@@ -22,64 +62,111 @@ async def abandon_call(
 ) -> Result:
     """Tools 先提交终态再协作取消；真实效果与清理仍由原 Task 持有。"""
     state.check_access(reply.reader, reply.writer)
-    if not reply.abandoned():
-        raise ValueError("工具没有已接纳的放弃控制")
+    # 放弃判定会扫调用之后的整段前缀，与下方回执读取一样放进 worker。
+    stopped = not await run_file_io(reply.abandoned)
+    if stopped and not await run_file_io(reply.stopped):
+        raise ValueError("工具没有已接纳的放弃或停止控制")
     key = durable_call_key(reply.call_ref)
+    actor = "用户已停止此工作" if stopped else "用户已放弃此工作"
 
-    async def settle(slot: TaskSlot) -> Result:
-        record = state.read(key)
-        if record is None:
-            for message in reply.reader.snapshot():
-                body = message.body
-                if isinstance(body, ToolResult) and body.call_ref == reply.call_ref:
-                    if slot.current is not None:
-                        slot.current.cancel()
-                    return Result(body.outcome, body.parts)
-        if record is not None and "reply_id" in record.value:
-            identity = record.value["reply_id"]
-            if not isinstance(identity, str):
-                raise ValueError("消息工具回执缺少结果身份")
-            target = replace(reply, message_id=identity)
-        else:
-            target = reply
-            if record is not None and record.value["phase"] == "done":
-                result = record.value.get("result")
-                if isinstance(result, Mapping) and isinstance(result.get("message_id"), str):
-                    target = replace(reply, message_id=cast(str, result["message_id"]))
-        call = target.request()
-        fingerprint = _fingerprint(call.binding_id, call.arguments, target)
-        if record is not None:
-            if record.value["request"] != fingerprint:
-                if "reply_id" not in record.value:
-                    raise LegacyReplyIdentityUnavailable(
-                        f"旧工具回执缺少可恢复的结果身份 call={reply.call_ref.message_id}:{reply.call_ref.part_index}"
-                    )
-                raise ValueError("放弃的工具回执与原请求不一致")
-            if record.value["phase"] == "done":
-                if slot.current is not None:
-                    slot.current.cancel()
-                return target.read(record.value["result"])
-            if record.value["phase"] not in {"requested", "prepared", "started"}:
-                raise ValueError("工具回执阶段无效")
-        # 无阶段回执不能证明未执行；重启后内存 Task 已丢失，仍须保留效果不确定性。
-        may_have_started = record is None or record.value["phase"] == "started"
+    async def settle(slot: TaskSlot) -> Result | Task:
+        # 停止不跳过收尾：还在运行或排空的调用等原 Task 写终态，新回合才继续。
+        if stopped and slot.current is not None and not slot.current.done:
+            return slot.current
+
         def cancel_after_commit(_result: Result) -> None:
             if slot.current is not None:
                 slot.current.cancel()
 
-        result = await finish(
+        # 回执与已有结果的读取放进 worker：启动扫描时机械盘冷读曾让事件循环停顿 2.2s。
+        record = await run_file_io(lambda: state.read(key))
+        existing = await run_file_io(lambda: _existing_result(reply.reader, reply.call_ref))
+        if existing is not None:
+            result = Result(existing.outcome, existing.parts)
+            cancel_after_commit(result)
+            return result
+        try:
+            target = await run_file_io(lambda: _reply_target(reply, record))
+            if record is not None and record.value["phase"] == "done":
+                done = record.value.get("result")
+                result = await run_file_io(lambda: target.read(done))
+                cancel_after_commit(result)
+                return result
+        except ValueError as error:
+            return await commit_message(state, reply, Result("error", (ContentPart(
+                "text", f"{actor}；旧工具回执无法恢复，结果未知: {error}。"
+                "可能已产生副作用，请先检查当前状态，不要直接重复原操作。",
+            ),)), on_commit=cancel_after_commit)
+        call = await run_file_io(target.request)
+        fingerprint = _fingerprint(call.binding_id, call.arguments, target)
+        # 无阶段回执不能证明未执行；重启后内存 Task 已丢失，仍须保留效果不确定性。
+        may_have_started = record is None or record.value["phase"] == "started"
+        if stopped and record is None:
+            # 停止可以证明的只有本进程内从未进入 invoke 的调用。
+            may_have_started = key in invoked_unrecorded or await run_file_io(lambda: _before_process(reply))
+        return await finish(
             state, key, record,
             Result("interrupted" if may_have_started else "denied", (ContentPart(
-                "text", "用户已放弃此工作；工具可能已部分执行。请先检查当前状态，再决定是否重试。"
-                if may_have_started else "用户已放弃此工作，工具未启动。",
+                "text", f"{actor}；工具可能已部分执行。请先检查当前状态，再决定是否重试。"
+                if may_have_started else _not_started(stopped),
             ),)), target,
             initial={"version": 1, "request": fingerprint, "binding": call.binding_id,
                      "reply_id": target.message_id, "arguments": call.arguments},
             on_commit=cancel_after_commit,
         )
-        return result
 
-    return await tasks.admit_async((task_key, key), settle)
+    while True:
+        outcome = await tasks.admit_async((task_key, key), settle)
+        if isinstance(outcome, Result):
+            invoked_unrecorded.discard(key)
+            return outcome
+        await _join_stopped(outcome)
+
+
+def _not_started(stopped: bool) -> str:
+    return STOPPED_NOT_STARTED if stopped else "用户已放弃此工作，工具未启动。"
+
+
+# 调用消息不是本进程写入的：内存里没有它的执行记录，不能证明未开始。
+def _before_process(reply: MessageReply) -> bool:
+    call = reply.reader.get(reply.call_ref.message_id)
+    return call is None or not is_process_call_output(call.message_id)
+
+
+# 原 Task 的取消或失败由它自己的回执表达；只有等待者自身被取消才向上传播。
+async def _join_stopped(task: Task) -> None:
+    try:
+        _ = await task.join()
+    except asyncio.CancelledError:
+        caller = asyncio.current_task()
+        if caller is not None and caller.cancelling():
+            raise
+    except Exception:
+        logger.info("停止结算等待的工具 Task 以失败结束", exc_info=True)
+
+
+# 区间内任一来源出现 abandon Control；按来源走 kind 索引，只解码 Control。
+# 只解码 abandon 控制及其所需窗口：被放弃的调用只来自同来源、through_seq 前最后一次结束输出之后，
+# 不必为一条历史控制解码整段会话（启动时 seen 为空，大会话会被整段解码两次）。
+def _abandon_targets(
+    reader: MessageReader, after_seq: int, through_seq: int,
+) -> list[tuple[Message, tuple[CallRef, ...]]]:
+    targets: list[tuple[Message, tuple[CallRef, ...]]] = []
+    for source in reader.source_names():
+        seqs = reader.scan_controls(
+            lambda rows: [seq for seq, body in rows if body.action == "abandon"],
+            source=source, after_seq=after_seq, through_seq=through_seq,
+        )
+        for seq in seqs:
+            control = reader.read(after_seq=seq - 1, through_seq=seq, limit=1)[0]
+            bound = cast(Control, control.body).through_seq
+            finished = reader.latest_finished_output_seq(source, after_seq=-1, through_seq=bound)
+            window = reader.scan(
+                tuple, after_seq=-1 if finished is None else finished, through_seq=bound, source=source,
+            )
+            targets.append((control, abandoned_calls(window, control)))
+    targets.sort(key=lambda target: target[0].seq)
+    return targets
 
 
 async def follow_abandon(
@@ -133,18 +220,13 @@ async def follow_abandon(
                     continue
                 ok = True
                 try:
-                    changed = await asyncio.to_thread(reader.snapshot, after_seq=previous, through_seq=head)
-                    controls = [message for message in changed
-                                if isinstance(message.body, Control) and message.body.action == "abandon"]
-                    messages = await asyncio.to_thread(reader.snapshot, through_seq=head) if controls else ()
-                    for control in controls:
-                        for ref in abandoned_calls(messages, control):
+                    # 启动时 seen 为空，窗口是整段历史；走 Control 索引找 abandon，只解码各自的尾部窗口。
+                    targets = await asyncio.to_thread(_abandon_targets, reader, previous, head)
+                    for control, refs in targets:
+                        for ref in refs:
                             try:
                                 async with reply(reader, control.source, ref) as target:
-                                    try:
-                                        _ = await abandon_call(state, tasks, target, task_key=task_key)
-                                    except LegacyReplyIdentityUnavailable as error:
-                                        _ = report_incident("legacy_tool_reply_identity", str(error))
+                                    _ = await abandon_call(state, tasks, target, task_key=task_key)
                             except asyncio.CancelledError:
                                 raise
                             except Exception as error:

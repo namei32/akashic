@@ -12,7 +12,7 @@
 .memory-status header p, .memory-status dt, .memory-status section > p, .memory-notes { color: var(--ak-ink-secondary); }
 .memory-status header > p:first-child, .memory-status dt, .memory-notes, .memory-status details { font-size: var(--memory-type-small); }
 .memory-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-block: 24px; }
-.memory-status button { min-height: 44px; padding: 8px 14px; border: 1px solid var(--ak-rule-default); border-radius: 6px; font: inherit; color: inherit; background: var(--ak-paper-editing); cursor: pointer; }
+.memory-status button { min-height: 44px; padding: 8px 14px; border: 1px solid var(--ak-rule-default); border-radius: var(--ak-radius-sm); font: inherit; color: inherit; background: var(--ak-paper-editing); cursor: pointer; }
 .memory-status button:disabled { opacity: .45; cursor: default; }
 .memory-status :focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: 3px; }
 .memory-status section { margin-top: 28px; }
@@ -32,3 +32,12 @@
 .memory-notes { margin-top: 32px; border-top: 1px solid var(--ak-rule-subtle); padding-top: 16px; }
 @media (max-width: 480px) { .memory-details > div { grid-template-columns: 1fr; gap: 2px; } }
 @media (hover: hover) { .memory-status button:not(:disabled):hover { background: var(--ak-paper-quiet); } }
+
+.memory-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-block: 16px; }
+.memory-filters label { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 10rem; color: var(--ak-ink-secondary); }
+.memory-filters input, .memory-filters select { min-height: 44px; width: 100%; min-width: 0; border: 1px solid var(--ak-rule-default); border-radius: var(--ak-radius-sm); padding: 8px; color: var(--ak-ink-primary); background: var(--ak-paper-editing); font: inherit; }
+.memory-filters .memory-search { flex-basis: 18rem; }
+.memory-records { list-style: none; padding: 0; margin: 16px 0; }
+.memory-records > li { padding-block: 16px; border-bottom: 1px solid var(--ak-rule-subtle); }
+.memory-records .memory-record-meta { color: var(--ak-ink-secondary); font-size: var(--memory-type-small); }
+.memory-records ol { padding-inline-start: 24px; }

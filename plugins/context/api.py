@@ -12,31 +12,11 @@ from plugins.ledger.contract import (
     ContentReferences,
     Control,
     Message,
-    MessageSnapshot,
     Output,
     ToolCall,
     ToolResult,
 )
 from plugins.context.contract import MaterialData
-
-
-def summary_cutoff(snapshot: Sequence[Message], summary: Summary | None) -> int:
-    """请求组装与召回去重共用的摘要切点；不改变来源消息或回合归属。"""
-    if snapshot and type(snapshot) is not MessageSnapshot:
-        session = snapshot[0].session_id
-        if any(item.session_id != session for item in snapshot):
-            raise ValueError("Context 快照只能属于一个 Session")
-        if any(a.seq >= b.seq for a, b in zip(snapshot, snapshot[1:])):
-            raise ValueError("Context 快照必须按 seq 严格递增")
-        if len({item.message_id for item in snapshot}) != len(snapshot):
-            raise ValueError("Context 快照消息身份重复")
-    if summary is None:
-        return -1
-    covered = summary_range(snapshot, summary.source_message_ids)
-    ends = settled_prefixes(snapshot[:covered.stop])
-    if covered.stop not in ends or covered.start and covered.start not in ends:
-        raise ValueError("摘要不能覆盖尚未结算的工具调用")
-    return snapshot[covered.stop - 1].seq
 
 
 def settled_prefixes(messages: Sequence[Message]) -> tuple[int, ...]:
@@ -76,16 +56,15 @@ def check_notice(part: ContentPart) -> ContentReferences:
     return ContentReferences()
 
 
-def summary_range(snapshot: Sequence[Message], source_message_ids: tuple[str, ...]) -> range:
-    """按真实身份定位摘要的连续区间；窗口外旧消息不冒充摘要来源。"""
-    identities = tuple(message.message_id for message in snapshot)
-    if not source_message_ids or source_message_ids[0] not in identities:
+def summary_indexes(snapshot: Sequence[Message], source_message_ids: tuple[str, ...]) -> tuple[int, ...]:
+    """按真实身份核对摘要覆盖；允许跳过未覆盖消息，但不能重排、重复或引用不存在的消息。"""
+    positions = {message.message_id: index for index, message in enumerate(snapshot)}
+    if not source_message_ids or any(identity not in positions for identity in source_message_ids):
         raise ValueError("摘要来源缺少实际消息")
-    start = identities.index(source_message_ids[0])
-    end = start + len(source_message_ids)
-    if identities[start:end] != source_message_ids:
-        raise ValueError("摘要来源不等于实际连续消息范围")
-    return range(start, end)
+    indexes = tuple(positions[identity] for identity in source_message_ids)
+    if any(left >= right for left, right in zip(indexes, indexes[1:])):
+        raise ValueError("摘要来源必须按实际消息顺序排列且不能重复")
+    return indexes
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,10 +96,14 @@ class Reminder:
     text: str
     priority: int
     replay: bool = True
+    # 贡献这条提醒的插件；由材料汇总按实际 owner 填写，只用于上下文构成统计。
+    owner: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("提醒必须有稳定的局部名称")
+        if not isinstance(self.owner, str):
+            raise TypeError("提醒 owner 必须是字符串")
         if not isinstance(self.text, str):
             raise TypeError("提醒正文必须是字符串")
         if type(self.priority) is not int:
@@ -138,10 +121,14 @@ class Materials:
     summary: Summary | None = None
     references: tuple[Mapping[str, object], ...] = ()
     notices: tuple[str, ...] = ()
+    # system_prompt 按贡献材料拆开的 (材料名, 正文)；只用于上下文构成统计，拼接仍以 system_prompt 为准。
+    prompt_sections: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.system_prompt, str):
             raise TypeError("system Prompt 必须是字符串")
+        if any(len(item) != 2 or not all(isinstance(value, str) for value in item) for item in self.prompt_sections):
+            raise TypeError("prompt_sections 必须是 (名称, 正文) 字符串对")
         if any(not isinstance(item, str) or not item.strip() for item in self.notices):
             raise ValueError("上下文诊断必须是非空正文")
         parts = tuple(self.reminders)
@@ -200,7 +187,7 @@ def _summary(value: object) -> Summary | None:
 
 def _reminder(value: object) -> Reminder:
     data = _object(value, "reminder")
-    if set(data) not in ({"name", "text", "priority"}, {"name", "text", "priority", "replay"}):
+    if not {"name", "text", "priority"} <= set(data) <= {"name", "text", "priority", "replay", "owner"}:
         raise ValueError("reminder 字段无效")
     name, text, priority = data["name"], data["text"], data["priority"]
     if not isinstance(name, str) or not isinstance(text, str) or type(priority) is not int:
@@ -208,13 +195,16 @@ def _reminder(value: object) -> Reminder:
     replay = data.get("replay", True)
     if type(replay) is not bool:
         raise TypeError("reminder.replay 必须是 bool")
-    return Reminder(name, text, priority, replay)
+    owner = data.get("owner", "")
+    if not isinstance(owner, str):
+        raise TypeError("reminder.owner 必须是字符串")
+    return Reminder(name, text, priority, replay, owner)
 
 
 def decode_material(value: object) -> Materials:
     """在 Context 边界把 provider 的普通映射转换为内部材料值。"""
     data = _object(value, "materials")
-    unknown = set(data) - {"system_prompt", "reminders", "summary", "references", "notices"}
+    unknown = set(data) - {"system_prompt", "reminders", "summary", "references", "notices", "prompt_sections"}
     if unknown:
         raise ValueError(f"materials 包含未知字段: {sorted(unknown)}")
     prompt = data.get("system_prompt", "")
@@ -226,7 +216,11 @@ def decode_material(value: object) -> Materials:
     notices = _sequence(data.get("notices", ()), "materials.notices")
     if any(not isinstance(item, str) for item in notices):
         raise TypeError("materials.notices 必须是字符串数组")
-    return Materials(prompt, reminders, summary, references, cast(tuple[str, ...], notices))
+    sections = tuple(tuple(cast(Sequence[object], item)) for item in _sequence(data.get("prompt_sections", ()), "materials.prompt_sections"))
+    if any(len(item) != 2 or not all(isinstance(value, str) for value in item) for item in sections):
+        raise TypeError("materials.prompt_sections 必须是 [名称, 正文] 字符串对")
+    return Materials(prompt, reminders, summary, references, cast(tuple[str, ...], notices),
+                     cast(tuple[tuple[str, str], ...], sections))
 
 
 def material_data(materials: Materials) -> MaterialData:
@@ -239,10 +233,12 @@ def material_data(materials: Materials) -> MaterialData:
     return {
         "system_prompt": materials.system_prompt,
         "reminders": tuple({"name": item.name, "text": item.text, "priority": item.priority,
-                            **({"replay": False} if not item.replay else {})} for item in materials.reminders),
+                            **({"replay": False} if not item.replay else {}),
+                            **({"owner": item.owner} if item.owner else {})} for item in materials.reminders),
         "summary": summary,
         "references": tuple(dict(item) for item in materials.references),
         **({"notices": materials.notices} if materials.notices else {}),
+        **({"prompt_sections": materials.prompt_sections} if materials.prompt_sections else {}),
     }
 
 

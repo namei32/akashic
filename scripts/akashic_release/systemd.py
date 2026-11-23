@@ -13,32 +13,32 @@ from typing import Callable
 
 Run = Callable[..., subprocess.CompletedProcess[str]]
 _UNITS = ("akashic-host-bridge.service", "akashic-core.service")
-_EXTERNAL_UNIT = "akashic-home-services.service"
 _SYSTEM_UNIT_ROOT = Path("/etc/systemd/system")
+# sudoers 只免密放行 /tmp/akashic-units-*/ 下的单元；部署者常把 TMPDIR 改到别处，暂存目录要固定。
+_UNIT_STAGING_ROOT = Path("/tmp")
 
 
-def verify_external_service_contract(
-    *, run: Run, unit_root: Path = _SYSTEM_UNIT_ROOT
+def require_unit_install(
+    *, checkout: Path, run: Run, unit_root: Path = _SYSTEM_UNIT_ROOT, runtime_env: Path | None = None,
 ) -> None:
-    """Require the separately owned home-services lifecycle unit."""
+    """停机前确认能写入变化的系统单元；sudo 要密码时停机后才失败会让生产停在 inactive。"""
 
-    if unit_root != _SYSTEM_UNIT_ROOT:
-        external_unit = unit_root / _EXTERNAL_UNIT
-        if not external_unit.is_file():
-            raise RuntimeError(f"隔离 unit root 缺少外围服务合同: {external_unit}")
-        run(
-            ["systemd-analyze", "verify", str(external_unit)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    if unit_root != _SYSTEM_UNIT_ROOT or os.geteuid() == 0:
         return
-    run(
-        ["systemctl", "cat", "--", _EXTERNAL_UNIT],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    changed, _ = _unit_changes(checkout=checkout, unit_root=unit_root, runtime_env=runtime_env)
+    denied: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="akashic-units-", dir=_UNIT_STAGING_ROOT) as temporary_root:
+        for name, _, target in changed:
+            # 1. 把已安装内容原样装回：命令形状与正式安装一致，验证 sudoers 放行而不改变单元。
+            staged = Path(temporary_root) / name
+            command = ["sudo", "-n", "true"]
+            if target.exists():
+                shutil.copy2(target, staged)
+                command = ["sudo", "-n", "install", "-m", "0644", str(staged), str(target)]
+            if run(command, check=False, capture_output=True, text=True).returncode != 0:
+                denied.append(name)
+    if denied:
+        raise RuntimeError(f"目标版本更新了 systemd 单元 {', '.join(denied)}，当前用户不能免密写入；请用 root 部署，生产未停机")
 
 
 def install_units(
@@ -51,6 +51,42 @@ def install_units(
 ) -> bool:
     """安装发生变化的单元；备份由部署者选择。"""
 
+    changed, rendered_units = _unit_changes(checkout=checkout, unit_root=unit_root, runtime_env=runtime_env)
+    # 2. 预检必须在写任何单元之前完成：环境文件缺失是启动期故障，不是安装期发现。
+    verify_rendered_units(rendered_units)
+    if not changed:
+        if unit_root == _SYSTEM_UNIT_ROOT:
+            run(["sudo", "systemctl", "enable", *_UNITS], check=True)
+        return False
+
+    backup = None
+    if backup_root is not None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = backup_root / f"systemd-{timestamp}"
+        backup.mkdir(parents=True, exist_ok=False)
+    with tempfile.TemporaryDirectory(prefix="akashic-units-", dir=_UNIT_STAGING_ROOT) as temporary_root:
+        for name, rendered, target in changed:
+            if target.exists() and backup is not None:
+                shutil.copy2(target, backup / target.name)
+            staged = Path(temporary_root) / name
+            staged.write_bytes(rendered)
+            if unit_root != _SYSTEM_UNIT_ROOT:
+                temporary = target.with_name(f".{target.name}.installing")
+                shutil.copy2(staged, temporary)
+                temporary.chmod(0o644)
+                temporary.replace(target)
+            else:
+                run(["sudo", "install", "-m", "0644", str(staged), str(target)], check=True)
+    if unit_root == _SYSTEM_UNIT_ROOT:
+        run(["sudo", "systemctl", "daemon-reload"], check=True)
+        run(["sudo", "systemctl", "enable", *_UNITS], check=True)
+    return True
+
+
+# 按服务账号渲染发行版单元，返回与已安装内容不同的部分。
+def _unit_changes(
+    *, checkout: Path, unit_root: Path, runtime_env: Path | None,
+) -> tuple[list[tuple[str, bytes, Path]], dict[str, bytes]]:
     source_root = checkout / "docker" / "host-runtime" / "systemd"
     service_user, service_group, service_home = resolve_service_account(
         installed_unit=(unit_root / _UNITS[0]) if unit_root.joinpath(_UNITS[0]).exists() else None,
@@ -73,35 +109,7 @@ def install_units(
         rendered_units[name] = rendered
         if not target.exists() or target.read_bytes() != rendered:
             changed.append((name, rendered, target))
-    # 2. 预检必须在写任何单元之前完成：环境文件缺失是启动期故障，不是安装期发现。
-    verify_rendered_units(rendered_units)
-    if not changed:
-        if unit_root == _SYSTEM_UNIT_ROOT:
-            run(["sudo", "systemctl", "enable", *_UNITS], check=True)
-        return False
-
-    backup = None
-    if backup_root is not None:
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup = backup_root / f"systemd-{timestamp}"
-        backup.mkdir(parents=True, exist_ok=False)
-    with tempfile.TemporaryDirectory(prefix="akashic-units-") as temporary_root:
-        for name, rendered, target in changed:
-            if target.exists() and backup is not None:
-                shutil.copy2(target, backup / target.name)
-            staged = Path(temporary_root) / name
-            staged.write_bytes(rendered)
-            if unit_root != _SYSTEM_UNIT_ROOT:
-                temporary = target.with_name(f".{target.name}.installing")
-                shutil.copy2(staged, temporary)
-                temporary.chmod(0o644)
-                temporary.replace(target)
-            else:
-                run(["sudo", "install", "-m", "0644", str(staged), str(target)], check=True)
-    if unit_root == _SYSTEM_UNIT_ROOT:
-        run(["sudo", "systemctl", "daemon-reload"], check=True)
-        run(["sudo", "systemctl", "enable", *_UNITS], check=True)
-    return True
+    return changed, rendered_units
 
 
 def resolve_service_account(

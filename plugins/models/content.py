@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import hashlib
 import json
 import posixpath
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, cast
@@ -35,6 +36,8 @@ from plugins.models.contract import MODEL_CONTENT as MODEL_CONTENT
 # 历史里的附件每轮都会重新投影，预算按 token 成本保守取（48KB 约 1.2 万 token）。
 MAX_TEXT_FILE_BYTES = 48 * 1024
 MAX_TEXT_TOTAL_BYTES = 160 * 1024
+# 存储层异常可能带绝对路径，模型和用户只看这句固定说明；真实原因留在异常链和日志里。
+_ARTIFACT_UNAVAILABLE = "附件文件已丢失或校验失败，请重新上传"
 _TEXT_MEDIA_TYPES = frozenset({
     "application/json", "application/ld+json", "application/xml", "application/yaml", "application/x-yaml",
     "application/toml", "application/javascript", "application/x-javascript", "application/typescript",
@@ -73,7 +76,7 @@ def _decode_text(raw: bytes, *, truncated: bool) -> str | None:
 # 有预算时读入文本附件内容，写回附件标签里的状态说明；返回实际计入预算的字节数与内容块。
 # 同一附件在历史里出现几次，正文就投影几次：单份额度按出现次数分摊，返回的成本已乘上次数。
 async def _text_view(reader: ArtifactRead, ref: AttachmentRef, label: dict[str, object], *,
-                     remaining: int, occurrences: int) -> tuple[int, Mapping[str, Any] | None]:
+                     remaining: int, occurrences: int, current: bool) -> tuple[int, Mapping[str, Any] | None]:
     # 1. 预算用完时只说明未提供，原附件不变
     if remaining // occurrences <= 0:
         label["text_status"] = "本次未提供文本内容；文本附件预算已用完"
@@ -83,12 +86,18 @@ async def _text_view(reader: ArtifactRead, ref: AttachmentRef, label: dict[str, 
         return 0, None
     limit = min(MAX_TEXT_FILE_BYTES, remaining // occurrences)
     truncated = ref.size_bytes > limit
-    # 2. 只读前缀：超长文件给开头部分并写明
-    lease = await reader.acquire(ref)
+    # 2. 只读前缀：超长文件给开头部分并写明；文件读不到时当前输入明确失败，历史附件只说明未提供
     try:
-        raw = await lease.read_chunk(offset=0, max_bytes=min(limit, ref.size_bytes))
-    finally:
-        await lease.aclose()
+        lease = await reader.acquire(ref)
+        try:
+            raw = await lease.read_chunk(offset=0, max_bytes=min(limit, ref.size_bytes))
+        finally:
+            await lease.aclose()
+    except (OSError, ValueError) as error:
+        if current:
+            raise ValueError(_ARTIFACT_UNAVAILABLE) from error
+        label["text_status"] = f"本次未提供文本内容：{_ARTIFACT_UNAVAILABLE}"
+        return 0, None
     text = _decode_text(raw, truncated=truncated)
     if text is None:
         label["text_status"] = "不是 UTF-8 文本；未提供内容"
@@ -120,7 +129,8 @@ async def load_artifacts(
         text_block: Mapping[str, Any] | None = None
         if ref.kind is AttachmentKind.FILE and _text_like(ref):
             cost, text_block = await _text_view(reader, ref, label, remaining=MAX_TEXT_TOTAL_BYTES - text_bytes,
-                                                occurrences=counts[ref.artifact_id])
+                                                occurrences=counts[ref.artifact_id],
+                                                current=ref.artifact_id in current_artifact_ids)
             text_bytes += cost
         elif ref.kind is AttachmentKind.IMAGE:
             if not accepts_images:
@@ -132,20 +142,22 @@ async def load_artifacts(
                         and raw_bytes + raw_cost <= MAX_IMAGE_TOTAL_BYTES)
                 if fits:
                     # 2. 字节完整性由 Artifact owner 核验，关闭租约后在 worker 转图。
-                    lease = await reader.acquire(ref)
                     try:
-                        raw = await lease.read_bytes(max_bytes=MAX_IMAGE_FILE_BYTES)
-                    finally:
-                        await lease.aclose()
-                    candidate = await asyncio.to_thread(encode_image_bytes, raw)
-                    del raw
-                    encoded_cost = len(candidate) * counts[ref.artifact_id]
-                    fits = encoded_bytes + encoded_cost <= MAX_IMAGE_DATA_URI_TOTAL_BYTES
-                    if fits:
-                        uri = candidate
-                        raw_bytes += raw_cost
-                        encoded_bytes += encoded_cost
-                    del candidate
+                        candidate = await _encoded_image(reader, ref)
+                    except ValueError as error:
+                        # 坏图和丢失的文件不会自己好：当前输入明确失败让用户重传，旧图只说明未提供，
+                        # 不占预算也不挡更早的图。否则这条历史会让之后每条输入都失败。
+                        if current:
+                            raise
+                        label["image_status"] = f"本次未提供图片内容：{error}"
+                    else:
+                        encoded_cost = len(candidate) * counts[ref.artifact_id]
+                        fits = encoded_bytes + encoded_cost <= MAX_IMAGE_DATA_URI_TOTAL_BYTES
+                        if fits:
+                            uri = candidate
+                            raw_bytes += raw_cost
+                            encoded_bytes += encoded_cost
+                        del candidate
                 if not fits:
                     if current:
                         raise ValueError("当前输入图片超过临时图片视图资源预算，请减少或压缩图片")
@@ -163,6 +175,50 @@ async def load_artifacts(
     return cast(Mapping[str, tuple[Mapping[str, Any], ...]], freeze_json(content))
 
 
+# 不可变图片按内容摘要复用请求图：每次模型调用都会重新投影历史图片，工具循环里同一张图
+# 原本每步重编码一次（PNG optimize 单张可达秒级）。上限为单次请求图片预算的两倍。
+_ENCODED_LIMIT = 2 * MAX_IMAGE_DATA_URI_TOTAL_BYTES
+_encoded: OrderedDict[str, str] = OrderedDict()
+_encoded_bytes = 0
+
+
+async def _encoded_image(reader: ArtifactRead, ref: AttachmentRef) -> str:
+    # 1. 命中也照常取得并关闭租约：附件存在与读取授权仍由 owner 判定，只省去读字节与转图。
+    try:
+        lease = await reader.acquire(ref)
+        try:
+            cached = _encoded.get(ref.sha256)
+            if cached is not None:
+                _encoded.move_to_end(ref.sha256)
+                return cached
+            raw = await lease.read_bytes(max_bytes=MAX_IMAGE_FILE_BYTES)
+        finally:
+            await lease.aclose()
+    except (OSError, ValueError) as error:
+        raise ValueError(_ARTIFACT_UNAVAILABLE) from error
+    # 2. 并发首次使用同一图片时各自转图，结果相同；不共享在途任务，取消语义与原来一致。
+    uri, digest = await asyncio.to_thread(_encode_and_digest, raw)
+    del raw
+    _remember(ref.sha256, uri, digest)
+    return uri
+
+
+def _encode_and_digest(raw: bytes) -> tuple[str, str]:
+    return encode_image_bytes(raw), hashlib.sha256(raw).hexdigest()
+
+
+# 3. 只缓存实际字节摘要与引用一致的结果；按总字节淘汰最久未用的条目。
+def _remember(key: str, uri: str, digest: str) -> None:
+    global _encoded_bytes
+    if digest != key or len(uri) > _ENCODED_LIMIT or key in _encoded:
+        return
+    _encoded[key] = uri
+    _encoded_bytes += len(uri)
+    while _encoded_bytes > _ENCODED_LIMIT:
+        _, evicted = _encoded.popitem(last=False)
+        _encoded_bytes -= len(evicted)
+
+
 def render_content(
     part: ContentPart,
     *,
@@ -174,7 +230,7 @@ def render_content(
         return ({"type": "text", "text": part.value},)
     if part.kind == "artifact_ref":
         return artifacts[cast(str, part.value)]
-    if part.kind in {"model.selection", "tool.selection", "context.summary", "context.notice", "history.record", "history.turn_input"}:
+    if part.kind in {"model.selection", "tool.selection", "context.summary", "context.notice", "compaction.boundary", "history.record", "history.turn_input"}:
         return ()
     if part.kind == "reply_ref":
         if read_message is None:

@@ -11,7 +11,6 @@ from agent.plugin_composition import Context, RuntimeScope
 from plugins.ledger.contract import MessageCatalog, MessageReader
 from agent.plugin_composition.model import CompositionError
 from agent.plugin_composition.tasks import RestartGate, Task, TaskServiceClosed
-from plugins.ledger.contract import Control, Input, Output
 from plugins.sources.contract import (
     AsyncSource as Source,
     SourcesV5 as Sources,
@@ -27,6 +26,8 @@ class _Wake:
     source: Source | None = None
     changed: bool = True
     event: asyncio.Event = field(default_factory=asyncio.Event)
+    retry: bool = False
+    failure: tuple[BaseException, int] | None = None
 
 
 @dataclass(slots=True)
@@ -245,12 +246,14 @@ class _Follower:
     def __init__(
         self, ctx: Context, catalog: MessageCatalog,
         sources: Sources, program: Program, restart_gate: RestartGate | None,
+        release_pending: Callable[[MessageReader, str], None] | None = None,
     ) -> None:
         self._ctx = ctx
         self._catalog = catalog
         self._sources = sources
         self._program = program
         self._restart_gate = restart_gate
+        self._release_pending = release_pending
         self._active: dict[tuple[str, str], _Wake] = {}
         self._group: asyncio.TaskGroup | None = None
         self._drive_tasks: set[asyncio.Task[None]] = set()
@@ -273,8 +276,15 @@ class _Follower:
                 self._wake_event.clear()
                 if self._catalog_closed or self._sources_closed:
                     break
-                if self._latest_heads is not None:
-                    self._dispatch_changes(self._latest_heads)
+                heads = self._latest_heads
+                if heads is not None:
+                    # 全量核对（启动或来源身份变化）先固定 heads 再取候选：之后到达的输入
+                    # 必然推进 head，下一轮按增量变化唤醒，不会落在两次读取之间。
+                    candidates = (
+                        await self._catalog.open_input_sources_async()
+                        if self._sources_changed() else None
+                    )
+                    self._dispatch_changes(heads, candidates)
             for task in (catalog_task, source_task, *self._drive_tasks):
                 if not task.done():
                     task.cancel()
@@ -305,7 +315,16 @@ class _Follower:
     def _current_source(self, name: str) -> Source | None:
         return next((item for item in self._sources.entries() if item.name == name), None)
 
-    def _dispatch_changes(self, heads: dict[str, int]) -> None:
+    # 当前注册的来源与上次分派时不同（含启动时的空集），需要全量核对。
+    def _sources_changed(self) -> bool:
+        current = {source.name: source for source in self._sources.entries()}
+        return current.keys() != self._previous_sources.keys() or any(
+            self._previous_sources[name] is not source for name, source in current.items()
+        )
+
+    def _dispatch_changes(
+        self, heads: dict[str, int], candidates: frozenset[tuple[str, str]] | None = None,
+    ) -> None:
         current_sources = {source.name: source for source in self._sources.entries()}
         source_names = set(self._previous_sources) | set(current_sources)
         changed_source_names = {
@@ -323,20 +342,26 @@ class _Follower:
                 wake.source = current_sources.get(source_name)
                 wake.changed = True
 
+        previous_heads = self._previous_heads
         changed_sessions = {
             session_id for session_id, head in heads.items()
-            if self._previous_heads.get(session_id) != head
+            if previous_heads.get(session_id) != head
         }
         self._previous_heads = dict(heads)
         self._previous_sources = current_sources
 
         # 2. One scan handles changed sessions and genuine identity changes.
-        session_ids = (
-            heads
-            if current_identity_changes
-            else (session_id for session_id in heads if session_id in changed_sessions)
-        )
-        for session_id in session_ids:
+        #    With candidates, a full check only visits possibly pending or active pairs;
+        #    sessions without a known previous head are covered by the candidates.
+        checked = None if candidates is None else candidates | self._active.keys()
+        known_changed = {session_id for session_id in changed_sessions if session_id in previous_heads}
+        if checked is not None:
+            session_ids = {session_id for session_id, _ in checked if session_id in heads} | known_changed
+        elif current_identity_changes:
+            session_ids = set(heads)
+        else:
+            session_ids = changed_sessions
+        for session_id in sorted(session_ids):
             reader = self._catalog.reader(session_id)
             present = reader.source_names()
             session_changed = session_id in changed_sessions
@@ -345,7 +370,13 @@ class _Follower:
                 if source_name not in present:
                     continue
                 identity_changed = source_name in current_identity_changes
-                if not session_changed and not identity_changed:
+                if checked is None:
+                    due = session_changed or identity_changed
+                else:
+                    due = session_id in known_changed or (
+                        (session_id, source_name) in checked and (session_changed or identity_changed)
+                    )
+                if not due:
                     continue
                 source_head = reader.head(source=source_name)
                 key = (session_id, source_name)
@@ -377,9 +408,11 @@ class _Follower:
 
     # 每个 Session 独立排空旧工作；并发通知只要求再次读取日志。
     async def _drive(self, session_id: str, source_name: str, wake: _Wake) -> None:
+        retries = 0
         try:
             while wake.changed:
                 wake.changed = False
+                wake.retry = False
                 source = wake.source
                 if source is None:
                     break
@@ -390,10 +423,38 @@ class _Follower:
                         break
                     wake.changed = True
                     continue
-                if not await self._drive_source(session_id, source, wake):
+                try:
+                    again = await self._drive_source(session_id, source, wake)
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as error:
+                    logger.error("回复 lane 失败，等待恢复: session=%s source=%s", session_id, source_name, exc_info=error)
+                    wake.retry = True
+                    again = True
+                if wake.retry:
+                    retries += 1
+                    await self._retry_lane(session_id, source_name, retries)
+                    wake.changed = True
+                elif not again:
                     break
+                else:
+                    retries = 0
         finally:
             self._active.pop((session_id, source_name), None)
+
+    # Release passive delivery holds while a lane waits; other lanes keep running.
+    async def _retry_lane(self, session_id: str, source_name: str, attempt: int) -> None:
+        if self._release_pending is not None:
+            self._release_pending(self._catalog.reader(session_id), source_name)
+        if attempt == 1:
+            scope = await _enter_scope(self._ctx)
+            if scope is not None:
+                try:
+                    _ = self._ctx.report_incident("reply_lane_retry",
+                        f"回复来源暂时不可用，正在恢复: session={session_id} source={source_name}")
+                finally:
+                    await scope.__aexit__(None, None, None)
+        await asyncio.sleep((0.25, 1.0, 5.0, 30.0)[min(attempt - 1, 3)])
 
     # 一次 source drive；返回 False 时结束本 Session lane。
     async def _drive_source(self, session_id: str, source: Source, wake: _Wake) -> bool:
@@ -404,7 +465,7 @@ class _Follower:
         admission_boundary = self._catalog.reader(session_id).head(source=source.name)
         restart_after_cleanup = False
         try:
-            await self._start(state, session_id, source)
+            await self._start(state, session_id, source, wake)
             if state.task is None and not state.stop_drive:
                 restart_after_cleanup = (
                     self._restart_gate is not None and not self._restart_gate.accepting
@@ -419,14 +480,15 @@ class _Follower:
             state.pending_errors.append(error)
         finally:
             await self._release(state, session_id, source)
-        await self._record_failure(state, admission_boundary)
+        await self._record_failure(state, admission_boundary, wake)
         return await self._conclude(state, source, wake, restart_after_cleanup)
 
     # 1. 依次进入 reply 与 source scope，捕获后立即退出，再启动 Source Task。
-    async def _start(self, state: _Iteration, session_id: str, source: Source) -> None:
+    async def _start(self, state: _Iteration, session_id: str, source: Source, wake: _Wake) -> None:
         reply_scope_cm = await _enter_scope(self._ctx)
         if reply_scope_cm is None:
             state.stop_drive = True
+            wake.retry = True
             return
         try:
             state.reply_scope = self._ctx.capture_runtime_scope()
@@ -436,6 +498,7 @@ class _Follower:
         source_scope_cm = await _enter_scope(source.context)
         if source_scope_cm is None:
             state.stop_drive = True
+            wake.retry = True
             return
         try:
             state.source_scope = source.context.capture_runtime_scope()
@@ -443,7 +506,13 @@ class _Follower:
                 state.session = source.open(session_id)
             except TaskServiceClosed:
                 state.stop_drive = True
+                wake.retry = True
                 return
+            # Finish the previous failure before granting another model execution.
+            if wake.failure is not None:
+                error, boundary = wake.failure
+                await state.session.record_failure(error, boundary=boundary)
+                wake.failure = None
             state.add_monitor(state.reply_scope)
             state.add_monitor(state.source_scope)
 
@@ -454,12 +523,13 @@ class _Follower:
                 state.task = await state.session.start(wrapped_program)
             except TaskServiceClosed:
                 state.stop_drive = True
+                wake.retry = True
             if state.task is not None:
                 state.task.on_done(state.task_finished.set)
         finally:
             await source_scope_cm.__aexit__(None, None, None)
 
-    # 2. 等 Task 完成；期间若日志已有终态且出现后续输入，则分离旧 Task。
+    # 2. 等 Task 完成；每次日志变化都复查，已有终态且出现后续输入时分离旧 Task。
     async def _await_task(
         self, state: _Iteration, session_id: str, source: Source,
         wake: _Wake, admission_boundary: int,
@@ -468,18 +538,22 @@ class _Follower:
         joined = asyncio.create_task(state.wait_task())
         notified = asyncio.create_task(wake.event.wait())
         try:
-            done, _ = await asyncio.wait((joined, notified), return_when=asyncio.FIRST_COMPLETED)
-            if joined in done:
-                await joined
-            elif (
-                self._still_current(wake, source)
-                and await self._terminal_committed(session_id, source.name, admission_boundary)
-                and self._still_current(wake, source)
-            ):
-                state.detached = True
-                state.task.cancel()
-            else:
-                await joined
+            while True:
+                done, _ = await asyncio.wait((joined, notified), return_when=asyncio.FIRST_COMPLETED)
+                if joined in done:
+                    await joined
+                    break
+                # 先清事件再读日志：读之后才提交的消息会再次唤醒，不会漏掉。
+                wake.event.clear()
+                notified = asyncio.create_task(wake.event.wait())
+                if (
+                    self._still_current(wake, source)
+                    and await self._terminal_committed(session_id, source.name, admission_boundary)
+                    and self._still_current(wake, source)
+                ):
+                    state.detached = True
+                    state.task.cancel()
+                    break
         finally:
             wake.event.clear()
             for waiter in (joined, notified):
@@ -496,18 +570,14 @@ class _Follower:
         reader = self._catalog.reader(session_id)
 
         def read(reader: MessageReader) -> bool:
-            terminal = False
-
-            def consume(rows) -> bool:
-                nonlocal terminal
-                for message in rows:
-                    if isinstance(message.body, Output) and message.body.finish != "continue" or isinstance(message.body, Control):
-                        terminal = True
-                    if terminal and isinstance(message.body, Input):
-                        return True
+            # 「终态之后有输入」等价于「最新输入之前有终态」；回合内每条提交都会来复查，全走索引不解码日志。
+            latest = reader.latest_input_seq(source_name, through_seq=reader.head())
+            if latest is None or latest <= boundary:
                 return False
-
-            return reader.scan(consume, after_seq=boundary, source=source_name)
+            if reader.latest_finished_output_seq(source_name, after_seq=boundary, through_seq=latest) is not None:
+                return True
+            control = reader.latest_control(source_name, through_seq=latest)
+            return control is not None and control.seq > boundary
 
         return await reader.read_async(read)
 
@@ -537,27 +607,37 @@ class _Follower:
             state.cleanup_errors.append(error)
 
     # 4. 程序失败交给 Source 记录；记录成功即视为本 lane 已持久结算。
-    async def _record_failure(self, state: _Iteration, admission_boundary: int) -> None:
-        failure = next((error for error in state.pending_errors if isinstance(error, Exception)), None)
-        if failure is None and isinstance(state.task_error, Exception):
-            failure = state.task_error
+    async def _record_failure(self, state: _Iteration, admission_boundary: int, wake: _Wake) -> None:
+        errors = [*state.pending_errors, *state.monitor_errors, *state.cleanup_errors]
+        if state.task_error is not None:
+            errors.append(state.task_error)
+        failure = None
+        for error in errors:
+            if not isinstance(error, asyncio.CancelledError):
+                failure = error
+                break
+        if wake.failure is not None:
+            failure, admission_boundary = wake.failure
         if failure is None:
-            return
-        if state.session is None:
-            logger.warning("来源打开失败，封闭当前回复 lane", exc_info=failure)
-            state.pending_errors.clear()
-            state.stop_drive = True
             return
         boundary = state.task.boundary_hint if state.task is not None else admission_boundary
         if not isinstance(boundary, int):
             boundary = admission_boundary
+        wake.failure = (failure, boundary)
+        if state.session is None:
+            logger.warning("来源打开失败，等待重开后记录 failure", exc_info=failure)
+            state.pending_errors.clear()
+            state.stop_drive = True
+            wake.retry = True
+            return
         try:
             await state.session.record_failure(failure, boundary=boundary)
         except Exception as error:
             state.pending_errors = [RuntimeError(f"回复驱动没有持久进展 (no progress): {error}")]
         else:
+            wake.failure = None
             state.pending_errors.clear()
-            state.stop_drive = True
+            wake.changed = True
 
     # 5. 决定 lane 是否继续：抛出 follower 失败，或按停止/重启门决定下一轮。
     async def _conclude(
@@ -570,6 +650,12 @@ class _Follower:
             state.stop_drive = True
             return False
         errors = [*follower_errors, *state.source_settlement_errors]
+        if state.caller_cancellations or state.coalesced_caller_cancel:
+            cancelled = state.caller_cancellations[0] if state.caller_cancellations else asyncio.CancelledError()
+            others = [error for error in errors if error is not cancelled]
+            if others:
+                raise cancelled from BaseExceptionGroup("回复取消时的结算结果", others)
+            raise cancelled
         if errors:
             if len(errors) == 1:
                 raise errors[0]
@@ -586,6 +672,7 @@ class _Follower:
 async def follow(
     ctx: Context, catalog: MessageCatalog,
     sources: Sources, program: Program, restart_gate: RestartGate | None = None,
+    *, release_pending: Callable[[MessageReader, str], None] | None = None,
 ) -> None:
     """从日志追赶可回复来源；空闲不保留 scope，不保存 cursor 或回复队列。"""
-    await _Follower(ctx, catalog, sources, program, restart_gate).run()
+    await _Follower(ctx, catalog, sources, program, restart_gate, release_pending).run()

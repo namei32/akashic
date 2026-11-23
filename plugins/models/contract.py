@@ -5,24 +5,29 @@ import asyncio
 import base64
 import io
 import json
+import math
+import re
 import socket
 import ssl
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from core.net.http import retry_after_time
 from plugins.ledger.contract import detect_supported_image_mime
-from core.common.frozen_json import freeze_json
+from core.common.file_io import shield_until_done
+from core.common.frozen_json import freeze_json, frozen_memo
 from dataclasses import (
     asdict,
     field,
     replace,
     dataclass,
 )
-from datetime import datetime
 from types import MappingProxyType
 from collections.abc import (
     AsyncGenerator,
     Awaitable,
     Callable,
+    Iterable,
     Mapping,
     MutableMapping,
     Sequence,
@@ -35,10 +40,12 @@ from typing import (
     cast,
     AsyncContextManager,
     Literal,
+    NamedTuple,
     TypeAlias,
     Any,
     Protocol,
 )
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from plugins.ledger.contract import Bindings
 from agent.plugin_composition import (
     Context,
@@ -50,7 +57,10 @@ from agent.plugin_composition.model import ServiceKey
 from plugins.ledger.contract import (
     ContentPart,
     ContentReferences,
+    Control,
+    Input,
     Message,
+    Output,
     ToolCall as MessageToolCall,
 )
 
@@ -74,10 +84,10 @@ class ModelUsage:
 class ToolCall:
     id: str
     name: str
-    arguments: Mapping[str, Any]
+    arguments: Mapping[str, Any] | str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "arguments", cast(Mapping[str, Any], freeze_json(self.arguments)))
+        object.__setattr__(self, "arguments", cast(Mapping[str, Any] | str, freeze_json(self.arguments)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +110,10 @@ class LLMResponse:
     continuation: ModelContinuation | None = None
     usage: ModelUsage | None = None
     call_record_id: str | None = None
-    # 原生响应部件由调用账本保存，随同一 binding 的消息重放。
+    # 原生响应部件由调用账本保存，随同一模型的消息重放。
     provider_metadata: Mapping[str, Any] | None = None
+    # 长度截断时驱动丢弃了不完整的输出（工具片段等）；没有 usage 时它是区分真 0 输出的唯一证据。
+    output_discarded: bool = False
 
     def __post_init__(self) -> None:
         """冻结一次响应，多个请求等待者不能相互改变已结算事实。"""
@@ -113,6 +125,13 @@ class LLMResponse:
 
 
 StreamCallback: TypeAlias = Callable[[dict[str, str]], Awaitable[None]]
+
+
+# 流式正文落账前的统一整理：行首空白留给 ReAct 判断（续写段要保留）；
+# 被长度截断的段连行尾一起保留，断点可能正落在换行或空格上。
+def stream_text(raw: str, finish_reason: str | None) -> str | None:
+    text = raw if finish_reason == "length" else raw.rstrip()
+    return text if text.strip() else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +170,20 @@ class ModelAttemptStatus:
                    None if next_at is None else float(next_at))
 
 
+# 上下文构成的六类；injected 是装配时插入的材料（记忆、环境、提醒、历史摘要）。
+ContextCategory = Literal["system", "tools", "user", "assistant", "tool_results", "injected"]
+
+
+@dataclass(frozen=True, slots=True)
+class RequestSource:
+    """请求里一段内容的出处：类别、来源名（插件材料、工具名等），以及它占的行或工具定义。"""
+
+    category: ContextCategory
+    label: str
+    rows: tuple[Mapping[str, Any], ...] = ()
+    tools: tuple[Mapping[str, Any], ...] = ()
+
+
 @dataclass(frozen=True, slots=True)
 class ModelRequest:
     messages: Sequence[Mapping[str, Any]]
@@ -163,11 +196,18 @@ class ModelRequest:
     continuation: ModelContinuation | None = None
     disable_reasoning: bool = False
     request_key: str | None = None
+    # Long provider backoff ends this request; None keeps visible, cancellable waiting.
+    max_retry_wait: float | None = None
+    # Ends a provider backoff early so the caller can take its next step; never sent or digested.
+    retry_wake: asyncio.Event | None = None
+    # A caller may lower the connection budget when continuing the same model step.
+    max_attempts: int | None = None
+    reduce_on_empty: bool = False
     # 本次完整展示、尚无成功展示回执的消息内容位置；不发送给 provider。
     content_refs: tuple[tuple[str, int], ...] = ()
     content_transformed: bool = False
-    # 本地历史降级标记，用于回复诊断，不发送给 provider。
-    history_recovery: bool = False
+    # 装配方给出的逐来源拆分，只用于上下文构成统计，不发送给 provider。
+    sources: tuple[RequestSource, ...] = ()
 
     @staticmethod
     def read_content_refs(value: object) -> tuple[tuple[str, int], ...]:
@@ -197,11 +237,18 @@ class ModelRequest:
                 self.tools if isinstance(self.tools, (list, tuple)) else tuple(self.tools)
             ))
         )
+        if self.max_retry_wait is not None and (
+            isinstance(self.max_retry_wait, bool) or not isinstance(self.max_retry_wait, (int, float))
+            or not math.isfinite(self.max_retry_wait) or self.max_retry_wait <= 0
+        ):
+            raise ValueError("max_retry_wait must be a finite positive number or None")
+        if self.max_attempts is not None and (type(self.max_attempts) is not int or self.max_attempts < 1):
+            raise ValueError("max_attempts must be a positive integer or None")
+        if type(self.reduce_on_empty) is not bool:
+            raise ValueError("reduce_on_empty must be bool")
         object.__setattr__(self, "content_refs", self.read_content_refs(self.content_refs))
         if type(self.content_transformed) is not bool:
             raise ValueError("内容投影标记必须是 bool")
-        if type(self.history_recovery) is not bool:
-            raise ValueError("历史恢复标记必须是 bool")
         if isinstance(self.tool_choice, Mapping):
             object.__setattr__(
                 self, "tool_choice", cast(Mapping[str, Any], freeze_json(self.tool_choice))
@@ -218,6 +265,8 @@ ModelKind: TypeAlias = Literal["chat", "embedding"]
 
 
 ModelAvailability: TypeAlias = Literal["available", "disabled", "driver_unavailable"]
+# 连接用哪些模型：all = 服务商目录里的对话模型全部启用（含以后新上的），picked = 只用勾选的。
+CatalogMode: TypeAlias = Literal["picked", "all"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +374,10 @@ class ConnectionDescriptor:
     driver_id: str
     auth_identity: str
     availability: ModelAvailability
+    # 主机名供连接列表展示，endpoint 供编辑表单回显上次保存的 Base URL；凭据不进目录。
+    endpoint_host: str = ""
+    catalog_mode: CatalogMode = "picked"
+    endpoint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +413,65 @@ class DiscoveredModel:
 class ChatModelSelection:
     model_id: str | None = None
     reasoning_effort: str | None = None
+
+
+ModelFollow: TypeAlias = Literal["default", "session"]
+ModelNeed: TypeAlias = Literal["image", "context_window"]
+MODEL_NEED_LABELS: Mapping[ModelNeed, str] = {"image": "接收图片", "context_window": "已确认的上下文窗口"}
+
+
+class ModelChoice(BaseModel):
+    """插件配置里的一处模型选择：跟随默认模型、跟随当前对话，或指定一个已注册模型。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    follow: ModelFollow | None = None
+    model_id: str | None = Field(default=None, min_length=1)
+    reasoning_effort: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _one_source(self) -> "ModelChoice":
+        if (self.follow is None) == (self.model_id is None):
+            raise ValueError("模型选择必须是跟随或指定模型之一")
+        if self.reasoning_effort is not None and self.model_id is None:
+            raise ValueError("推理强度只能配合指定模型")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class ModelUse:
+    """插件声明的一个模型用途：use_id 记进调用出处，label 用于提示，follows 是允许的跟随方式，needs 是模型必须具备的能力。"""
+
+    use_id: str
+    label: str
+    follows: tuple[ModelFollow, ...] = ("default",)
+    needs: frozenset[ModelNeed] = frozenset()
+
+    # 配置校验：只允许本用途声明过的跟随方式。
+    def check(self, choice: ModelChoice) -> ModelChoice:
+        if choice.follow is not None and choice.follow not in self.follows:
+            raise ValueError(f"「{self.label}」不支持{'跟随当前对话' if choice.follow == 'session' else '跟随默认模型'}")
+        return choice
+
+    # 能力门槛：看图要求 image 输入，压缩要求已确认的上下文窗口。
+    def accepts(self, capabilities: ModelCapabilities) -> bool:
+        if "image" in self.needs and "image" not in capabilities.input_modalities:
+            return False
+        return not ("context_window" in self.needs and capabilities.context_window is None)
+
+    # 设置页的候选：允许的跟随方式、默认模型与满足能力门槛的可用聊天模型。
+    def options(self, snapshot: "ModelCatalogSnapshot") -> dict[str, object]:
+        names = {item.connection_id: item.name for item in snapshot.connections}
+        models = [
+            {"id": item.model_id, "model": item.model, "connection": names.get(item.connection_id, ""),
+             "efforts": list(item.capabilities.supported_reasoning_efforts)}
+            for item in snapshot.models
+            if item.kind == "chat" and item.availability == "available" and self.accepts(item.capabilities)
+        ]
+        default_id = snapshot.role_bindings.get("default")
+        default = next((item for item in snapshot.models if item.model_id == default_id), None)
+        return {"follows": list(self.follows), "models": models,
+                "default_model": None if default is None else default.model,
+                "default_fits": default is not None and self.accepts(default.capabilities)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,17 +550,8 @@ class DriverConnection:
         """等待资源关闭完成，再向调用方传回取消。"""
         if self.close is not None:
             # 1. 独立任务保护关闭过程，避免重复取消截断底层资源释放。
-            task = asyncio.ensure_future(self.close())
-            cancelled = False
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    cancelled = True
             # 2. 关闭失败必须可见；关闭成功后恢复调用方的取消。
-            task.result()
-            if cancelled:
-                raise asyncio.CancelledError
+            _ = await shield_until_done(asyncio.ensure_future(self.close()))
 
 
 ContentRenderer = Callable[[ContentPart], Sequence[Mapping[str, Any]]]
@@ -468,7 +571,13 @@ class RenderedContent:
 ContentTransform = Callable[[Message, int], RenderedContent | None]
 
 
-PrepareContent = Callable[[tuple[Message, ...], str, frozenset[str], frozenset[tuple[str, int]]], ContentTransform]
+ReadMessage = Callable[[str], Message | None]
+# 贡献者签名：read_message 取当前快照之外的同会话消息（窗口读面省略了摘要覆盖的前缀）。
+PrepareContent = Callable[
+    [tuple[Message, ...], str, frozenset[str], frozenset[tuple[str, int]], ReadMessage], ContentTransform,
+]
+# 投影收到的版本：调用方已绑定本会话的读取口。
+BoundPrepareContent = Callable[[tuple[Message, ...], str, frozenset[str], frozenset[tuple[str, int]]], ContentTransform]
 
 
 class ContentViews(Protocol):
@@ -495,13 +604,16 @@ class ContextModel(Protocol):
         messages: Sequence[Message],
         *,
         after_seq: int,
+        covered_message_ids: frozenset[str] = frozenset(),
         summary_reference: str | None = None,
         fresh: bool = False,
         current_reminder: str | None = None,
         current_reminder_input_id: str | None = None,
         current_context: str | None = None,
     ) -> ModelRequest:
-        """接收完整事实；after_seq 是摘要覆盖末尾，-1 表示没有覆盖。
+        """接收完整事实；after_seq 是首次窗口起点之前的 seq，-1 表示不裁切前缀。
+
+        covered_message_ids 是摘要精确覆盖；未列出的旧消息仍保留。
 
         实现方接受任意 Sequence，包括存储签发的 MessageSnapshot；不得修改输入。
 
@@ -574,7 +686,7 @@ class ModelProjections(Protocol):
         read_call: CallReader,
         check_summary: Callable[[ContentPart], ContentReferences],
         keep_input_ids: tuple[str, ...] = (),
-        prepare_content: PrepareContent | None = None,
+        prepare_content: BoundPrepareContent | None = None,
         tool_names: frozenset[str] = frozenset(),
         dynamic_content_kinds: frozenset[str] | None = frozenset(),
     ) -> MessageProjection: ...
@@ -610,36 +722,30 @@ class ModelCallStats:
 MODEL_CALL_STATS = ServiceKey[Callable[[str], ModelCallStats]]("models.call-stats.v1")
 
 
-@dataclass(frozen=True, slots=True)
-class ModelUsageQuery:
-    """UTC 时间窗口内的调用统计；cursor 仅用于明细翻页。"""
-
-    start: datetime
-    end: datetime
-    model: str | None = None
-    cursor: str | None = None
-
-
-class ModelUsageReports(Protocol):
-    async def report(self, query: ModelUsageQuery) -> dict[str, object]:
-        """返回字段级覆盖、聚合和最多 50 条明细；不含正文、凭据或失败原文。"""
-        ...
-
-
-MODEL_USAGE_REPORTS = ServiceKey[ModelUsageReports]("models.usage-reports.v1")
-
-
 class CacheUsageRead(Protocol):
-    """按需计算的 KV Cache 用量；数据来自调用账与消息 Turn，不另存投影。"""
+    """按需计算的 Token 与 KV Cache 用量；数据来自调用账与消息 Turn，不另存投影。"""
 
-    async def overview(self) -> dict[str, object]:
-        """按需推进扫描；complete=false 只返回进度，完成后才返回完整统计。"""
+    async def insights(
+        self, since: str | None, limit: int, order: Literal["input", "context", "recent"],
+    ) -> dict[str, object]:
+        """按需推进扫描；complete=false 只返回进度，完成后给小时桶、来源、模型与会话排行。"""
         ...
 
     async def message_output_tokens(self, session_id: str, message_id: str) -> int | None: ...
 
 
 MODEL_CACHE_USAGE = ServiceKey[CacheUsageRead]("models.cache-usage.v1")
+
+
+class UsageSources(Protocol):
+    """来源插件自己声明用量口径；Core 与用量面板不点名任何插件。"""
+
+    async def declare_proactive(self, ctx: Context, source: str) -> Effect:
+        """声明该 lane 的回合是主动联系：不计入被动回答的输出尾注，面板单列。插件卸载时声明随之撤销。"""
+        ...
+
+
+USAGE_SOURCES = ServiceKey[UsageSources]("models.usage-sources.v1")
 
 
 class BoundChatModel(Protocol):
@@ -680,7 +786,11 @@ class BoundChatModel(Protocol):
 
 
 class ModelExecution(Protocol):
-    def chat(self, role: str) -> BoundChatModel: ...
+    # 本次执行的主模型：显式会话选择，否则是默认模型。
+    def chat(self) -> BoundChatModel: ...
+
+    # 按插件配置在同一冻结目录里取模型；指定模型不可用或能力不足时回到默认模型。
+    async def use(self, use: ModelUse, choice: ModelChoice) -> BoundChatModel: ...
 
 
 class ChatModels(Protocol):
@@ -700,6 +810,12 @@ class ChatModels(Protocol):
         """Open a model execution without a parent task's model binding."""
 
         ...
+
+    # 把插件配置解析成交给另一回合的显式选择：session 是调用方从所属对话读到的选择（MODEL_SELECTION），
+    # 跟随对话时沿用它；跟随默认或回到默认时给空选择。
+    async def resolve(
+        self, use: ModelUse, choice: ModelChoice, session: ChatModelSelection = ChatModelSelection(),
+    ) -> ChatModelSelection: ...
 
 
 class ModelCatalog(Protocol):
@@ -736,6 +852,51 @@ DriverAuthHandler: TypeAlias = Callable[
 
 
 @dataclass(frozen=True, slots=True)
+class QuotaWindow:
+    """订阅的一个用量窗口；used_percent 是服务商给出的已用比例（0–100）。"""
+
+    label: str
+    used_percent: float
+    # ISO-8601（UTC）；服务商没给或窗口未开始计时为 None。
+    resets_at: str | None = None
+    window_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class QuotaReading:
+    """一次额度读取的事实；不含凭据。没有的项留空，界面不显示。"""
+
+    plan: str = ""
+    account: str = ""
+    windows: tuple[QuotaWindow, ...] = ()
+    # 已带币种的余额文本，例如 "¥23.40"；服务商只给比例时为空。
+    balance: str = ""
+    note: str = ""
+
+
+# 返回 None 表示这个连接没有额度可读：同一驱动接多家服务时，只有部分服务有套餐。
+DriverQuota: TypeAlias = Callable[
+    [DriverConnectionDescriptor, CredentialHandle],
+    Awaitable[QuotaReading | None],
+]
+
+
+# 窗口按时长命名，各驱动共用同一套叫法。
+def quota_window_label(seconds: int | None) -> str:
+    if not seconds or seconds <= 0:
+        return "额度"
+    if seconds % 604800 == 0:
+        weeks = seconds // 604800
+        return "每周" if weeks == 1 else f"{weeks} 周"
+    if seconds % 86400 == 0:
+        days = seconds // 86400
+        return "每天" if days == 1 else "每月" if days in (30, 31) else f"{days} 天"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} 小时"
+    return f"{max(1, seconds // 60)} 分钟"
+
+
+@dataclass(frozen=True, slots=True)
 class ModelDriverDefinition:
     driver_id: str
     contract_version: str
@@ -746,6 +907,10 @@ class ModelDriverDefinition:
     start_auth: DriverAuthHandler | None = None
     finish_auth: DriverAuthHandler | None = None
     cancel_auth: DriverAuthHandler | None = None
+    # 连接的品牌图标（SVG 文本，≤16 KiB）；聊天里的模型选择按连接分组时显示。
+    icon: Callable[[DriverConnectionDescriptor], str | None] | None = None
+    # 订阅窗口或余额；没有公开接口的服务不提供，设置页就不显示额度。
+    read_quota: DriverQuota | None = None
 
 
 class ModelDrivers(Protocol):
@@ -848,6 +1013,9 @@ class ModelError:
     response_delta_seen: bool = False
     retry_safe: bool = False
     retry_after: float | None = None
+    # 上游明确拒绝时的 HTTP 状态和未叠加宿主说明的文本；只用于判断拒绝是否与内容有关。
+    http_status: int | None = None
+    upstream_text: str | None = None
 
     def __str__(self) -> str:
         return self.message
@@ -908,6 +1076,13 @@ class ModelTimeoutError(ModelError):
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationTimeoutError(ModelTimeoutError):
+    """One generation reached its total deadline and must not be sent again under this key."""
+
+    retryable: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class TransportError(ModelError):
     retryable: bool = True
 
@@ -917,6 +1092,20 @@ class EmptyResponseError(ModelError):
     """模型调用成功，但没有可提交的正文或工具调用。"""
 
     retryable: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class InputReductionRequired(ModelError):
+    """This key ended for an optional input reduction; only unused attempts may follow."""
+
+    remaining_attempts: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RetryWaitInterrupted(ModelError):
+    """The caller woke this key out of its backoff; only unused attempts may follow."""
+
+    remaining_attempts: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -948,6 +1137,11 @@ LOW_DETAIL_IMAGE_TOKENS = 1024
 
 def message_size(message: Mapping[str, Any]) -> tuple[int, int]:
     """统计一条消息的字符与图片成本；调用方按各自字符比取整，保持容量边界。"""
+    # 渲染视图跨轮复用冻结行；长会话每次请求都要测量全部历史行，只算一次。
+    return frozen_memo(message, "models.message_size", lambda: _measure_message(message))
+
+
+def _measure_message(message: Mapping[str, Any]) -> tuple[int, int]:
     text_chars = image_tokens = 0
     content: object = message.get("content")
     if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
@@ -1076,7 +1270,10 @@ def encode_image_bytes(raw: bytes) -> str:
                 if compressed_b64_len <= MAX_IMAGE_DATA_URI_BYTES:
                     candidate_b64 = base64.b64encode(candidate_bytes).decode()
                     return f"data:image/jpeg;base64,{candidate_b64}"
-    except (OSError, Image.DecompressionBombError) as exc:
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 这里只解析内存里的不可信字节：Pillow 对损坏文件还会抛 SyntaxError 等，都是"解不开"。
         raise ValueError("图片文件无法解码或已损坏。请确认这是有效图片。") from exc
 
     raise ValueError(
@@ -1139,3 +1336,785 @@ def describe_transport_error(error: Exception) -> str:
             details.append(f"{type(cause).__name__}: {cause.strerror}")
         cause = cause.__cause__ or cause.__context__
     return f"{reason}（{'；'.join(dict.fromkeys(details))}）"
+
+
+# 插件设置页的状态补充：各模型字段的候选，取自 models 当前目录；字段名对应插件配置里的 ModelChoice。
+def model_options(ctx: Context, uses: Mapping[str, ModelUse]) -> Callable[[], Awaitable[Mapping[str, object]]]:
+    async def read() -> Mapping[str, object]:
+        snapshot = ctx.require(MODEL_CATALOG).snapshot()
+        return {"model_options": {name: use.options(snapshot) for name, use in uses.items()}}
+    return read
+
+
+# ---- 模型驱动插件共用的连接 UI 登记、凭据作用域校验、基础校验与 OpenAI Chat Completions 协议辅助 ----
+
+CONNECTION_TYPES_SLOT = {
+    "models.connection-types.v1": "8c304d85090a65a4a66cd777a5c2a88e6908de147964dc91e7f84336979ea561",
+}
+
+# 文案对照 pi-mono packages/ai/src/utils/overflow.ts；Copilot 一条收窄到 token count，避免命中无关的 "exceeds the limit"。
+_CONTEXT_ERROR = re.compile("|".join((
+    r"context[_ ]length[_ ]exceeded",
+    r"context_window_exceeded",
+    r"maximum context length",
+    r"context window exceeds limit",
+    r"exceeds the context window",
+    r"exceeds the available context size",
+    r"greater than the context length",
+    r"longer than the model'?s context length",
+    r"but the configured context size is",
+    r"input length and .*exceed context limit",
+    r"range of input length",
+    r"exceeds (?:the )?maximum allowed input length",
+    r"reduce the length",
+    r"too many tokens",
+    r"token limit exceeded",
+    r"exceeded model token limit",
+    r"token count of [\d,]+ exceeds the limit of",
+    r"input token count.*exceeds the maximum",
+    r"prompt (?:is )?too long",
+    r"prompt\s*超长",
+    r"prompt exceeds max length",
+    r"maximum prompt length is \d",
+    r"input is too long",
+    r"request_too_large",
+)), re.IGNORECASE)
+# 这些标记本身带引号或嵌在 JSON 文本里，对原文匹配。
+# OpenAI 的 string too long 带字段名：只有 messages/input 才是输入过长，tools[...] 的描述过长压缩帮不上忙。
+_OVERFLOW_MARKER = re.compile(
+    r"context_length_exceeded|context_window_exceeded|request_too_large"
+    r"|(?<![\w.\]])(?:messages|input)\b(?:(?!tools\[)[^:])*: string too long",
+    re.IGNORECASE,
+)
+# 对照 overflow.ts NON_OVERFLOW_PATTERNS；"too many tokens"、"token limit exceeded" 也可能是限流。
+_RATE_LIMIT_ERROR = re.compile(
+    r"rate[ _-]?limit|too many requests|throttl|tokens? per (?:minute|hour|day)|\btpm\b",
+    re.IGNORECASE,
+)
+# 弱 code 之下仍可信的额度文案；"billing" 这类泛词要有非弱 code 或 402/429 才算。
+_BALANCE_ERROR = re.compile(
+    r"credit balance|insufficient[ _](?:balance|credit|funds|quota)|exceeded your current quota|余额不足|账户已欠费|套餐已到期|套餐已失效",
+    re.IGNORECASE,
+)
+# 代理会把上游原话整段加引号再转发；带具体数字的形式是上游的判断，对原文匹配。
+_OVERFLOW_EVIDENCE = re.compile(r"maximum context length(?: is| of)? ?\(?[\d,]+|[\d,]+ tokens? > [\d,]+", re.IGNORECASE)
+# 字段校验错误引号里是回显的取值，同样的数字也不算证据。
+_FIELD_ECHO = re.compile(r"\binvalid(?: (?:value|param|parameter|field)\b|\s*:)", re.IGNORECASE)
+# 代理常把上游错误包成字符串，先取出里面的 message，否则下面的去引号会把正文一起去掉。
+_EMBEDDED_MESSAGE = re.compile(r"""["']message["']\s*:\s*(["'])((?:\\.|(?!\1).)*)""", re.DOTALL)
+# 引号内是回显的用户内容或字段值，不是上游的判断；"model's" 这样的撇号不算开引号。
+_QUOTED_ECHO = re.compile(r"""(?<!\w)'.*?(?:'(?!\w)|$)|(?<!\w)".*?(?:"(?!\w)|$)|`.*?(?:`|$)""", re.DOTALL)
+# GLM 码见 https://docs.bigmodel.cn/cn/api/api-code；MiniMax 1008 见 platform.minimax.io/docs/api-reference/errorcode。
+_QUOTA_CODES = frozenset({
+    "402", "1008", "1113", "1308", "1309", "1310", "1314", "1316", "1317", "1318", "1319", "1320", "1321",
+    "insufficient_quota", "insufficient_balance", "arrearage",
+})
+# MiniMax 1002、1039 的官方处置都是稍后重试。
+_RATE_LIMIT_CODES = frozenset({"429", "rate_limit_exceeded", "rate_limit_error", "slow_down", "1002", "1039"})
+# 只说明请求有问题的 code，具体原因仍看 message。
+_WEAK_CODES = frozenset({"400", "404", "422", "invalid_request_error", "invalid_request", "invalid_argument", "string_above_max_length"})
+_SAFETY_ERROR_CODES = (
+    "content_filter",
+    "content_policy_violation",
+    "data_inspection_failed",
+    "bio_policy",
+    "cyber_policy",
+    "policy_violation",
+    "safety",
+    "moderation",
+)
+
+
+async def register_connection_type_ui(ctx: Context, *, web: str = "web_module.js") -> None:
+    """为模型驱动插件在可选 UI 子分支上登记连接类型前端模块。"""
+    from plugins.ui.contract import UI
+
+    async def _register(child: Context) -> None:
+        await child.require(UI).register(
+            child,
+            web=web,
+            requires=("models.connection-types.v1",),
+            provides=(),
+            contract_digests=CONNECTION_TYPES_SLOT,
+        )
+
+    _ = await ctx.inject((UI,), _register, name="ui")
+
+
+def check_credential_scope(
+    descriptor: DriverConnectionDescriptor,
+    credential: CredentialHandle,
+) -> None:
+    if credential.connection_id != descriptor.connection_id:
+        raise AuthenticationError("credential connection scope does not match").exception()
+    if credential.auth_identity != descriptor.auth_identity:
+        raise AuthenticationError("credential auth identity does not match").exception()
+
+
+def check_bound_model(
+    descriptor: DriverConnectionDescriptor,
+    connection_id: str,
+    driver_id: str,
+) -> None:
+    if connection_id != descriptor.connection_id or driver_id != descriptor.driver_id:
+        raise ValueError("bound model does not belong to this driver connection")
+
+
+def credential_bearer_token(payload: Mapping[str, str]) -> str:
+    token = payload.get("access_token") or payload.get("api_key") or payload.get("token")
+    if not token or not token.strip():
+        raise AuthenticationError("credential does not contain an API token").exception()
+    return token.strip()
+
+
+def normalize_http_base_url(
+    value: str,
+    *,
+    strip_suffixes: tuple[str, ...] = ("/chat/completions", "/completions", "/embeddings", "/models"),
+) -> str:
+    text = value.strip()
+    parsed = urlsplit(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("endpoint must be an absolute HTTP(S) URL")
+    if parsed.username or parsed.password:
+        raise ValueError("endpoint must not contain credentials")
+    if parsed.query:
+        raise ValueError("endpoint must not contain a query")
+    if parsed.fragment:
+        raise ValueError("endpoint must not contain a fragment")
+    path = parsed.path.rstrip("/")
+    for suffix in strip_suffixes:
+        if path.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            break
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def positive_float_config(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return float(value)
+
+
+def optional_non_negative_int(value: object, error_message: str = "token count must be a non-negative integer") -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise TransportError(error_message).exception()
+    return value
+
+
+def required_non_empty_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise TransportError(f"{label} must be a non-empty string").exception()
+    return value
+
+
+def response_json_object(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise TransportError("provider response is not valid JSON").exception() from error
+    if not isinstance(payload, dict):
+        raise TransportError("provider response must be a JSON object").exception()
+    return cast(dict[str, Any], payload)
+
+
+def mark_unsent_error(error: Exception) -> Exception:
+    """发送前本地校验失败：请求可证明未到达 provider，标记为允许重试的证据。"""
+    return ModelError.change(error, send_evidence="unsent")
+
+
+class StreamReadError(RuntimeError):
+    def __init__(self, error: Exception, *, response_delta_seen: bool) -> None:
+        super().__init__(str(error))
+        self.error = error
+        self.response_delta_seen = response_delta_seen
+
+
+class StreamCallbackError(RuntimeError):
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def redact_secret_text(message: str, secret: str) -> str:
+    if secret:
+        return message.replace(secret, "[REDACTED]")
+    return message
+
+
+class _ProviderError(NamedTuple):
+    code: str
+    # 展示用，含 code 前缀且已脱敏。
+    detail: str
+    kind: type[ModelError] | None
+    # 分类用，只有上游自己写的 message。
+    text: str
+
+
+# Keep provider diagnostics bounded while retaining the machine-readable code.
+def _provider_error_details(error: object, secret: str = "") -> _ProviderError:
+    if not isinstance(error, Mapping):
+        detail = redact_secret_text(error if isinstance(error, str) else "", secret)[:500]
+        return _ProviderError("", detail or "unknown provider error", None, detail)
+    raw = cast(Mapping[str, object], error)
+    kind = None
+    metadata = raw.get("metadata")
+    error_type = cast(Mapping[str, object], metadata).get("error_type") if isinstance(metadata, Mapping) else None
+    if isinstance(error_type, str) and error_type:
+        kind = _PROVIDER_ERROR_TYPES.get(error_type.lower(), ModelError)
+    # 上游可能同时给 code 和 type，取能定性的那个。
+    codes = [str(value) for value in (raw.get("code"), raw.get("reason"), raw.get("type")) if value]
+    code = next((value for value in codes if _strong_code(value.lower())), codes[0] if codes else "")
+    message = raw.get("message")
+    detail = ": ".join(value for value in (code, error_type, message) if isinstance(value, str) and value)
+    text = redact_secret_text(message, secret)[:500] if isinstance(message, str) else ""
+    return _ProviderError(code.lower(), redact_secret_text(detail or "unknown provider error", secret)[:500], kind, text)
+
+
+def response_error_details(response: httpx.Response, secret: str) -> tuple[str, str]:
+    details = _response_error_details(response, secret)
+    return details.code, details.detail
+
+
+# Parse the HTTP error once and retain its structured classification.
+def _response_error_details(response: httpx.Response, secret: str) -> _ProviderError:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        text = redact_secret_text(response.text, secret)[:500]
+        return _ProviderError("", text or f"HTTP {response.status_code}", None, text)
+    raw = payload.get("error", payload.get("detail", payload)) if isinstance(payload, Mapping) else payload
+    return _provider_error_details(raw, secret)
+
+
+def response_error_message(response: httpx.Response, *, secret: str = "") -> str:
+    return response_error_details(response, secret)[1]
+
+
+def is_quota_error(code: str, message: str) -> bool:
+    return code in _QUOTA_CODES or any(
+        marker in message.lower() for marker in (
+            "quota", "billing", "usage limit", "credit", "usage_not_included",
+            "使用上限", "余额不足", "账户已欠费", "套餐已到期", "套餐已失效",
+        )
+    )
+
+
+# 去掉回显后的上游原话；词表只看这部分，回显里的 rate limit、credit 不是判断依据。
+def _own_words(text: str) -> str:
+    embedded = _EMBEDDED_MESSAGE.search(text)
+    return _QUOTED_ECHO.sub(" ", embedded.group(2) if embedded else text)
+
+
+def _is_context_overflow(code: str, text: str, own: str) -> bool:
+    return (
+        (
+            _CONTEXT_ERROR.search(own) is not None
+            or _OVERFLOW_MARKER.search(text) is not None
+            or (_OVERFLOW_EVIDENCE.search(text) is not None and _FIELD_ECHO.search(own) is None)
+        )
+        and _RATE_LIMIT_ERROR.search(own) is None
+        and not is_quota_error(code, own)
+    )
+
+
+def _strong_code(code: str) -> bool:
+    return code in _ERROR_CODE_KINDS or code in _RATE_LIMIT_CODES or code in _QUOTA_CODES
+
+
+# HTTP 与流内错误共用的分类顺序：显式 code，额度，限流，超窗，安全策略；都不命中返回 None。
+def _classify_error(code: str, text: str, *, weak: bool) -> type[ModelError] | None:
+    own = _own_words(text)
+    # 1. 显式 code 优先；限流码下仍要区分真实额度（#1914 不重试）。
+    if code in _RATE_LIMIT_CODES:
+        return QuotaError if is_quota_error(code, own) else RateLimitError
+    if code in _QUOTA_CODES:
+        return QuotaError
+    if code in _ERROR_CODE_KINDS:
+        return _ERROR_CODE_KINDS[code]
+    # 2. 弱 code 或 4xx 之下，泛词 billing、credit 可能只是回显，只认明确的余额文案。
+    if _BALANCE_ERROR.search(own) is not None:
+        return QuotaError
+    if not (weak or code in _WEAK_CODES) and is_quota_error(code, own):
+        return QuotaError
+    # 3. 限流文案先于超窗词表："too many tokens" 也可能是限流。
+    if _RATE_LIMIT_ERROR.search(own) is not None:
+        return RateLimitError
+    if _is_context_overflow(code, text, own):
+        return ContextLengthError
+    if any(marker in own.lower() for marker in _SAFETY_ERROR_CODES):
+        return ContentSafetyError
+    return None
+
+
+# OpenRouter's typed code owns classification; unknown types fail without guessing.
+_PROVIDER_ERROR_TYPES: Mapping[str, type[ModelError]] = {
+    "context_length_exceeded": ContextLengthError,
+    "max_tokens_exceeded": OutputLengthError,
+    "token_limit_exceeded": QuotaError,
+    "string_too_long": InvalidRequestError,
+    "authentication": AuthenticationError,
+    "permission_denied": AuthenticationError,
+    "payment_required": QuotaError,
+    "rate_limit_exceeded": RateLimitError,
+    "provider_overloaded": TransportError,
+    "provider_unavailable": TransportError,
+    "invalid_request": InvalidRequestError,
+    "invalid_prompt": InvalidRequestError,
+    "not_found": InvalidRequestError,
+    "precondition_failed": InvalidRequestError,
+    "payload_too_large": ContextLengthError,
+    "unprocessable": InvalidRequestError,
+    "content_policy_violation": ContentSafetyError,
+    "refusal": ContentSafetyError,
+    "invalid_image": InvalidRequestError,
+    "image_too_large": InvalidRequestError,
+    "image_too_small": InvalidRequestError,
+    "unsupported_image_format": InvalidRequestError,
+    "image_not_found": InvalidRequestError,
+    "image_download_failed": InvalidRequestError,
+    "server": TransportError,
+    "timeout": ModelTimeoutError,
+    "unmapped": ModelError,
+}
+
+# 结构化 code 自身就能定性，先于任何词表。
+_ERROR_CODE_KINDS: Mapping[str, type[ModelError]] = {
+    **{code: TransportError for code in ("500", "502", "503", "504", "server_error", "internal_error", "overloaded_error", "server_is_overloaded", "interrupted")},
+    **{code: AuthenticationError for code in ("401", "403", "invalid_api_key", "authentication_error")},
+    **{code: ModelTimeoutError for code in ("408", "timeout", "request_timeout")},
+    **{code: ContextLengthError for code in ("context_length_exceeded", "context_window_exceeded", "model_context_window_exceeded", "request_too_large", "1261")},
+    **{code: ContentSafetyError for code in ("content_filter", "content_policy_violation", "data_inspection_failed", "bio_policy", "cyber_policy", "policy_violation", "invalid_prompt")},
+}
+
+
+# Stream errors are generation failures; they do not prove an HTTP rejection.
+def provider_stream_error(error: object, *, secret: str = "") -> Exception:
+    code, message, kind, text = _provider_error_details(error, secret)
+    if kind is None:
+        kind = _classify_error(code, text, weak=False)
+    if kind is None:
+        kind = InvalidRequestError if code in _WEAK_CODES else ModelError
+    return kind(message).exception()
+
+
+# Check both HTTP-200 JSON bodies and SSE chunks before consuming partial output.
+def check_chat_response_error(payload: Mapping[str, Any], *, secret: str = "") -> None:
+    if payload.get("error") is not None:
+        raise provider_stream_error(payload["error"], secret=secret)
+    # MiniMax 把失败放在 base_resp，成功时 status_code 为 0。
+    base = payload.get("base_resp")
+    if isinstance(base, Mapping):
+        base = cast(Mapping[str, object], base)
+        if base.get("status_code") not in (None, 0, "0", ""):
+            raise provider_stream_error({"code": str(base.get("status_code")), "message": base.get("status_msg")}, secret=secret)
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
+        return
+    choice = choices[0]
+    if choice.get("error") is not None:
+        raise provider_stream_error(choice["error"], secret=secret)
+    reason = choice.get("finish_reason")
+    if reason is not None and reason not in {"stop", "length", "tool_calls", "function_call"}:
+        raise provider_stream_error({"code": reason, "message": f"Provider finish_reason: {reason}"}, secret=secret)
+
+
+# 非流式正文缓存上限：足够容纳正常的完整响应，超过即停止读取并按无法解析处理。
+_NON_STREAM_BODY_LIMIT = 1 << 20
+# SSE 注释与控制字段不是正文；只收到它们后断开仍是真断流。
+_SSE_CONTROL_PREFIXES = (":", "event:", "id:", "retry:")
+# 部分网关用裸行保活；只收到它们后断开同样是真断流。
+_KEEPALIVE_LINES = frozenset({"ping", "keep-alive", "keepalive"})
+
+
+class NonStreamBody:
+    """HTTP 200 却不是 SSE 时的有界正文缓存；见过任何 data 帧后不再生效。"""
+
+    def __init__(self) -> None:
+        self._lines: list[str] = []
+        self._size = 0
+        self._frame_seen = False
+
+    # 记下一帧 data；此后的断流保持可重试的传输错误。
+    def frame(self) -> None:
+        self._frame_seen = True
+        self._lines.clear()
+
+    # 缓存一条非 data 行；返回 True 时调用方应停止读取。
+    def feed(self, line: str) -> bool:
+        stripped = line.strip()
+        if self._frame_seen or not stripped or line.startswith(_SSE_CONTROL_PREFIXES) or stripped.lower() in _KEEPALIVE_LINES:
+            return False
+        self._lines.append(line)
+        self._size += len(line)
+        return self._size > _NON_STREAM_BODY_LIMIT
+
+    # 返回携带 success 字段的响应对象；错误正文抛分类后的失败；没有正文（真断流）返回 None。
+    def payload(self, *, secret: str = "", success: str | None = None) -> dict[str, Any] | None:
+        if self._frame_seen or not self._lines:
+            return None
+        text = "\n".join(self._lines).strip()
+        # 1. httpx 按 splitlines 分行，字符串里的 U+2028 等会被拆开，strict=False 才能解析整体。
+        try:
+            decoded: object = json.loads(text, strict=False)
+        except (ValueError, RecursionError):
+            decoded = None
+        if isinstance(decoded, list) and len(cast(list[object], decoded)) == 1:
+            decoded = cast(list[object], decoded)[0]
+        # 2. 只有结构化错误才分类，正常回答里提到 rate limit、credit 不是错误证据。
+        if isinstance(decoded, dict):
+            raw = cast(dict[str, Any], decoded)
+            try:
+                check_chat_response_error(raw, secret=secret)
+            except RuntimeError as error:
+                raise _non_stream_error(error) from None
+            if success is not None and raw.get(success):
+                return raw
+            if isinstance(raw.get("message"), str) and (raw.get("code") or raw.get("type")):
+                raise _non_stream_error(provider_stream_error(raw, secret=secret))
+        # 3. 其余都是未知响应：不可重试，带摘录。
+        raise _non_stream_error(ModelError(redact_secret_text(text, secret)[:500]).exception())
+
+
+# 保留分类，只补上来源说明；未知正文因此不可重试且带摘录。
+def _non_stream_error(error: Exception) -> Exception:
+    value = ModelError.read(error)
+    assert value is not None
+    return ModelError.change(error, message=f"模型服务在 HTTP 200 中返回了非流式正文：{value.message}")
+
+
+# 把一次完整的 Chat Completions 响应转成统一结果；网关忽略 stream 参数时走这里。
+def chat_completion_response(payload: Mapping[str, Any]) -> LLMResponse:
+    raw_choice: object = payload["choices"][0]
+    raw_message = cast(Mapping[str, object], raw_choice).get("message") if isinstance(raw_choice, Mapping) else None
+    if not isinstance(raw_message, Mapping):
+        excerpt = json.dumps(payload, ensure_ascii=False)[:500]
+        raise ModelError(f"模型服务在 HTTP 200 中返回了无法识别的响应：{excerpt}").exception()
+    choice = cast(Mapping[str, object], raw_choice)
+    message = cast(Mapping[str, object], raw_message)
+    calls: dict[int, dict[str, str]] = {}
+    raw_calls = message.get("tool_calls")
+    if isinstance(raw_calls, list):
+        _ = merge_stream_tool_deltas(calls, [
+            {**cast(Mapping[str, object], raw), "index": index} if isinstance(raw, Mapping) else raw
+            for index, raw in enumerate(cast(list[object], raw_calls))
+        ])
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    content = message.get("content")
+    finish = str(choice.get("finish_reason") or "stop")
+    raw_usage = payload.get("usage")
+    return LLMResponse(
+        content=(content.strip() or None) if isinstance(content, str) else None,
+        thinking=(reasoning.strip() or None) if isinstance(reasoning, str) else None,
+        tool_calls=() if finish == "length" else build_stream_tool_calls(calls),
+        finish_reason=finish,
+        usage=parse_openai_usage(cast(Mapping[str, Any], raw_usage)) if isinstance(raw_usage, Mapping) else None,
+        output_discarded=finish == "length" and bool(calls),
+    )
+
+
+def http_status_error(
+    response: httpx.Response,
+    *,
+    secret: str,
+    auth_message: str | None = None,
+    server_message: str | None = None,
+    honor_503_retry_after: bool = True,
+) -> Exception | None:
+    if response.status_code < 400:
+        return None
+    code, message, kind, text = _response_error_details(response, secret)
+    if kind is not None:
+        return kind(message).exception()
+    status = response.status_code
+    if status in {401, 403}:
+        return AuthenticationError(auth_message or _http_error_text(AuthenticationError, status, message)).exception()
+    if status >= 500:
+        error = TransportError(server_message or _http_error_text(TransportError, status, message)).exception()
+        if status == 503 and honor_503_retry_after:
+            error = ModelError.change(error, retry_at=retry_after_time(response.headers.get("retry-after")))
+        return error
+    # 状态码先于词表：402/429 的正文即使提到 tokens 也不是超窗，413 无正文也是超窗。
+    if status == 402:
+        found: type[ModelError] | None = QuotaError
+    elif status == 429:
+        found = QuotaError if is_quota_error(code, _own_words(text)) else RateLimitError
+    elif status == 413:
+        found = ContextLengthError
+    else:
+        found = _classify_error(code, text, weak=True) or InvalidRequestError
+    error = found(_http_error_text(found, status, message)).exception()
+    if found is RateLimitError:
+        error = ModelError.change(error, retry_at=retry_after_time(response.headers.get("retry-after")))
+    return error
+
+
+# HTTP 失败的用户文案；未列出的类型按拒绝请求说明。
+def _http_error_text(kind: type[ModelError], status: int, message: str) -> str:
+    if kind is AuthenticationError:
+        return f"模型连接授权未通过（HTTP {status}）。请在模型设置中核对 API Key 或账号权限后重试。服务返回：{message}"
+    if kind is TransportError:
+        return f"模型服务暂不可用（HTTP {status}），请稍后重试。服务返回：{message}"
+    if kind is QuotaError:
+        return f"模型账号额度不足（HTTP {status}）。服务返回：{message}"
+    if kind is RateLimitError:
+        return f"模型服务限流（HTTP {status}）。服务返回：{message}"
+    if kind is ContextLengthError:
+        return f"模型上下文超过限制（HTTP {status}）。服务返回：{message}"
+    if kind is ContentSafetyError:
+        return f"模型安全策略拒绝请求（HTTP {status}）。服务返回：{message}"
+    return f"模型服务拒绝请求（HTTP {status}）。服务返回：{message}"
+
+
+def raise_http_status(
+    response: httpx.Response,
+    *,
+    secret: str,
+    auth_message: str | None = None,
+    server_message: str | None = None,
+    honor_503_retry_after: bool = True,
+) -> None:
+    error = http_status_error(
+        response,
+        secret=secret,
+        auth_message=auth_message,
+        server_message=server_message,
+        honor_503_retry_after=honor_503_retry_after,
+    )
+    if error is None:
+        return
+    if response.status_code < 500:
+        error = rejected_by_upstream(error, response.status_code)
+    raise error
+
+
+# Record the positive send evidence before any host text is added to the message.
+def rejected_by_upstream(error: BaseException, status: int) -> Exception:
+    return ModelError.change(error, send_evidence="rejected", http_status=status, upstream_text=str(error))
+
+
+def map_driver_error(error: Exception) -> Exception:
+    if ModelError.matches(
+        error,
+        AuthenticationError,
+        ContentSafetyError,
+        ContextLengthError,
+        InvalidRequestError,
+        ModelTimeoutError,
+        QuotaError,
+        RateLimitError,
+        TransportError,
+    ):
+        return error
+    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
+        mapped = TransportError(describe_transport_error(error)).exception()
+        mapped = ModelError.change(mapped, send_evidence="unsent")
+        return ModelError.change(mapped, retry_safe=True)
+    if isinstance(error, (httpx.TimeoutException, TimeoutError)):
+        return ModelTimeoutError(describe_transport_error(error)).exception()
+    if isinstance(error, httpx.TransportError):
+        return TransportError(describe_transport_error(error)).exception()
+    if isinstance(error, StreamReadError):
+        mapped = map_driver_error(error.error)
+        if ModelError.matches(mapped):
+            mapped = ModelError.change(mapped, response_delta_seen=error.response_delta_seen, send_evidence=None)
+        else:
+            setattr(mapped, "response_delta_seen", error.response_delta_seen)
+        return mapped
+    return error
+
+
+def is_driver_retryable(error: Exception) -> bool:
+    value = ModelError.read(error)
+    return value is not None and value.send_evidence in ("rejected", "unsent") and (
+        isinstance(value, (ModelTimeoutError, RateLimitError)) or value.retry_safe
+    )
+
+
+# Failure prefix for a request the upstream confirmed rejecting; frontend needsAbandon matches it.
+CONTENT_REJECTED_FAILURE = "内容被上游拒绝"
+REJECTED_INPUT_NOTICE = "这条输入所在的一轮被上游拒绝后已放弃，内容已从模型视图移除，原文仍在会话记录里。"
+REJECTED_OUTPUT_NOTICE = "这段模型回复所在的一轮被上游拒绝后已放弃，内容已从模型视图移除。"
+REJECTED_CALL_NOTICE = "一次未通过校验的工具调用未执行；所在的一轮被上游拒绝后已放弃，内容已从模型视图移除。"
+# Host records in a hidden Output: not model-authored text, so they keep their normal treatment.
+REJECTED_KEEP_KINDS = frozenset({"model.facts", "context.summary", "context.notice", "model.selection", "tool.selection"})
+# 4xx that name a setup problem: dropping the user's input cannot help, so they are not content rejections.
+_CONFIG_REJECTION_MARKERS = (
+    "model_not_found", "model not found", "model not exist", "model does not exist", "unknown model", "invalid model",
+    "model is not available", "model not available", "deprecated", "decommissioned",
+    "does not exist or you do not have access", "no endpoints", "模型不存在", "已下线",
+    "api key", "api_key", "apikey", "unauthorized", "authentication", "access denied", "密钥",
+    "credit", "balance", "billing", "quota", "arrearage", "good standing", "insufficient", "余额", "欠费", "额度",
+    "max_tokens", "max_completion_tokens", "temperature", "top_p", "1210:", "参数有误",
+    # History the host replayed in the wrong shape: hiding the turn does not change how it builds requests.
+    "reasoning_content", "tool call arguments", "invalid json",
+)
+_PARAMETER_MARKERS = (
+    "unsupported parameter", "unsupported value", "unknown parameter", "unknown field", "unknown name",
+    "unrecognized request argument", "extra inputs are not permitted", "not supported", "does not support", "不支持",
+    "must be between", "tools[",
+)
+
+
+# Only a confirmed rejection that may concern the content counts; anything else keeps its normal exit.
+def is_content_rejection(error: BaseException) -> bool:
+    value = ModelError.read(error, InvalidRequestError, ContentSafetyError)
+    if value is None or value.send_evidence != "rejected":
+        return False
+    if isinstance(value, ContentSafetyError):
+        return True
+    if value.http_status not in (400, 413, 422):
+        return False
+    # Host notes such as attempt budgets must not decide this: read only what the upstream said.
+    text = (value.upstream_text or "").lower()
+    if any(marker in text for marker in _CONFIG_REJECTION_MARKERS):
+        return False
+    # An image the upstream cannot take is the user's content; a parameter or tool problem is setup.
+    return "image" in text or "图片" in text or not any(marker in text for marker in _PARAMETER_MARKERS)
+
+
+def content_rejection_reason(detail: str, *, may_be_config: bool = False) -> str:
+    config = "如果是模型或参数配置问题，不要放弃，改好设置后直接发新消息。" if may_be_config else ""
+    return (
+        f"{CONTENT_REJECTED_FAILURE}：{detail}\n"
+        "同样的请求重试不会改变结果。放弃本轮可把本轮的输入、回复和工具结果从模型视图移除后继续："
+        "对话可用 /abandon，程序可用 programmatic/message/abandon。"
+        f"如果被拒的内容已进入摘要或更早的轮次，放弃解不开，需要新开会话。{config}"
+    )
+
+
+# Replacement for a hidden result: the effect stays stated even though the content is gone.
+def rejected_result_notice(outcome: str) -> str:
+    effect = "工具已执行，外部效果已经发生" if outcome == "success" else (
+        f"工具结算为 {outcome}，外部效果可能已经发生，不能据此重跑"
+    )
+    return f"{effect}；所在的一轮被上游拒绝后已放弃，结果已从模型视图移除。"
+
+
+# Input and Output ids hidden by an abandon right after a rejection failure, with no newer Input between.
+# Only what the failure's through_seq covers: a late failure must not hide input it never saw. Results follow their call.
+def rejected_segments(messages: Iterable[Message]) -> frozenset[str]:
+    opened: dict[str, list[Message]] = {}
+    covered: dict[str, int] = {}
+    hidden: set[str] = set()
+    for message in messages:
+        body, source = message.body, message.source
+        if isinstance(body, Output) and body.finish != "continue":
+            _ = opened.pop(source, None)
+            _ = covered.pop(source, None)
+        elif isinstance(body, (Input, Output)):
+            opened.setdefault(source, []).append(message)
+            if isinstance(body, Input):
+                # 新输入接着往下走：之后的放弃（比如步数上限）不是针对这次拒绝的。
+                _ = covered.pop(source, None)
+        elif isinstance(body, Control) and body.action == "failure":
+            if (body.reason or "").startswith(CONTENT_REJECTED_FAILURE):
+                covered[source] = max(covered.get(source, -1), body.through_seq)
+        elif isinstance(body, Control) and body.action == "abandon":
+            limit = min(covered.pop(source, -1), body.through_seq)
+            hidden.update(item.message_id for item in opened.get(source, ()) if item.seq <= limit)
+            opened[source] = [item for item in opened.get(source, ()) if item.seq > body.through_seq]
+    return frozenset(hidden)
+
+
+# Preserve invalid model output for the tool owner to reject with feedback.
+def parse_tool_arguments(value: object) -> Mapping[str, Any] | str:
+    if not isinstance(value, str):
+        raise TransportError("tool call arguments must be a JSON string").exception()
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return value
+    if not isinstance(parsed, dict):
+        return value
+    return cast(dict[str, Any], parsed)
+
+
+def merge_stream_tool_deltas(calls: dict[int, dict[str, str]], raw_calls: list[Any]) -> bool:
+    """合并合法工具片段，并报告是否增加了调用内容。"""
+    advanced = False
+    for raw in raw_calls:
+        if not isinstance(raw, Mapping):
+            raise TransportError("stream tool call delta must be an object").exception()
+        index = raw.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            raise TransportError("stream tool call index must be non-negative").exception()
+        slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        raw_id = raw.get("id")
+        if isinstance(raw_id, str):
+            slot["id"] += raw_id
+            advanced = advanced or bool(raw_id)
+        function = raw.get("function")
+        if isinstance(function, Mapping):
+            name = function.get("name")
+            arguments = function.get("arguments")
+            if isinstance(name, str):
+                slot["name"] += name
+                advanced = advanced or bool(name)
+            if isinstance(arguments, str):
+                slot["arguments"] += arguments
+                advanced = advanced or bool(arguments)
+    return advanced
+
+
+def build_stream_tool_calls(calls: Mapping[int, Mapping[str, str]]) -> list[ToolCall]:
+    result: list[ToolCall] = []
+    for index in sorted(calls):
+        raw = calls[index]
+        result.append(
+            ToolCall(
+                id=required_non_empty_string(raw.get("id"), "tool call id"),
+                name=required_non_empty_string(raw.get("name"), "tool call name"),
+                arguments=parse_tool_arguments(raw.get("arguments") or "{}"),
+            )
+        )
+    return result
+
+
+def parse_openai_usage(raw: Mapping[str, Any]) -> ModelUsage:
+    input_tokens = optional_non_negative_int(raw.get("prompt_tokens"))
+    output_tokens = optional_non_negative_int(raw.get("completion_tokens"))
+    prompt_details = raw.get("prompt_tokens_details")
+    completion_details = raw.get("completion_tokens_details")
+    cached = (
+        optional_non_negative_int(prompt_details.get("cached_tokens"))
+        if isinstance(prompt_details, Mapping)
+        else None
+    )
+    cache_hit = optional_non_negative_int(raw.get("prompt_cache_hit_tokens"))
+    cache_miss = optional_non_negative_int(raw.get("prompt_cache_miss_tokens"))
+    if cache_hit is not None or cache_miss is not None:
+        if input_tokens is None:
+            input_tokens = (cache_hit or 0) + (cache_miss or 0)
+        if cached is None:
+            cached = cache_hit or 0
+    if cached is None:
+        cached = optional_non_negative_int(raw.get("cached_tokens"))
+    cache_write = (
+        optional_non_negative_int(prompt_details.get("cache_write_tokens"))
+        if isinstance(prompt_details, Mapping)
+        else None
+    )
+    reasoning = (
+        optional_non_negative_int(completion_details.get("reasoning_tokens"))
+        if isinstance(completion_details, Mapping)
+        else None
+    )
+    covered = int(input_tokens is not None and output_tokens is not None)
+    coverage: UsageCoverage = (
+        "exact"
+        if covered
+        else ("partial" if input_tokens is not None or output_tokens is not None else "unavailable")
+    )
+    return ModelUsage(
+        input_tokens=input_tokens,
+        cache_write_input_tokens=cache_write,
+        cached_input_tokens=cached,
+        output_tokens=output_tokens,
+        reasoning_output_tokens=reasoning,
+        covered_request_count=covered,
+        coverage=coverage,
+    )
+

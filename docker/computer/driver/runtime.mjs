@@ -4,15 +4,21 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
-import { BrowserBackend } from "./cdp.mjs";
+import { BrowserBackend, SPACE_SENTINEL_URL } from "./cdp.mjs";
 import { AnonymousBrowsers } from "./anonymous.mjs";
+import { BackgroundSpaces } from "./spaces.mjs";
+
+// Core 的硬超时是 170s，调用本身最多 110s，等人的时间要留在余量里。
+const HUMAN_WAIT_MS = 40_000;
 
 /** 一个容器只有一个带个人 profile 的浏览器；各 Session 隔离 JS 绑定并各自串行，Session 之间并行。 */
 export class ComputerDriver extends EventEmitter {
-  constructor({ anonymousIdleMs = 600000 } = {}) {
+  constructor({ anonymousIdleMs = 600000, maxSpaceConcurrency = 4, shouldAllowExternalFocus = null } = {}) {
     super();
     this.anonymous = new AnonymousBrowsers(anonymousIdleMs);
     this.browser = new BrowserBackend(undefined, undefined, null, this.anonymous.contexts);
+    this.spaces = new BackgroundSpaces({ browser: this.browser, maxConcurrency: maxSpaceConcurrency });
+    this.shouldAllowExternalFocus = shouldAllowExternalFocus;
     this.anonymous.on("targets", () => this.emit("targets"));
     this.anonymous.on("closed", ({ browserId, reason, context }) => {
       this.emit("targets");
@@ -33,8 +39,9 @@ export class ComputerDriver extends EventEmitter {
   controlVersion = 0;
   agentJobs = new Set();
   humanJobs = new Set();
+  interceptionSync = Promise.resolve();
 
-  /** 人工接管先阻止新操作，再等待已发操作和输入释放。 */
+  /** 人工操作租约先阻止 Agent 新操作，再等待已发操作和输入释放。 */
   async takeControl(id, target = "", signal) {
     if (this.closed) throw new Error("Computer driver is stopped");
     if (this.control) throw new Error("Another viewer controls this Computer");
@@ -45,7 +52,7 @@ export class ComputerDriver extends EventEmitter {
     this.control = control;
     this.controlVersion++;
     this.emit("control");
-    this.pauseClock();
+    await this.syncInterception();
     try {
       await waitForSignal(Promise.allSettled([...this.agentJobs, ...this.humanJobs]), signal);
       if (this.control !== control || control.release) throw new Error("Control request was cancelled");
@@ -80,28 +87,72 @@ export class ComputerDriver extends EventEmitter {
       if (this.control !== control) throw new Error("Computer control owner changed during release");
       this.control = null;
       this.emit("control");
+      await this.syncInterception();
       if (control.instance) this.anonymous.unhold(control.instance);
       control.releaseWorkload?.();
       control.resume();
-      this.resumeClock();
     })();
     try { await control.release; }
     catch (error) { this.closed = true; this.rejectAll(error); throw error; }
   }
 
-  async waitForControl(signal) {
-    while (this.control) {
+  // 拦截只在 Agent 持有浏览器时生效：有进行中的调用且无人接管。调用之间和接管期间没人能放行
+  // 暂停的文档响应，iframe、跳转和点击会一直挂住，所以这时关掉拦截，已暂停的响应随之放行。
+  syncInterception() {
+    const work = this.interceptionSync.then(() => {
+      const on = this.actives.size > 0 && !this.control;
+      const backends = [this.browser];
+      for (const instance of this.anonymous.instances.values())
+        if (instance.backend && !instance.closing) backends.push(instance.backend);
+      return Promise.all(backends.map(backend => backend.setInterception(on)));
+    });
+    this.interceptionSync = work.catch(() => {});
+    return this.interceptionSync;
+  }
+
+  // active 给出时，一次调用累计最多等人 HUMAN_WAIT_MS；超过就明确失败，让模型去聊天里问用户。
+  async waitForControl(signal, active) {
+    if (active && this.control) this.waitStarted(active);
+    try {
+      while (this.control) {
+        signal?.throwIfAborted();
+        const control = this.control;
+        if (!active) { await waitForSignal(control.done, signal); continue; }
+        let timer;
+        const late = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(
+            "The user is operating the browser in the Computer panel. Do not retry now: ask the user in chat "
+            + "whether they have finished (for example logging in), then continue.")),
+            Math.max(0, HUMAN_WAIT_MS - active.waited - (Date.now() - active.waitingSince)));
+        });
+        try { await waitForSignal(Promise.race([control.done, late]), signal); }
+        finally { clearTimeout(timer); }
+      }
       signal?.throwIfAborted();
-      const control = this.control;
-      await waitForSignal(control.done, signal);
-    }
-    signal?.throwIfAborted();
+    } finally { if (active?.waiters) this.waitEnded(active); }
+  }
+
+  // 一次调用可能有几个操作同时等人：第一个开始等时暂停这次调用的计时，最后一个等完时记账并恢复。
+  // 没在等人的调用（比如在跑页面外的 Promise）照常计时，不会因为人一直在操作而绕过上限。
+  waitStarted(active) {
+    if (active.waiters++) return;
+    active.waitingSince = Date.now();
+    if (!active.timer) return;
+    clearTimeout(active.timer);
+    active.remaining = Math.max(1, active.remaining - (Date.now() - active.startedAt));
+    active.timer = null;
+  }
+
+  waitEnded(active) {
+    if (--active.waiters) return;
+    active.waited += Date.now() - active.waitingSince;
+    this.startClock(active);
   }
 
   /** 通用 CDP 可能执行脚本，所有 Agent RPC 都经过同一个权限边界。 */
-  async agentOperation(task, signal) {
+  async agentOperation(task, signal, active) {
     do {
-      await this.waitForControl(signal);
+      await this.waitForControl(signal, active);
       await waitForSignal(Promise.allSettled([...this.humanJobs]), signal);
     } while (this.control || this.humanJobs.size);
     const work = task();
@@ -124,22 +175,10 @@ export class ComputerDriver extends EventEmitter {
     for (const active of this.actives.values()) active.reject(error);
   }
 
-  // 人工接管期间暂停全部调用的计时，交还后从剩余时间继续。
-  pauseClock() {
-    for (const active of this.actives.values()) {
-      if (!active.timer) continue;
-      clearTimeout(active.timer);
-      active.remaining = Math.max(1, active.remaining - (Date.now() - active.startedAt));
-      active.timer = null;
-    }
-  }
-
-  resumeClock(only) {
-    for (const active of only ? [only] : this.actives.values()) {
-      if (this.control || active.timer || active.cancelled) continue;
-      active.startedAt = Date.now();
-      active.timer = setTimeout(() => active.reject(new Error("Computer call timed out")), active.remaining);
-    }
+  startClock(active) {
+    if (active.timer || active.cancelled) return;
+    active.startedAt = Date.now();
+    active.timer = setTimeout(() => active.reject(new Error("Computer call timed out")), active.remaining);
   }
   /** 目录直接来自存活页面：主浏览器的标签在前，匿名 Context 的标签在后；front 是屏幕最前的那个。 */
   async targets() {
@@ -210,7 +249,13 @@ export class ComputerDriver extends EventEmitter {
   /** 人工新开标签：个人浏览器里开一个窗口并提到最前，返回它的观看 id。 */
   async openPage(url = "about:blank") {
     const connection = this.browser.browser;
-    const { targetId } = await connection.send("Target.createTarget", { url, newWindow: true });
+    this.browser.creatingInternalTargets++;
+    let targetId;
+    try {
+      ({ targetId } = await connection.send("Target.createTarget", { url, newWindow: true }));
+    } finally {
+      this.browser.creatingInternalTargets--;
+    }
     await this.browser.screen.place(connection, targetId);
     await this.browser.screen.show(connection, targetId);
     const tab = (await this.browser.listTabs()).find(item => this.browser.tab(item.id).targetId === targetId);
@@ -233,8 +278,17 @@ export class ComputerDriver extends EventEmitter {
     try {
       const connection = this.browser.browser;
       const [first] = await this.browser.listTabs();
-      const next = first ? this.browser.tab(first.id).targetId
-        : (await connection.send("Target.createTarget", { url: "about:blank", newWindow: true })).targetId;
+      let next;
+      if (first) {
+        next = this.browser.tab(first.id).targetId;
+      } else {
+        this.browser.creatingInternalTargets++;
+        try {
+          ({ targetId: next } = await connection.send("Target.createTarget", { url: "about:blank", newWindow: true }));
+        } finally {
+          this.browser.creatingInternalTargets--;
+        }
+      }
       if (!first) await screen.place(connection, next);
       await screen.show(connection, next);
     } catch (error) {
@@ -250,9 +304,60 @@ export class ComputerDriver extends EventEmitter {
     // 1. 页面增删、换标题都要刷新目录；最前的页面关闭时补一个。
     this.browser.browser.on("event", ({ method, params }) => {
       if (!method?.startsWith("Target.target")) return;
-      if (method === "Target.targetDestroyed") void this.recoverFront(params.targetId);
-      if (method === "Target.targetCreated" && params.targetInfo.type === "page" && params.targetInfo.openerId)
-        this.browser.screen.front = params.targetInfo.targetId;
+      const info = params.targetInfo;
+      const targetId = info?.targetId ?? params.targetId;
+      if (method === "Target.targetDestroyed") {
+        this.browser.hiddenTargetRoots.delete(targetId);
+        if (this.browser.hiddenTargets.delete(targetId)) return;
+        void this.recoverFront(targetId);
+        this.emit("targets");
+        return;
+      }
+      const isHiddenSubtree =
+        this.browser.hiddenTargets.has(targetId) ||
+        info?.url === SPACE_SENTINEL_URL ||
+        (Boolean(info?.openerId) && this.browser.hiddenTargets.has(info.openerId));
+      if (isHiddenSubtree) {
+        this.browser.hiddenTargets.add(targetId);
+        if (info?.openerId) {
+          const root = this.browser.hiddenTargetRoots.get(info.openerId) ?? info.openerId;
+          this.browser.hiddenTargetRoots.set(targetId, root);
+          if (
+            info.type === "page" &&
+            !this.shouldAllowExternalFocus?.() &&
+            this.browser.screen.front &&
+            this.browser.screen.front !== targetId
+          ) {
+            void this.browser.screen.restoreFront(this.browser.browser);
+            const timer = setTimeout(() => {
+              if (!this.closed && !this.shouldAllowExternalFocus?.()) {
+                void this.browser.screen.restoreFront(this.browser.browser);
+              }
+            }, 150);
+            timer.unref?.();
+          }
+        }
+        return;
+      }
+      if (method === "Target.targetCreated" && info?.type === "page") {
+        if (info.openerId) {
+          this.browser.screen.front = targetId;
+        } else if (
+          !this.anonymous.contexts.has(info.browserContextId) &&
+          !this.browser.creatingInternalTargets &&
+          !this.shouldAllowExternalFocus?.() &&
+          this.browser.screen.front &&
+          this.browser.screen.front !== targetId
+        ) {
+          void this.browser.screen.restoreFront(this.browser.browser);
+          const timer = setTimeout(() => {
+            if (!this.closed && !this.shouldAllowExternalFocus?.()) {
+              void this.browser.screen.restoreFront(this.browser.browser);
+            }
+          }, 150);
+          timer.unref?.();
+        }
+      }
       this.emit("targets");
     });
     await this.browser.browser.send("Target.setDiscoverTargets", { discover: true });
@@ -327,9 +432,11 @@ export class ComputerDriver extends EventEmitter {
       });
       return;
     }
-    const work = this.agentOperation(() =>
-      this.browserCall(session, message, active.context),
-      active.controller.signal);
+    // 放行被拦截的请求是已开始导航的后续，不是新操作，也不产生输入：不等人。
+    // 否则人在 Agent 导航时点一下画面，导航就卡到 CDP 超时。
+    const call = () => this.browserCall(session, message, active.context);
+    const work = message.method === "executeCdp" && String(message.params?.params?.method).startsWith("Fetch.")
+      ? call() : this.agentOperation(call, active.controller.signal, active);
     active.pending.add(work);
     work
       .then(
@@ -403,6 +510,8 @@ export class ComputerDriver extends EventEmitter {
       controller: new AbortController(),
       remaining: timeoutMs,
       timer: null,
+      waiters: 0,
+      waited: 0,
     };
     this.actives.set(context.session_id, active);
     active.done = new Promise((resolve) => {
@@ -424,10 +533,11 @@ export class ComputerDriver extends EventEmitter {
       if (!task) active.session = await this.session(context.session_id);
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) abort();
-      this.resumeClock(active);
-      await this.waitForControl(active.controller.signal);
+      this.startClock(active);
+      await this.waitForControl(active.controller.signal, active);
+      await this.syncInterception();
       if (task) {
-        const work = this.agentOperation(() => task(active.controller.signal, context), active.controller.signal);
+        const work = this.agentOperation(() => task(active.controller.signal, context), active.controller.signal, active);
         active.pending.add(work);
         work
           .then(active.resolve, active.reject)
@@ -440,8 +550,8 @@ export class ComputerDriver extends EventEmitter {
           endTurn,
         });
       }
+      // 调用做完就返回；人还在操作时，下一次操作自己会等。
       content = await result;
-      await this.waitForControl(active.controller.signal);
     } catch (error) {
       failure = error;
       reset = !active.scriptError || endTurn || active.controller.signal.aborted;
@@ -479,10 +589,10 @@ export class ComputerDriver extends EventEmitter {
         await rm(active.session.directory, { recursive: true, force: true });
       }
       this.actives.delete(context.session_id);
+      await this.syncInterception();
       active.finish();
     }
     if (failure) {
-      this.emit("cursor", { point: null, error: "操作中断，位置标记已清除" });
       failure.message +=
         reset ? "; earlier effects may remain; JS bindings for this session were reset"
           : "; earlier effects may remain; JS bindings and browser pages were kept; inspect the current page before retrying";

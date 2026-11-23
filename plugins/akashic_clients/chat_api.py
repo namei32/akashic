@@ -1,42 +1,36 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-from plugins.models.contract import ModelCallStats
-
-import asyncio
+import gzip
 import hashlib
 import json
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+import re
+import secrets
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from urllib.parse import quote
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from plugins.models.contract import (
-    ModelControlUnavailable,
-    ModelError,
-)
+from core.common.file_io import run_file_io
 
-from .static import register_chat_assets
-from plugins.ui.contract import read_message_rows, session_row
-from .navigation import NavigationPreferences, PinUpdate, check_project_pin, session_pin_row
+from .client_diagnostics import register_client_diagnostics
+from .static import current_chat_build, current_runtime_commit, register_chat_assets
+from plugins.ui.contract import PluginUiSlot, PromptShutdownServer, accepts_gzip_header, read_message_rows, session_row
+from .navigation import NavigationPreferences, PinUpdate, session_pin_row
 from .notifications import NotificationFeed, NotificationRequest, notification_events
 from .read_marks import ReadMarks
 from .session_activity import follow_session_activity
-from .services import AttachmentStorePort as AttachmentStore
 from .services import (
     ActiveSessionsFollowPort,
     InvalidPage,
     MessageCatalogPort as MessageCatalog,
     MessageDisplayReader,
-    ModelCatalogSnapshot,
-    ChatModelSelection,
-    ModelCatalogUnavailable,
     PluginUiPluginUnavailable,
     PluginUiProvider,
     PluginUiQueryOverloaded,
@@ -45,19 +39,12 @@ from .services import (
     PluginUiRpcInvalidRequest,
     PluginUiStaleRevision,
     SessionAdminPort,
-    default_chat_model_id,
-    project_chat_runtimes,
-    project_unavailable_chat_runtimes,
 )
 from .services import ArtifactStorePort as ChannelAttachmentArtifactStore
 from .web_chat import (
     MAX_UPLOAD_BYTES,
     UploadTooLargeError,
     WebChatChannel,
-)
-from .runtime_inspection import (
-    RuntimeInspectionError,
-    RuntimeInspectionService,
 )
 
 
@@ -68,13 +55,7 @@ class WebPluginUiQueryPayload(BaseModel):
     plugin_revision: str = Field(min_length=1, max_length=128)
     method: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,255}$")
     payload: dict[str, object]
-    slot: Literal[
-        "turn.before_reasoning",
-        "turn.before_tool",
-        "turn.after_answer",
-        "drawer.panel",
-        "message.attachment",
-    ]
+    slot: PluginUiSlot
     session_id: str | None = Field(default=None, max_length=512)
     turn_id: str | None = Field(default=None, max_length=128)
 
@@ -92,6 +73,24 @@ class WebUiProvider(Protocol):
 
     async def state(self) -> dict[str, str | bool]: ...
 
+    async def module_asset(self, plugin_id: str, sha256: str) -> str: ...
+
+
+# bootstrap 载荷按目录身份缓存(plugins/ui/plugin.py);同一载荷的 gzip 结果也缓存。
+# plugin-ui 模块同样按内容哈希(sha256 参数即内容指纹)缓存压缩结果。
+# 容量覆盖当前目录的模块数量加 bootstrap,内容更新后旧条目随即被淘汰。
+_gzip_cache: dict[str, bytes] = {}
+
+
+def _gzip_cached(payload_sha256: str, payload: bytes) -> bytes:
+    body = _gzip_cache.get(payload_sha256)
+    if body is None:
+        body = gzip.compress(payload, compresslevel=6, mtime=0)
+        _gzip_cache[payload_sha256] = body
+        while len(_gzip_cache) > 24:
+            del _gzip_cache[next(iter(_gzip_cache))]
+    return body
+
 
 class ReadMarkUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -99,28 +98,44 @@ class ReadMarkUpdate(BaseModel):
     seq: int = Field(ge=-1)
 
 
+_EPHEMERAL_DOWNLOAD_TTL_S = 120.0
+_EPHEMERAL_DOWNLOAD_MAX_ITEMS = 16
+_EPHEMERAL_DOWNLOAD_MAX_ITEM_BYTES = 20 * 1024 * 1024
+_EPHEMERAL_DOWNLOAD_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+_EPHEMERAL_DOWNLOAD_TYPES = frozenset({"image/png", "image/jpeg", "image/webp"})
+_EPHEMERAL_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def _safe_download_filename(filename: str) -> str:
+    clean = Path(filename).name.replace('"', "").replace("\r", "").replace("\n", "").strip()
+    return clean or "download.png"
+
+
+def _attachment_disposition(filename: str) -> str:
+    safe = _safe_download_filename(filename)
+    encoded = quote(safe, safe="")
+    if encoded != safe:
+        ascii_fallback = safe.encode("ascii", "ignore").decode("ascii").strip() or "download.png"
+        return f'attachment; filename="{ascii_fallback}"; filename*=utf-8\'\'{encoded}'
+    return f'attachment; filename="{safe}"'
+
+
 def create_chat_app(
     *,
     workspace: Path,
     channel: WebChatChannel,
     navigation: NavigationPreferences | None = None,
+    check_scope: Callable[[str, str], Awaitable[None]] | None = None,
     read_marks: ReadMarks | None = None,
-    runtime_inspection: RuntimeInspectionService | None = None,
     message_display: MessageDisplayReader | None = None,
     plugin_ui_provider: PluginUiProvider | None = None,
     plugin_ui_scope: Callable[[], Any] | None = None,
     web_ui_provider: WebUiProvider | None = None,
-    model_catalog_reader: Callable[[], Awaitable[ModelCatalogSnapshot]] | None = None,
-    model_call_stats_reader: Callable[[str], Awaitable[ModelCallStats]] | None = None,
-    model_selection_reader: Callable[
-        [Mapping[str, object]], Awaitable[ChatModelSelection]
-    ] | None = None,
     messages: MessageCatalog | None = None,
     reply_status: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None,
     follow_active_sessions: ActiveSessionsFollowPort | None = None,
     message_scope: Callable[[], Any] | None = None,
     session_admin_scope: Callable[[], Any] | None = None,
-    attachment_store: AttachmentStore | None = None,
     artifact_store: ChannelAttachmentArtifactStore | None = None,
 ) -> FastAPI:
     if messages is not None and message_scope is not None:
@@ -131,8 +146,6 @@ def create_chat_app(
         channel.bind_message_readers(messages, reply_status)
     if message_display is not None:
         channel.bind_message_display(message_display)
-    if attachment_store is not None:
-        channel.bind_attachment_store(attachment_store)
     if artifact_store is not None:
         channel.bind_artifact_store(artifact_store)
 
@@ -143,6 +156,13 @@ def create_chat_app(
     app = FastAPI(title="Akashic Chat API", lifespan=lifespan)
     app.state.workspace = workspace
     app.state.channel = channel
+    ephemeral_downloads: dict[str, tuple[bytes, str, str, float]] = {}
+
+    def _prune_ephemeral_downloads(now: float) -> int:
+        expired = [key for key, item in ephemeral_downloads.items() if now >= item[3]]
+        for key in expired:
+            del ephemeral_downloads[key]
+        return sum(len(item[0]) for item in ephemeral_downloads.values())
 
     @asynccontextmanager
     async def open_message_catalog() -> AsyncGenerator[MessageCatalog, None]:
@@ -195,7 +215,9 @@ def create_chat_app(
         async with session_admin_scope() as admin:
             yield cast(SessionAdminPort, admin)
 
-    register_chat_assets(app, Path(__file__).resolve().parent / "static/chat")
+    static_dir = Path(__file__).resolve().parent / "static/chat"
+    register_chat_assets(app, static_dir)
+    register_client_diagnostics(app, workspace)
 
     @app.get("/api/shell/state")
     async def client_state() -> dict[str, object]:
@@ -205,7 +227,9 @@ def create_chat_app(
         except RuntimeError:
             ready = False
         return {"status": "ready" if ready else "unavailable",
-                "configured": True, "chatReady": ready}
+                "configured": True, "chatReady": ready,
+                "build": await current_chat_build(static_dir),
+                "commit": await current_runtime_commit()}
 
     @app.get("/api/chat/health")
     async def chat_health() -> dict[str, str]:
@@ -227,17 +251,52 @@ def create_chat_app(
                 detail="Web 插件界面服务暂不可用",
             ) from error
         # 每次仍读取当前 snapshot；只有完整响应字节相同才复用浏览器缓存。
-        etag = f'"{hashlib.sha256(payload).hexdigest()}"'
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        compressed = accepts_gzip_header(request.headers.get("accept-encoding", ""))
+        etag = f'"{payload_sha256}{"-gzip" if compressed else ""}"'
         headers = {
             "Cache-Control": "private, no-cache",
             "ETag": etag,
+            "Vary": "Accept-Encoding",
             "X-Content-Type-Options": "nosniff",
         }
         # 压缩代理可能把强 ETag 改为弱 ETag；GET 的条件校验按弱比较匹配。
         validators = request.headers.get("if-none-match", "").split(",")
         if any(value.strip().removeprefix("W/") in {"*", etag} for value in validators):
             return Response(status_code=304, headers=headers)
-        return Response(content=payload, media_type="application/json", headers=headers)
+        # 目录字节是 JSON 内嵌的压缩模块,线上约 1MB;gzip 后约剩 1/4。
+        # 强 ETag 区分编码；固定 gzip 时间戳，让相同载荷跨进程仍得到相同字节。
+        body = payload
+        if compressed:
+            # 首次压缩约 35ms,排水到文件 worker,不占用事件循环;命中缓存的线程往返可忽略。
+            body = await run_file_io(lambda: _gzip_cached(payload_sha256, payload))
+            headers["Content-Encoding"] = "gzip"
+        return Response(content=body, media_type="application/json", headers=headers)
+
+    @app.get("/api/chat/web-ui/module")
+    async def web_ui_module(
+        request: Request,
+        plugin_id: str = Query(..., min_length=1, max_length=128),
+        sha256: str = Query(..., pattern=r"^[0-9a-f]{64}$"),
+    ) -> Response:
+        if web_ui_provider is None:
+            raise HTTPException(status_code=503, detail="Web 插件界面服务不可用")
+        try:
+            content = await web_ui_provider.module_asset(plugin_id, sha256)
+        except KeyError:
+            # 目录换代或摘要篡改都按不存在处理;页面由 stale 核对流程刷新。
+            raise HTTPException(status_code=404, detail="Web 模块不存在或已更新") from None
+        headers = {
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "Vary": "Accept-Encoding",
+            "X-Content-Type-Options": "nosniff",
+        }
+        # 模块字节以 sha256 参数为内容指纹且 immutable;接受 gzip 时送缓存的压缩变体。
+        body: str | bytes = content
+        if accepts_gzip_header(request.headers.get("accept-encoding", "")):
+            body = await run_file_io(lambda: _gzip_cached(sha256, content.encode("utf-8")))
+            headers["Content-Encoding"] = "gzip"
+        return Response(content=body, media_type="text/javascript", headers=headers)
 
     @app.get("/api/chat/web-ui/state")
     async def web_ui_state() -> Response:
@@ -266,11 +325,15 @@ def create_chat_app(
             raise HTTPException(status_code=422, detail="目录 cursor 需要时间与会话 ID")
         after = None if after_time is None or after_key is None else (after_time, after_key)
         async with open_message_catalog() as catalog:
+            # 纪元在查询前读取：客户端据此判断首连基线通知是否已被这次读取覆盖。
+            epoch = catalog.metadata_epoch
             try:
-                page = catalog.sessions(prefix=f"{channel.name}:", visibility="listed", after=after, limit=page_size)
+                page = await catalog.sessions_async(
+                    prefix=f"{channel.name}:", visibility="listed", after=after, limit=page_size)
             except InvalidPage as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
         return {"items": [session_row(cast(Any, entry)) for entry in page.items], "total": page.total,
+                "catalog_epoch": epoch,
                 "next_cursor": None if page.next_cursor is None else {
                     "updated_at": page.next_cursor[0], "session_id": page.next_cursor[1]}}
 
@@ -334,12 +397,13 @@ def create_chat_app(
         async with open_message_catalog() as catalog:
             try:
                 reader = catalog.reader(payload.session_id)
-                deleted, head = reader.deleted, reader.head()
+                deleted = await reader.deleted_async()
+                head = await reader.head_async()
             except (KeyError, ValueError) as error:
                 raise HTTPException(status_code=404, detail="会话不存在") from error
             if deleted:
                 raise HTTPException(status_code=404, detail="会话不存在")
-        seq = marks.mark(payload.session_id, min(payload.seq, head))
+        seq = await marks.mark(payload.session_id, min(payload.seq, head))
         return {"session_id": payload.session_id, "seq": seq}
 
     async def read_pins() -> dict[str, object]:
@@ -348,7 +412,7 @@ def create_chat_app(
         async with open_message_catalog() as catalog:
             refs = navigation.read()
             sessions = [row for ref in refs if ref.kind == "session"
-                        if (row := session_pin_row(catalog, ref.id)) is not None]
+                        if (row := await session_pin_row(catalog, ref.id)) is not None]
         return {"pins": [ref.model_dump() for ref in refs], "sessions": sessions}
 
     @app.get("/api/chat/navigation/pins")
@@ -364,66 +428,16 @@ def create_chat_app(
             # Replaying an already committed pin must not revalidate a temporarily missing target.
             if request.pinned and reference not in navigation.read():
                 if reference.kind == "session":
-                    if session_pin_row(catalog, reference.id) is None:
-                        raise HTTPException(status_code=400, detail="只能置顶没有项目归属的可见会话")
+                    if await session_pin_row(catalog, reference.id) is None:
+                        raise HTTPException(status_code=400, detail="只能置顶可见的会话")
                 else:
-                    try:
-                        if plugin_ui_scope is not None:
-                            async with plugin_ui_scope() as provider:
-                                await check_project_pin(provider, reference.id)
-                        else:
-                            await check_project_pin(_require_plugin_ui_provider(plugin_ui_provider), reference.id)
-                    except ValueError as error:
-                        raise HTTPException(status_code=400, detail=str(error)) from error
-                    except (PluginUiPluginUnavailable, PluginUiStaleRevision, PluginUiQueryOverloaded,
-                            PluginUiQueryTimeout, PluginUiRpcInvalidRequest, PluginUiRpcExecutionError) as error:
-                        raise _plugin_ui_http_error(error) from error
+                    await _check_scope_pin(check_scope, reference.kind, reference.id)
             navigation.update(reference, pinned=request.pinned)
         return await read_pins()
 
     @app.get("/api/chat/navigation")
     def chat_navigation() -> dict[str, str]:
         return {"dashboard_path": "/"}
-
-    @app.get("/api/chat/models")
-    async def chat_models(session_key: str = Query(default="")) -> dict[str, object]:
-        if model_catalog_reader is None:
-            raise HTTPException(status_code=503, detail="模型注册表不可用")
-        session_override = ""
-        session_effort = ""
-        if session_key:
-            if model_selection_reader is None:
-                raise HTTPException(status_code=503, detail="模型选择服务不可用")
-            async with open_message_catalog() as catalog:
-                metadata = catalog.reader(session_key).metadata()
-            try:
-                selection = await model_selection_reader(
-                    metadata if metadata is not None else {}
-                )
-            except RuntimeError as error:
-                if not ModelError.matches(error, ModelControlUnavailable):
-                    raise
-                raise HTTPException(
-                    status_code=503,
-                    detail="模型选择服务不可用",
-                ) from error
-            session_override = selection.model_id or ""
-            session_effort = selection.reasoning_effort or ""
-        try:
-            current = await model_catalog_reader()
-        except ModelCatalogUnavailable as error:
-            raise HTTPException(status_code=503, detail="模型注册表不可用") from error
-        return {
-            "generationId": current.revision,
-            "defaultRuntime": default_chat_model_id(current),
-            "sessionOverride": session_override,
-            "sessionSelection": {
-                "modelRef": session_override,
-                "reasoningEffort": session_effort,
-            },
-            "runtimes": project_chat_runtimes(current),
-            "unavailableRuntimes": project_unavailable_chat_runtimes(current),
-        }
 
     @app.get("/api/chat/plugin-ui/catalog")
     async def plugin_ui_catalog() -> dict[str, object]:
@@ -434,6 +448,7 @@ def create_chat_app(
 
     @app.get("/api/chat/plugin-ui/asset")
     async def plugin_ui_asset(
+        request: Request,
         plugin_id: str = Query(..., min_length=1, max_length=128),
         plugin_revision: str = Query(..., min_length=1, max_length=128),
         kind: Literal["module", "stylesheet"] = Query(...),
@@ -457,10 +472,20 @@ def create_chat_app(
                 )
         except (PluginUiPluginUnavailable, PluginUiStaleRevision) as error:
             raise _plugin_ui_http_error(error) from error
+        headers = {
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "Vary": "Accept-Encoding",
+        }
+        # 模块字节以 sha256 参数为内容指纹且 immutable;接受 gzip 时送缓存的压缩变体。
+        content = str(asset["content"])
+        body: str | bytes = content
+        if accepts_gzip_header(request.headers.get("accept-encoding", "")):
+            body = await run_file_io(lambda: _gzip_cached(sha256, content.encode("utf-8")))
+            headers["Content-Encoding"] = "gzip"
         return Response(
-            content=str(asset["content"]),
+            content=body,
             media_type="text/javascript" if kind == "module" else "text/css",
-            headers={"Cache-Control": "private, max-age=31536000, immutable"},
+            headers=headers,
         )
 
     @app.post("/api/chat/plugin-ui/query")
@@ -478,6 +503,9 @@ def create_chat_app(
             raise HTTPException(status_code=400, detail="插件参数不是有效 JSON") from error
         if len(encoded) > 64 * 1024:
             raise HTTPException(status_code=413, detail="插件参数超过 64 KiB")
+        # 插件按 session_id 读写会话数据；入口先把它限定在本通道，插件不必各自重做通道授权。
+        if request.session_id and not request.session_id.startswith(f"{channel.name}:"):
+            raise HTTPException(status_code=400, detail="插件查询只能指向本通道的会话")
         try:
             if plugin_ui_scope is not None:
                 async with plugin_ui_scope() as provider:
@@ -507,83 +535,27 @@ def create_chat_app(
         ) as error:
             raise _plugin_ui_http_error(error) from error
 
-    @app.get("/api/chat/model-calls/{call_id}")
-    async def model_call_stats(call_id: str) -> dict[str, object]:
-        """只返回模型 owner 的公开统计，不转发模型管理命令。"""
-        if model_call_stats_reader is None:
-            raise HTTPException(status_code=503, detail="模型调用统计不可用")
-        try:
-            return asdict(await model_call_stats_reader(call_id))
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="模型调用记录不存在") from error
-        except RuntimeError as error:
-            if not ModelError.matches(error, ModelControlUnavailable):
-                raise
-            raise HTTPException(status_code=503, detail=str(error)) from error
-
-    @app.get("/api/chat/runtime/documents")
-    async def list_runtime_documents() -> dict[str, object]:
-        try:
-            return await _require_runtime_inspection(runtime_inspection).list_documents()
-        except RuntimeInspectionError as error:
-            raise _runtime_http_error(error) from error
-
-    @app.get("/api/chat/runtime/documents/{document_id}")
-    async def read_runtime_document(document_id: str) -> dict[str, object]:
-        try:
-            return await _require_runtime_inspection(runtime_inspection).get_document(
-                document_id
-            )
-        except RuntimeInspectionError as error:
-            raise _runtime_http_error(error) from error
-
-    @app.get("/api/chat/runtime/jobs")
-    async def list_runtime_jobs() -> dict[str, object]:
-        try:
-            return await _require_runtime_inspection(runtime_inspection).list_jobs()
-        except RuntimeInspectionError as error:
-            raise _runtime_http_error(error) from error
-
-    @app.get("/api/chat/runtime/jobs/{job_id}")
-    async def read_runtime_job(job_id: str) -> dict[str, object]:
-        try:
-            return await _require_runtime_inspection(runtime_inspection).get_job(job_id)
-        except RuntimeInspectionError as error:
-            raise _runtime_http_error(error) from error
-
-    @app.get("/api/chat/runtime/capabilities")
-    async def list_runtime_capabilities() -> dict[str, object]:
-        try:
-            return await _require_runtime_inspection(
-                runtime_inspection
-            ).list_capabilities()
-        except RuntimeInspectionError as error:
-            raise _runtime_http_error(error) from error
-
-    @app.get("/api/chat/runtime/mcp")
-    async def read_runtime_mcp(
-        owner_id: str = Query(...),
-        name: str = Query(...),
-    ) -> dict[str, object]:
-        try:
-            return await _require_runtime_inspection(runtime_inspection).get_mcp(
-                owner_id,
-                name,
-            )
-        except RuntimeInspectionError as error:
-            raise _runtime_http_error(error) from error
-
     @app.get("/api/chat/sessions/{session_key:path}/messages")
     async def list_messages(
         session_key: str,
         page_size: int = Query(50, ge=1, le=200),
         before_seq: int | None = Query(default=None, ge=0),
         through_seq: int | None = Query(default=None, ge=-1),
+        after_seq: int | None = Query(default=None, ge=-1),
     ) -> dict[str, object]:
+        # after_seq 往新的方向读（查找跳到较早位置后向下补齐）；不带时照旧从尾部往前翻。
+        if after_seq is not None and before_seq is not None:
+            raise HTTPException(status_code=422, detail="after_seq 与 before_seq 不能同时使用")
         async with open_message_catalog() as catalog:
             try:
                 reader = catalog.reader(session_key)
-                page = reader.read_tail(
+                if after_seq is not None:
+                    newer = await reader.read_async(lambda current: current.read_page(
+                        after_seq=after_seq, through_seq=through_seq, limit=page_size))
+                    rows = await read_message_rows(cast(Any, newer), display_only=True, reader=channel.message_display)
+                    return {"version": 2, "items": rows, "through_seq": newer.through_seq,
+                            "has_more": newer.has_more, "after_seq": after_seq}
+                page = await reader.read_tail_async(
                     before_seq=before_seq, through_seq=through_seq, limit=page_size)
                 items = await read_message_rows(
                     cast(Any, page),
@@ -591,7 +563,7 @@ def create_chat_app(
                     reader=channel.message_display,
                 )
                 # 软删会话仍物理存在：如实返回消息并标记 deleted，供前端只读展示。
-                deleted = reader.deleted
+                deleted = await reader.deleted_async()
             except KeyError as error:
                 raise HTTPException(status_code=404, detail="会话不存在") from error
             except InvalidPage as error:
@@ -599,6 +571,25 @@ def create_chat_app(
         return {"version": 2, "items": items, "through_seq": page.through_seq,
                 "has_more": page.has_more, "deleted": deleted,
                 "before_seq": page.messages[0].seq if page.has_more else None}
+
+    # 会话内查找：服务端按完整历史匹配正文，返回命中消息的位置与摘要，前端据此预览并跳转。
+    # 空查询只建好索引（打开查找框时预热，长会话首建约半秒，输入完成前就绪）。
+    @app.get("/api/chat/sessions/{session_key:path}/search")
+    async def search_messages(
+        session_key: str,
+        q: str = Query(default="", max_length=200),
+        limit: int = Query(200, ge=1, le=500),
+    ) -> dict[str, object]:
+        async with open_message_catalog() as catalog:
+            try:
+                found = await catalog.reader(session_key).find_text_async(q, limit=limit)
+            except KeyError as error:
+                raise HTTPException(status_code=404, detail="会话不存在") from error
+        return {"version": 1, "query": q, "total": found.total, "capped": found.capped,
+                "through_seq": found.through_seq,
+                "items": [{"message_id": hit.message_id, "seq": hit.seq, "kind": hit.kind,
+                           "timestamp": hit.timestamp, "count": hit.count,
+                           "before": hit.before, "match": hit.match, "after": hit.after} for hit in found.hits]}
 
     @app.websocket("/ws")
     async def chat_ws(websocket: WebSocket, watch_sessions: bool = False) -> None:
@@ -632,7 +623,7 @@ def create_chat_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/chat/artifacts/{artifact_id}")
-    async def read_artifact(artifact_id: str) -> Response:
+    async def read_artifact(artifact_id: str, request: Request) -> Response:
         try:
             data, media_type, filename = await channel.read_artifact(artifact_id)
         except (RuntimeError, ValueError) as error:
@@ -650,20 +641,82 @@ def create_chat_app(
         # Any attachment can be opened as a document, including XHTML and XML.
         headers["Content-Security-Policy"] = "sandbox allow-scripts"
         headers["X-Content-Type-Options"] = "nosniff"
+        # 附件按 ID 只插入不覆盖（ledger artifact_store），同一 ID 内容永不变，ID 即强校验值。
+        # 每次仍经入口鉴权再回 304：退出登录后浏览器缓存里的附件不能绕过登录直接读出。
+        etag = f'"{artifact_id}"'
+        headers["Cache-Control"] = "private, no-cache"
+        headers["ETag"] = etag
+        if etag in (item.strip() for item in request.headers.get("if-none-match", "").split(",")):
+            return Response(status_code=304, headers={"Cache-Control": headers["Cache-Control"], "ETag": etag})
         return Response(
             content=data,
             media_type=media_type or "application/octet-stream",
             headers=headers,
         )
 
-    @app.get("/api/chat/media")
-    def read_media(path: str = Query(...)) -> FileResponse:
-        requested = Path(path).expanduser().resolve()
-        if not _can_read_media(channel, requested):
-            raise HTTPException(status_code=404, detail="文件不存在")
-        if not requested.is_file():
-            raise HTTPException(status_code=404, detail="文件不存在")
-        return FileResponse(requested)
+    @app.post("/api/chat/downloads")
+    async def create_ephemeral_download(
+        request: Request,
+        filename: str = Query(default="download.png"),
+    ) -> dict[str, str]:
+        media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if media_type not in _EPHEMERAL_DOWNLOAD_TYPES:
+            raise HTTPException(status_code=415, detail="不支持的下载文件类型")
+        declared_length = request.headers.get("content-length")
+        if declared_length is not None:
+            try:
+                declared = int(declared_length)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Content-Length 非法") from exc
+            if declared < 0:
+                raise HTTPException(status_code=400, detail="Content-Length 非法")
+            if declared > _EPHEMERAL_DOWNLOAD_MAX_ITEM_BYTES:
+                raise HTTPException(status_code=413, detail="下载文件超过 20MB 限制")
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > _EPHEMERAL_DOWNLOAD_MAX_ITEM_BYTES:
+                raise HTTPException(status_code=413, detail="下载文件超过 20MB 限制")
+            chunks.append(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="下载内容为空")
+        data = b"".join(chunks)
+        now = time.monotonic()
+        pool_bytes = _prune_ephemeral_downloads(now)
+        while ephemeral_downloads and (
+            len(ephemeral_downloads) >= _EPHEMERAL_DOWNLOAD_MAX_ITEMS
+            or pool_bytes + len(data) > _EPHEMERAL_DOWNLOAD_MAX_TOTAL_BYTES
+        ):
+            oldest_key = next(iter(ephemeral_downloads))
+            pool_bytes -= len(ephemeral_downloads[oldest_key][0])
+            del ephemeral_downloads[oldest_key]
+        token = secrets.token_urlsafe(24)
+        safe_name = _safe_download_filename(filename)
+        ephemeral_downloads[token] = (data, media_type, safe_name, now + _EPHEMERAL_DOWNLOAD_TTL_S)
+        return {"url": f"/api/chat/downloads/{token}", "filename": safe_name}
+
+    @app.get("/api/chat/downloads/{token}")
+    async def read_ephemeral_download(token: str) -> Response:
+        if _EPHEMERAL_TOKEN_RE.fullmatch(token) is None:
+            raise HTTPException(status_code=404, detail="下载链接不存在或已过期")
+        _ = _prune_ephemeral_downloads(time.monotonic())
+        item = ephemeral_downloads.get(token)
+        if item is None:
+            raise HTTPException(status_code=404, detail="下载链接不存在或已过期")
+        data, media_type, safe_name, _expires_at = item
+        return Response(
+            content=data,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": _attachment_disposition(safe_name),
+                "Content-Security-Policy": "sandbox",
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
 
     return app
 
@@ -673,23 +726,17 @@ def build_chat_server(
     workspace: Path,
     channel: WebChatChannel,
     navigation: NavigationPreferences | None = None,
+    check_scope: Callable[[str, str], Awaitable[None]] | None = None,
     read_marks: ReadMarks | None = None,
-    runtime_inspection: RuntimeInspectionService | None = None,
     message_display: MessageDisplayReader | None = None,
     plugin_ui_provider: PluginUiProvider | None = None,
     plugin_ui_scope: Callable[[], Any] | None = None,
     web_ui_provider: WebUiProvider | None = None,
-    model_catalog_reader: Callable[[], Awaitable[ModelCatalogSnapshot]] | None = None,
-    model_call_stats_reader: Callable[[str], Awaitable[ModelCallStats]] | None = None,
-    model_selection_reader: Callable[
-        [Mapping[str, object]], Awaitable[ChatModelSelection]
-    ] | None = None,
     messages: MessageCatalog | None = None,
     reply_status: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None,
     follow_active_sessions: ActiveSessionsFollowPort | None = None,
     message_scope: Callable[[], Any] | None = None,
     session_admin_scope: Callable[[], Any] | None = None,
-    attachment_store: AttachmentStore | None = None,
     artifact_store: ChannelAttachmentArtifactStore | None = None,
     uds: str,
 ) -> uvicorn.Server:
@@ -698,73 +745,43 @@ def build_chat_server(
             workspace=workspace,
             channel=channel,
             navigation=navigation,
+            check_scope=check_scope,
             read_marks=read_marks,
-            runtime_inspection=runtime_inspection,
             message_display=message_display,
             plugin_ui_provider=plugin_ui_provider,
             plugin_ui_scope=plugin_ui_scope,
             web_ui_provider=web_ui_provider,
-            model_catalog_reader=model_catalog_reader,
-            model_call_stats_reader=model_call_stats_reader,
-            model_selection_reader=model_selection_reader,
             messages=messages,
             reply_status=reply_status,
             follow_active_sessions=follow_active_sessions,
             message_scope=message_scope,
             session_admin_scope=session_admin_scope,
-            attachment_store=attachment_store,
             artifact_store=artifact_store,
         ),
         uds=uds,
         log_level="warning",
         access_log=False,
+        timeout_keep_alive=30,
         timeout_graceful_shutdown=10,
     )
     return ChatApiServer(config)
 
 
-class ChatApiServer(uvicorn.Server):
-    """Chat API 的退出请求立即进入 uvicorn 优雅关闭。"""
-
-    def __init__(self, config: uvicorn.Config) -> None:
-        self._exit_loop: asyncio.AbstractEventLoop | None = None
-        self._exit_event: asyncio.Event | None = None
-        self._exit_requested = False
-        super().__init__(config)
-
-    @property
-    def should_exit(self) -> bool:
-        return self._exit_requested
-
-    # uvicorn 只轮询该标志；置位时同时通知主循环，可能来自信号处理器。
-    @should_exit.setter
-    def should_exit(self, value: bool) -> None:
-        self._exit_requested = value
-        loop, event = self._exit_loop, self._exit_event
-        if value and loop is not None and event is not None and not loop.is_closed():
-            _ = loop.call_soon_threadsafe(event.set)
-
-    # 未请求退出时保持 uvicorn 每 0.1s 一次的 on_tick 节拍。
-    async def main_loop(self) -> None:
-        self._exit_event = asyncio.Event()
-        self._exit_loop = asyncio.get_running_loop()
-        counter = 0
-        should_exit = await self.on_tick(counter)
-        while not should_exit:
-            counter = (counter + 1) % 864000
-            try:
-                _ = await asyncio.wait_for(self._exit_event.wait(), timeout=0.1)
-            except TimeoutError:
-                pass
-            should_exit = await self.on_tick(counter)
+ChatApiServer = PromptShutdownServer
 
 
-def _require_runtime_inspection(
-    service: RuntimeInspectionService | None,
-) -> RuntimeInspectionService:
-    if service is None:
-        raise HTTPException(status_code=503, detail="运行时检查服务不可用")
-    return service
+# 维度值置顶交给该维度 owner 的接纳判定；owner 缺席或判定拒绝都不写入偏好。
+async def _check_scope_pin(
+    check: Callable[[str, str], Awaitable[None]] | None, dimension: str, value: str,
+) -> None:
+    if check is None:
+        raise HTTPException(status_code=503, detail="会话维度判定暂不可用")
+    try:
+        await check(dimension, value)
+    except PermissionError as error:
+        raise HTTPException(status_code=400, detail=f"没有插件负责这个维度: {dimension}") from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 def _require_plugin_ui_provider(
@@ -791,26 +808,3 @@ def _plugin_ui_http_error(error: Exception) -> HTTPException:
     if isinstance(error, PluginUiRpcInvalidRequest):
         return HTTPException(status_code=400, detail=str(error))
     return HTTPException(status_code=502, detail=str(error))
-
-
-def _runtime_http_error(error: RuntimeInspectionError) -> HTTPException:
-    if error.code == "inspection_unavailable":
-        return HTTPException(status_code=503, detail=str(error))
-    status_code = 404 if error.code.endswith("_not_found") else 409
-    return HTTPException(status_code=status_code, detail=str(error))
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        _ = path.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _can_read_media(channel: WebChatChannel, path: Path) -> bool:
-    if any(_is_relative_to(path, root.resolve()) for root in channel.upload_roots()):
-        return True
-    if channel.has_media(path):
-        return True
-    return False

@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import logging
 import asyncio
+import json
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
 from functools import partial
+from types import TracebackType
 from typing import Any, cast
 from uuid import uuid4
 
 from core.common.diagnostic_log import log_timing
+from core.common.file_io import run_file_io
 from agent.plugin_composition import Context, RuntimeScope
+from agent.plugin_composition.tasks import interrupt_requested
+from plugins.ledger.contract import LENGTH_CUT_NOTICE, has_partial_text, length_rejection_hint
 from plugins.ledger.contract import (
+    HistoryWindow,
     MessageConflict,
     MessageReader,
     MessageSnapshot,
@@ -24,10 +32,15 @@ from plugins.models.contract import (
     StreamCallback,
 )
 from plugins.models.contract import (
+    ContentSafetyError,
     ContextLengthError,
     EmptyResponseError,
+    InputReductionRequired,
     OutputLengthError,
     ModelError,
+    RetryWaitInterrupted,
+    content_rejection_reason,
+    is_content_rejection,
 )
 from plugins.models.contract import BoundChatModel
 from plugins.ledger.contract import (
@@ -40,6 +53,7 @@ from plugins.ledger.contract import (
     Part,
     ToolCall,
     ToolResult,
+    json_value,
 )
 from plugins.content.contract import (
     ContentView as ContentView,
@@ -73,32 +87,192 @@ inject = ()
 Preview = Callable[[str], AbstractContextManager[StreamCallback]]
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass(frozen=True, slots=True)
 class StepLimit(ModelError):
-    """本次程序达到明确的模型请求上限，保留日志供来源继续控制。"""
+    """本次程序达到明确的模型请求上限，保留日志供来源继续控制。
+
+    只在未完成区段含未回执工具调用时抛出：这些调用可能已有外部效果，
+    引擎不能替用户作废它们，只能停下并如实报告。
+    """
+
+
+# 引擎放弃未完成区段的持久原因前缀；来源与界面按它区分人工与自动放弃。
+STEP_LIMIT_ABANDON = "步数上限放弃"
+# 撞线但本段还有未回执调用时的失败前缀：来源只记 failure，界面按它提供放弃出口。
+# 这类失败重试不会生效——计数与未回执调用都还在，下一次仍在请求之前撞同一条门槛。
+STEP_LIMIT_FAILURE = "步数上限失败"
+
+
+def step_limit_abandon_reason(max_steps: int) -> str:
+    return (
+        f"{STEP_LIMIT_ABANDON}：本轮连续 {max_steps} 次模型请求都没有收尾，"
+        "本轮到此结束，未完成的工作不再继续；接下来的一句话将重新开始计数。"
+    )
+
+
+def step_limit_failure_reason(max_steps: int, unfinished: int) -> str:
+    return (
+        f"{STEP_LIMIT_FAILURE}：本轮连续 {max_steps} 次模型请求都没有收尾，已经停下。"
+        f"其中 {unfinished} 个工具调用没有拿到回执，状态未知（可能已部分执行），"
+        "所以没有自动作废。请先检查当前状态；重试不会生效，发新消息会重新开始计数并接着结算这些调用。"
+        "确实要丢掉这一轮，请点「放弃本轮未完成的工作」或发送 /abandon。"
+    )
 
 
 class _Superseded(Exception):
     """提交前提检查发现同来源新事实；被替代的旧草稿不写 failure。"""
 
 
+TOOL_FAILURE_LIMIT = 3
+TOOL_FAILURE_HINT_LIMIT = 2
+# 已提交拒绝的原因前缀；历史重放据此区分保护提示与原工具错误。
+TOOL_FAILURE_HINT = "重复失败保护："
+
+
+def _tool_key(name: str, arguments: Mapping[str, object] | str) -> tuple[str, str]:
+    return name, json.dumps(json_value(arguments), sort_keys=True, separators=(",", ":"))
+
+
+@dataclass(slots=True)
+class _ToolAttempt:
+    key: tuple[str, str]
+    output_id: str
+    name: str
+    ready: bool = False
+    error: str | None = None
+    blocked: bool = False
+
+
+class _ToolFailures:
+    """按调用顺序折叠本轮已提交失败；只保留连续失败和未结算批次。"""
+
+    def __init__(self, tool_name: Callable[[str], str]) -> None:
+        self._name = tool_name
+        self.reset()
+
+    # 新输入、停止、收尾或放弃开启新的失败计数，迟到的旧结果（含「未执行」回执）不参与。
+    def reset(self) -> None:
+        self._pending: dict[CallRef, _ToolAttempt] = {}
+        self._queue: deque[_ToolAttempt] = deque()
+        self._key: tuple[str, str] | None = None
+        self._count = 0
+        self._blocked = 0
+        self._blocked_output: str | None = None
+        self._failed_name = ""
+        self._error = ""
+
+    # 回执可能晚于同批协议拒绝；等前驱就绪后再按调用位置计数。
+    def update(self, message: Message) -> None:
+        body = message.body
+        if isinstance(body, Input) or isinstance(body, Control) and body.action in {"abandon", "pause"}:
+            self.reset()
+        elif isinstance(body, Output):
+            if body.finish != "continue":
+                self.reset()
+                return
+            self._add_output(message.message_id, body)
+        elif isinstance(body, ToolResult):
+            attempt = self._pending.pop(body.call_ref, None)
+            if attempt is not None:
+                attempt.ready = True
+                if body.outcome in {"error", "denied"}:
+                    detail = " ".join(str(part.value)[:500] for part in body.parts[:3])
+                    attempt.error = f"{body.outcome}: {detail}"[:500]
+        self._drain()
+
+    # 使用原模型调用名与参数；间接调用的 wire 事实已由投影 owner 保存。
+    def _add_output(self, message_id: str, output: Output) -> None:
+        wire: Mapping[str, Mapping[str, object]] = {}
+        for part in output.parts:
+            if isinstance(part, ContentPart) and part.kind == "model.facts":
+                facts = cast(Mapping[str, object], part.value)
+                wire = cast(Mapping[str, Mapping[str, object]], facts.get("wire_tool_calls", {}))
+        for index, part in enumerate(output.parts):
+            if isinstance(part, ToolCall):
+                name = self._name(part.binding_id)
+                raw = wire.get(str(index))
+                key = (_tool_key(name, part.arguments) if raw is None
+                       else _tool_key(cast(str, raw["name"]), cast(Mapping[str, object], raw["arguments"])))
+                attempt = _ToolAttempt(key, message_id, name)
+                self._pending[CallRef(message_id, index)] = attempt
+            elif isinstance(part, ContentPart) and part.kind == "model.tool_rejection":
+                rejected = cast(Mapping[str, object], part.value)
+                error = cast(str, rejected["error"])
+                key = _tool_key(cast(str, rejected["name"]), cast(Mapping[str, object] | str, rejected["arguments"]))
+                attempt = _ToolAttempt(key, message_id, key[0], ready=True,
+                                       error=error[:500], blocked=error.startswith(TOOL_FAILURE_HINT))
+            else:
+                continue
+            self._queue.append(attempt)
+
+    # success/interrupted 或不同调用打断连续失败；保护提示不覆盖原始错误。
+    def _drain(self) -> None:
+        while self._queue and self._queue[0].ready:
+            attempt = self._queue.popleft()
+            if attempt.key != self._key or attempt.error is None:
+                self._key = attempt.key
+                self._count = self._blocked = 0
+                self._blocked_output = None
+                self._failed_name = ""
+                self._error = ""
+            if attempt.error is None:
+                continue
+            if attempt.blocked:
+                if attempt.output_id != self._blocked_output:
+                    self._blocked += 1
+                    self._blocked_output = attempt.output_id
+            else:
+                self._count += 1
+                self._failed_name = attempt.name
+                self._error = attempt.error
+
+    # 达到失败门槛后，下一次相同请求只保存可行动的协议拒绝。
+    def rejection(self, name: str, arguments: Mapping[str, object] | str) -> str | None:
+        if self._key != _tool_key(name, arguments) or self._count < TOOL_FAILURE_LIMIT:
+            return None
+        return (
+            f"{TOOL_FAILURE_HINT}工具 {self._failed_name} 已用相同参数连续失败 {self._count} 次，"
+            f"本次未执行。最后错误：{self._error}。请换方案或向用户说明；"
+            "若仍重复，本轮将停止。先检查现场，失败不证明之前没有产生外部效果。"
+        )
+
+    # 提示之后仍重复才结束，批内多个真实失败不能跳过提示直接终止。
+    def failure(self) -> str | None:
+        if self._blocked < TOOL_FAILURE_HINT_LIMIT:
+            return None
+        assert self._key is not None
+        return (
+            f"工具重复失败：{self._failed_name} 使用相同参数连续失败 {self._count} 次，"
+            f"收到纠正提示后仍重复请求，本轮已停止。最后错误：{self._error}。"
+            "请检查工具状态或权限后发送新输入继续；新输入会重新计数。"
+        )
+
+
 class _History:
     """按新消息推进本来源的执行视图；旧前缀变化时从事实重建。"""
 
-    def __init__(self, source: str, max_steps: int) -> None:
+    def __init__(self, source: str, tool_name: Callable[[str], str]) -> None:
         self.source = source
-        self._max_steps = max_steps
-        self._exhausted = False
+        self._tool_name = tool_name
+        self.failures = _ToolFailures(tool_name)
         self.messages: Sequence[Message] = ()
         self.head = -1
         self.reminder_input_id: str | None = None
         self._boundary = -1
         self._abandoned_upto = -1
+        # 停止覆盖它之前已提交的全部调用；resume 只撤销新输入到来之前的停止。
+        self._stopped_upto = -1
+        self._stop_floor = -1
         self._calls: dict[CallRef, int] = {}
         self._results: set[CallRef] = set()
         self._succeeded: set[CallRef] = set()
         self._terminal_calls: list[tuple[CallRef, int, str]] = []
         self._outputs: list[int] = []
+        # Own Input/resume grants a new budget; complete/abandon closes the old one.
+        self.generation_rejections: list[tuple[int, str]] = []
 
     def update(self, messages: Sequence[Message]) -> None:
         """已提交读面证明前缀；普通序列仍逐条核对真实 Message 身份。"""
@@ -111,24 +285,25 @@ class _History:
             )
         )
         if not compatible:
-            self.__init__(self.source, self._max_steps)
+            self.__init__(self.source, self._tool_name)
             previous = ()
         for message in messages[len(previous):]:
             if message.source != self.source:
                 continue
             self.head = message.seq
+            self.failures.update(message)
             body = message.body
             if isinstance(body, Input):
-                # 只有已失败的满额执行能由新输入续额；工具与 Turn 边界保持原样。
-                if self._exhausted:
-                    self._outputs.clear()
-                    self._exhausted = False
                 self.reminder_input_id = message.message_id
+                self.generation_rejections.clear()
+                self._stop_floor = self._stopped_upto
+                # 同一回合内只有用户插话会写 Input，后台来源的 Input 各有自己的回合预算。
+                self._outputs.clear()
             elif isinstance(body, Output):
                 if body.finish != "continue":
                     self._boundary = message.seq
                     self._outputs.clear()
-                    self._exhausted = False
+                    self.generation_rejections.clear()
                 elif any(isinstance(part, ContentPart) and part.kind == "model.facts"
                          for part in body.parts):
                     self._outputs.append(message.seq)
@@ -139,16 +314,20 @@ class _History:
                             self._calls[ref] = message.seq
                         if body.finish == "continue":
                             self._terminal_calls.append((ref, message.seq, part.binding_id))
+                    elif isinstance(part, ContentPart) and part.kind == "model.facts" and body.finish == "continue":
+                        facts = cast(Mapping[str, object], part.value)
+                        if "generation_rejection" in facts:
+                            self.generation_rejections.append((message.seq, cast(str, facts["generation_rejection"])))
             elif isinstance(body, Control) and body.action == "abandon":
                 self._boundary = max(self._boundary, body.through_seq)
                 self._abandoned_upto = max(self._abandoned_upto, body.through_seq)
                 self._outputs = [seq for seq in self._outputs if seq > body.through_seq]
-                self._exhausted = False
-            elif isinstance(body, Control) and body.action == "failure":
-                self._exhausted = (
-                    self._max_steps > 0 and self.steps >= self._max_steps
-                    and self._outputs[-1] <= body.through_seq
-                )
+                self.generation_rejections = [(seq, kind) for seq, kind in self.generation_rejections if seq > body.through_seq]
+            elif isinstance(body, Control) and body.action == "pause":
+                self._stopped_upto = message.seq
+            elif isinstance(body, Control) and body.action == "resume":
+                self._stopped_upto = self._stop_floor
+                self.generation_rejections.clear()
             elif isinstance(body, ToolResult):
                 self._results.add(body.call_ref)
                 self._calls.pop(body.call_ref, None)
@@ -156,16 +335,21 @@ class _History:
                     self._succeeded.add(body.call_ref)
         self.messages = messages
 
+    # 这一段恢复里是否已有保留下来的截断正文。
+    def has_kept_text(self) -> bool:
+        seqs = {seq for seq, _kind in self.generation_rejections}
+        return any(message.seq in seqs and has_partial_text(message.body) for message in self.messages)
+
     @property
     def steps(self) -> int:
         return len(self._outputs)
 
     def open_calls(self) -> tuple[tuple[CallRef, ...], tuple[CallRef, ...]]:
-        """保留调用顺序；已关闭但未结算的旧调用仍可由之后的 abandon 结算。"""
+        """保留调用顺序；已关闭但未结算的旧调用仍可由之后的 abandon 结算，停止只结算未闭段。"""
         pending: list[CallRef] = []
         abandoned: list[CallRef] = []
         for ref, seq in self._calls.items():
-            if seq <= self._abandoned_upto:
+            if seq <= self._abandoned_upto or self._boundary < seq < self._stopped_upto:
                 abandoned.append(ref)
             elif seq > self._boundary:
                 pending.append(ref)
@@ -226,7 +410,7 @@ async def _settle(
     commit_after: _OrderGate | None = None,
     scope: RuntimeScope | None = None,
 ) -> None:
-    """普通取消等待原调用；明确放弃由 Tools 提交终态并释放等待者。"""
+    """普通撤权等工具自然结束；用户停止的中断才传给工具，再等待 Tools 保存终态并释放资源。"""
     # scope 由 owner task 预先取得；子任务里再取 lease 会丢失授权。
     if scope is None and capture_scope is not None:
         scope = capture_scope()
@@ -251,10 +435,18 @@ async def _settle(
         try:
             _ = await asyncio.shield(work)
         except asyncio.CancelledError as cancellation:
+            # 中断只传给工具一次；之后的取消不能打断 Tools 的回执提交和 owner 收尾。
+            interrupted = interrupt_requested()
+            if interrupted:
+                _ = work.cancel()
             while not work.done():
                 try:
                     _ = await asyncio.shield(work)
                 except asyncio.CancelledError:
+                    # 新输入撤权后用户又点停止：等待中升级为中断。
+                    if not interrupted and interrupt_requested():
+                        interrupted = True
+                        _ = work.cancel()
                     continue
                 except Exception as failure:
                     raise cancellation from failure
@@ -266,6 +458,16 @@ async def _settle(
     finally:
         if scope is not None:
             await scope.close()
+
+
+_SERIAL_NOTED: set[str] = set()
+
+
+# 并行判断失败退回串行；同一 binding 只记一次。
+def _note_serial_fallback(binding_id: str) -> None:
+    if binding_id not in _SERIAL_NOTED:
+        _SERIAL_NOTED.add(binding_id)
+        logger.warning("[fallback] 工具并行判断失败，退回串行: binding=%.40s", binding_id)
 
 
 def _parallel(reader: MessageReader, tools: ToolMenu, call: CallRef) -> bool:
@@ -280,15 +482,13 @@ def _parallel(reader: MessageReader, tools: ToolMenu, call: CallRef) -> bool:
     try:
         return tools.parallel(part.binding_id) is True
     except Exception:
+        _note_serial_fallback(part.binding_id)
         return False
 
 
 def _committed(reader: MessageReader, call: CallRef) -> bool:
     """本调用的 ToolResult 已经在日志里；错误回执也算提交完成。"""
-    return reader.scan(lambda rows: any(
-        isinstance(message.body, ToolResult) and message.body.call_ref == call
-        for message in rows
-    ))
+    return reader.result_committed(call)
 
 
 async def _run_ordered(
@@ -303,8 +503,14 @@ async def _run_ordered(
     try:
         await _settle(tools, call, commit_after=commit_after, scope=scope)
     except BaseException:
-        # 已落盘的回执放行后继；提交前失败或被前驱中止时不能把后继门打开。
-        if _committed(reader, call):
+        # 已落盘的回执放行后继；提交前失败、被前驱中止或查询本身异常时不能把后继门打开，
+        # 且必须保留原始异常而不是被查询异常掩盖（#2117）。
+        committed = False
+        try:
+            committed = _committed(reader, call)
+        except Exception:
+            committed = False
+        if committed:
             gate.release()
         else:
             gate.abort()
@@ -323,6 +529,7 @@ async def _settle_group(
     """同组调用重叠执行；提交门只在前驱完成后打开。"""
     gates = [_OrderGate() for _ in calls]
     tasks: list[asyncio.Task[None]] = []
+    scopes: list[RuntimeScope] = []
     in_flight: set[asyncio.Task[None]] = set()
     try:
         for index, call in enumerate(calls):
@@ -333,6 +540,8 @@ async def _settle_group(
                     if failure is not None:
                         raise failure
             scope = None if capture_scope is None else capture_scope()
+            if scope is not None:
+                scopes.append(scope)
             task = asyncio.create_task(_run_ordered(
                 reader, tools, call, gates[index], gates[index - 1] if index else None, scope,
             ))
@@ -340,11 +549,30 @@ async def _settle_group(
             in_flight.add(task)
         for task in tasks:
             await task
-    finally:
+    except asyncio.CancelledError:
+        # 同组调用各自读取当前 Task 的中断状态：撤权时等结果，中断时停下。
         for task in tasks:
             _ = task.cancel()
         if tasks:
+            await _drain_group(tasks)
+        raise
+    finally:
+        # 普通失败仍收集同批已启动调用；子任务首次运行前就被取消时其未进入的 scope 由这里兜底释放（#2116）。
+        if tasks:
             _ = await asyncio.gather(*tasks, return_exceptions=True)
+        for scope in scopes:
+            scope.discard()
+
+
+# 同组调用排空期间又收到中断时继续转给它们；排空完成前不离开。
+async def _drain_group(tasks: Sequence[asyncio.Task[None]]) -> None:
+    while not all(task.done() for task in tasks):
+        try:
+            _ = await asyncio.shield(asyncio.gather(*tasks, return_exceptions=True))
+        except asyncio.CancelledError:
+            if interrupt_requested():
+                for task in tasks:
+                    _ = task.cancel()
 
 
 async def _settle_pending(
@@ -368,6 +596,29 @@ async def _settle_pending(
         index = end
 
 
+class _StepAttempts:
+    """退避被叫醒时结束本步且不提交，未用的尝试额度带给下一步；生成成功后清空。"""
+
+    def __init__(self) -> None:
+        self.remaining: int | None = None
+
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        if exc is None:
+            self.remaining = None
+            return False
+        failure = ModelError.read(exc, RetryWaitInterrupted)
+        if not isinstance(failure, RetryWaitInterrupted):
+            return False
+        self.remaining = failure.remaining_attempts
+        return True
+
+
 @asynccontextmanager
 async def _complete(
     snapshot: Sequence[Message], prepared: Materials, *, source: str,
@@ -376,11 +627,16 @@ async def _complete(
     preview: Preview | None,
     reminder_input_id: str | None,
     operation_id: str = "",
+    max_retry_wait: float | None = None,
+    retry_wake: asyncio.Event | None = None,
+    max_attempts: int | None = None,
+    kept_text: bool = False,
 ) -> AsyncGenerator[tuple[LLMResponse, Materials, str, ModelRequest]]:
     """缩减只更新已取得材料中的摘要；provider 容量拒绝最多重试一次。"""
     mark = partial(log_timing, session_id=snapshot[-1].session_id if snapshot else "",
                    source=source, operation_id=operation_id)
     # 1. 本地容量与软水位先交给同一摘要 owner，其他材料不重新获取。
+    # 组装要折叠全史并核对调用账，冷读可达数秒，放进 worker 不占事件循环。
     def build(mats: Materials) -> tuple[ModelRequest, str | None]:
         mark("context.build.begin")
         result = context.build_attempt(snapshot, materials=mats, model=projection,
@@ -389,7 +645,9 @@ async def _complete(
         mark("context.build.end")
         return result
 
-    async def reduce_request(mats: Materials, request: ModelRequest, *, force: bool) -> tuple[Materials, Mapping[str, object] | None]:
+    async def reduce_request(
+        mats: Materials, request: ModelRequest, *, force: bool, required: bool = True,
+    ) -> tuple[Materials, Mapping[str, object] | None]:
         """压缩预览只显示状态；可见诊断随冻结材料进入最终 Output。"""
         assert reduce is not None
         notices = list(cast(Sequence[str], mats.get("notices", ())))
@@ -403,19 +661,20 @@ async def _complete(
                     await callback({"retry_status": text})
 
             mark("context.reduce.begin")
-            summary = await reduce(tuple(snapshot), mats, request, model, projection,
-                                   source=source, force=force, on_status=report)
+            reducer = reduce if required else partial(reduce, required=False)
+            summary = await reducer(tuple(snapshot), mats, request, model, projection,
+                                    source=source, force=force, on_status=report)
             mark("context.reduce.end")
         return ({**mats, "notices": tuple(notices)} if notices else mats), summary
 
-    request, rejection = build(prepared)
+    request, rejection = await run_file_io(lambda: build(prepared))
     if rejection is not None and reduce is None:
         raise ContextLengthError(rejection).exception()
     if reduce is not None:
         prepared, summary = await reduce_request(prepared, request, force=rejection is not None)
         if summary is not None and summary != prepared.get("summary"):
             prepared = {**prepared, "summary": summary}
-            request, rejection = build(prepared)
+            request, rejection = await run_file_io(lambda: build(prepared))
         if rejection is not None:
             raise ContextLengthError(rejection).exception()
     # 2. 每份新组装的请求拥有新身份；本次调用内的网络重试仍由 Models 复用该 key。
@@ -430,38 +689,113 @@ async def _complete(
 
         async def generate(
             request: ModelRequest, request_key: str, callback: StreamCallback | None,
+            *, max_attempts: int | None = None, reduce_on_empty: bool = False,
         ) -> LLMResponse:
             mark("model.begin", request_id=request_key)
-            response = await model.complete(replace(request, on_delta=callback, request_key=request_key))
+            try:
+                response = await model.complete(replace(
+                    request, on_delta=callback, request_key=request_key, max_retry_wait=max_retry_wait,
+                    retry_wake=retry_wake, max_attempts=max_attempts, reduce_on_empty=reduce_on_empty,
+                ))
+            except (RuntimeError, TimeoutError) as error:
+                if not is_content_rejection(error):
+                    raise
+                raise ModelError.change(error, message=content_rejection_reason(
+                    str(error), may_be_config=not ModelError.matches(error, ContentSafetyError),
+                )) from error
             mark("model.end", request_id=request_key)
             return response
 
         message_id, request_key, callback = begin()
+        # 已有保留正文时零输出不算失败：缩减帮得上就接着写，帮不上就交给调用者收尾。
+        zero_output: LLMResponse | None = None
         try:
-            response = await generate(request, request_key, callback)
+            response = await generate(
+                request, request_key, callback, max_attempts=max_attempts, reduce_on_empty=reduce is not None,
+            )
+            # 没有摘要 owner 时缩减不可用，保持长度拒绝的反馈恢复。
+            if reduce is not None:
+                zero_output = response if kept_text else None
+                _check_output_room(response)
         except (RuntimeError, TimeoutError) as error:
-            failure = ModelError.read(error, ContextLengthError)
+            failure = ModelError.read(error, ContextLengthError, InputReductionRequired)
             if failure is None:
                 raise
             previews.close()
-            # 强制缩减重试每代至多一次，且只适用于可证明的容量拒绝——
-            # send_evidence="rejected" 是 provider HTTP 拒绝应答的正面证据；
-            # HTTP 200 流内失败无论是否观察到 delta 都不得缩减后重发同一
-            # 请求。
-            if reduce is None or failure.send_evidence != "rejected":
+            # A capacity refusal requires a real reduction; empty output only asks for an optimization.
+            # The follow-up key spends the remaining budget and cannot request another empty-output reduction.
+            if reduce is None or isinstance(failure, ContextLengthError) and failure.response_delta_seen:
                 raise
-            prepared, summary = await reduce_request(prepared, request, force=True)
-            if summary is None or summary == prepared.get("summary"):
+            required = isinstance(failure, ContextLengthError) and zero_output is None
+            prepared, summary = await reduce_request(prepared, request, force=True, required=required)
+            reduced = summary is not None and summary != prepared.get("summary")
+            if reduced:
+                prepared = {**prepared, "summary": summary}
+                request, rejection = await run_file_io(lambda: build(prepared))
+                if rejection is not None:
+                    raise ContextLengthError(rejection).exception()
+            elif required:
                 raise
-            prepared = {**prepared, "summary": summary}
-            request, rejection = build(prepared)
-            if rejection is not None:
-                raise ContextLengthError(rejection).exception()
-            message_id, request_key, callback = begin()
-            # 第二次调用在 except 内；再次拒绝直接上抛，不产生第三次请求。
-            response = await generate(request, request_key, callback)
+            elif zero_output is None:
+                notices = cast(Sequence[str], prepared.get("notices", ()))
+                prepared = {**prepared, "notices": (*notices, "本次压缩优化未缩减输入，保留原请求并继续本步剩余尝试额度。")}
+            if zero_output is not None and not reduced:
+                response = zero_output
+            else:
+                message_id, request_key, callback = begin()
+                # 第二次调用在 except 内；再次拒绝直接上抛，不产生第三次请求。
+                response = await generate(
+                    request, request_key, callback,
+                    max_attempts=failure.remaining_attempts if isinstance(failure, InputReductionRequired) else max_attempts,
+                )
+                if not kept_text:
+                    _check_output_room(response)
         # 3. 草稿持续到调用者完成解码与 CAS；异常和取消也会释放预览。
         yield response, prepared, message_id, request
+
+
+# 零输出 length 说明输入占满实际窗口，减少输出的反馈帮不上忙；按容量拒绝走单次强制缩减，有正文、推理或被丢弃片段的不算。
+def _no_output_room(response: LLMResponse) -> bool:
+    usage = response.usage
+    return not (
+        response.finish_reason != "length"
+        or (response.content and response.content.strip())
+        or response.thinking
+        or response.tool_calls
+        or response.output_discarded
+        or (usage is not None and (usage.output_tokens or usage.reasoning_output_tokens))
+    )
+
+
+def _check_output_room(response: LLMResponse) -> None:
+    if not _no_output_room(response):
+        return
+    raise ContextLengthError(
+        "模型没有产生任何输出就达到了长度限制，输入可能已占满模型实际可用的上下文窗口。"
+        "压缩后仍无法生成；请减少上下文或换用窗口更大的模型后继续。"
+    ).exception()
+
+
+_MAX_GENERATION_RECOVERIES = 3
+
+
+# Rejected generations become durable feedback, never executable tool calls.
+def _response_rejection(reason: str | None, budget: int) -> str | None:
+    if reason == "length":
+        return length_rejection_hint(budget)
+    if reason == "malformed_function_call":
+        return "上次模型生成了无法解析的工具调用，全部调用均未执行。请按工具 schema 重新生成完整的 JSON 参数。"
+    return None
+
+
+# Enforce the same limit after a commit and before resuming a crashed generation.
+def _check_generation_recovery(count: int, reason: str | None, budget: int) -> None:
+    if count <= _MAX_GENERATION_RECOVERIES:
+        return
+    rejection = _response_rejection(reason, budget)
+    assert rejection is not None
+    failure = OutputLengthError if reason == "length" else ModelError
+    raise failure(rejection + " 已尝试 3 次恢复，现已停止；请调整输出预算或任务要求后继续。").exception()
 
 
 async def react(
@@ -476,30 +810,38 @@ async def react(
     tools: ToolMenu,
     max_output_tokens: int,
     max_steps: int,
+    max_retry_wait: float | None = None,
     reduce: SummaryReducer | None = None,
     preview: Preview | None = None,
     terminal_tools: frozenset[str] = frozenset(),
     capture_scope: Callable[[], RuntimeScope] | None = None,
     state: OwnerStore | None = None,
     max_parallel_calls: int = 1,
-    pending_work: Callable[[], bool] | None = None,
     check_start: StartCheck | None = None,
+    before_step: Callable[[], Awaitable[None]] | None = None,
+    retry_wake: asyncio.Event | None = None,
+    aborted: Callable[[str], Awaitable[Message]] | None = None,
+    window: HistoryWindow | None = None,
 ) -> Message:
-    """先结算已提交调用，再读日志推理并逐条提交；没有 Turn、Attempt 或历史副本。"""
+    """先结算已提交调用，再读日志推理并逐条提交；没有 Turn、Attempt 或历史副本。
+
+    给出 window 时只读摘要覆盖之后的窗口；窗口失效（前缀版本变化、迟到回执）时账本改给完整历史，
+    组装按快照自身的起点理解。
+    """
     if type(max_steps) is not int or max_steps < 0:
         raise ValueError("模型请求上限必须是非负整数")
     if type(max_parallel_calls) is not int or max_parallel_calls < 1:
         raise ValueError("并行工具上限必须是正整数")
     if reader.session_id != writer.session_id:
         raise ValueError("ReAct reader 与 writer 必须属于同一 Session")
-    history = _History(writer.source, max_steps)
-    history_recovery_reported = False
+    history = _History(writer.source, tools.name)
+    attempts = _StepAttempts()
     while True:
         operation_id = uuid4().hex
         mark = partial(log_timing, session_id=reader.session_id, source=writer.source, operation_id=operation_id)
         mark("react.begin")
-        # 1. 放弃区保持串行结算；未闭段里连续的 parallel 调用才重叠。
-        initial = await reader.committed_snapshot_async()
+        # 1. 放弃与停止区保持串行结算；未闭段里连续的 parallel 调用才重叠。
+        initial = await reader.committed_window_async(window)
         head_before = initial.through_seq
         history.update(initial)
         pending, abandoned = history.open_calls()
@@ -508,14 +850,17 @@ async def react(
             await tools.settle_abandoned(call)
         if abandoned:
             # 放弃结算已追加事实，重新读取；普通路径复用同一次扫描的待执行调用。
-            history.update(await reader.committed_snapshot_async())
+            history.update(await reader.committed_window_async(window))
             pending, _ = history.open_calls()
         await _settle_pending(
             reader, tools, pending, max_parallel_calls, capture_scope,
         )
         mark("tools.settled")
+        # 工具结果都已提交、下一次请求之前：调用方在这里写入插话，下面的重读会带上它。
+        if before_step is not None:
+            await before_step()
         if pending or abandoned or reader.head() != head_before:
-            snapshot = await reader.committed_snapshot_async()
+            snapshot = await reader.committed_window_async(window)
         else:
             # 无结算写入且 head 未动：进入结算前的固定前缀仍然有效。
             snapshot = initial
@@ -570,42 +915,89 @@ async def react(
                 return await commit(uuid4().hex, Output((), "quiet"))
         except _Superseded:
             raise asyncio.CancelledError from None
+        failure = history.failures.failure()
+        if failure is not None:
+            raise ModelError(failure).exception()
+        if history.generation_rejections:
+            _check_generation_recovery(
+                len(history.generation_rejections), history.generation_rejections[-1][1], max_output_tokens,
+            )
         if max_steps > 0 and history.steps >= max_steps:
-            raise StepLimit(
-                f"本来源未完成工作已达到 {max_steps} 个模型输出；请发送新消息继续，已完成的工具结果会保留"
-            ).exception()
+            # 门槛落在请求之前：本轮没有任何模型输出，未完成区段全部来自更早的轮次。
+            # 只有「从未落过回执」的调用会被放弃结算，它们的真实效果未知，
+            # 不能由引擎替用户作废（那会把整段已执行工作从模型历史和记忆里抹掉）。
+            unfinished, _ = history.open_calls()
+            if unfinished:
+                raise StepLimit(
+                    step_limit_failure_reason(max_steps, len(unfinished)),
+                ).exception()
+            if aborted is not None:
+                return await aborted(step_limit_abandon_reason(max_steps))
+            # 没有写控制能力的调用方只能得到明确失败，来源仍会记录 failure；
+            # 重试不重置计数，与修复前一致；新输入才会。
+            raise StepLimit(f"本来源未完成工作已达到 {max_steps} 个模型输出").exception()
 
         # 2. 重启和显式重试都用当前材料发新请求，不恢复旧请求身份。
         mark("preparation.begin")
         prepared = await materials(tuple(snapshot))
         mark("preparation.end")
-        async with _complete(
+        # 退避被叫醒时跳过下面的提交，回到循环顶部写入插话再发新请求。
+        async with attempts, _complete(
             snapshot, prepared, source=writer.source, context=context, model=model,
             projection=projection, tools=tools, max_output_tokens=max_output_tokens, reduce=reduce, preview=preview,
             reminder_input_id=reminder_input_id,
-            operation_id=operation_id,
+            operation_id=operation_id, max_retry_wait=max_retry_wait,
+            retry_wake=retry_wake, max_attempts=attempts.remaining, kept_text=history.has_kept_text(),
         ) as (response, prepared, message_id, request):
-            # 先检查完整性：即使截断参数恰好是合法 JSON，也不能执行该批工具。
-            if response.finish_reason == "length":
-                raise OutputLengthError(
-                    f"模型生成达到长度限制（输出预算 {request.max_output_tokens} tokens，含推理）；"
-                    "回复未完成，本次返回的工具调用未执行。请检查输出预算与模型上下文容量后，用新输入继续。"
-                ).exception()
-            decoded, metadata = await content.decode(response.content or "", cast(tuple[Mapping[str, object], ...], prepared.get("references", ())))
+            # 3. Keep rejection feedback in history before another model request.
+            rejection = _response_rejection(response.finish_reason, request.max_output_tokens)
+            # 没有工具调用的截断保留正文供用户阅读和模型续写；其余拒绝仍以提示替换，半截调用绝不落账。
+            # 续写段的行首空白属于断点，只有首段才去掉。
+            kept_text = history.has_kept_text()
+            text = (response.content or "") if kept_text else (response.content or "").lstrip()
+            partial_text = response.finish_reason == "length" and not response.tool_calls and bool(text.strip())
+            # 恢复次数或步数到顶、或续写时已零输出，且已有正文：收成 complete 结局，渠道和子任务才拿得到；没有正文仍走失败。
+            length_cut = (
+                response.finish_reason == "length"
+                and (partial_text or kept_text)
+                and (
+                    len(history.generation_rejections) >= _MAX_GENERATION_RECOVERIES
+                    or 0 < max_steps <= history.steps + 1
+                    or _no_output_room(response)
+                )
+            )
+            if rejection is not None:
+                response = replace(response, tool_calls=(), continuation=None, provider_metadata=None)
+            if length_cut:
+                text = (text.rstrip() if partial_text else "") + "\n\n" + LENGTH_CUT_NOTICE
+            elif rejection is not None and not partial_text:
+                text = rejection
+            decoded, metadata = await content.decode(
+                text,
+                cast(tuple[Mapping[str, object], ...], prepared.get("references", ())),
+            )
             parts: list[Part] = list(decoded)
             indices: list[int] = []
             actual_calls: list[ToolCall | ContentPart] = []
-            decoded_calls = tuple(tools.decode(call) for call in response.tool_calls)
-            mixed_exclusive = len(decoded_calls) > 1 and any(
-                decoded.binding_id is not None and decoded.exclusive_batch
+            calls = () if rejection is not None else response.tool_calls
+            decoded_calls = tuple(tools.decode(call) for call in calls)
+            exclusive_names = tuple(
+                tools.name(decoded.binding_id)
                 for decoded in decoded_calls
+                if decoded.binding_id is not None and decoded.exclusive_batch
             )
-            for call, decoded_call in zip(response.tool_calls, decoded_calls, strict=True):
+            mixed_exclusive = len(decoded_calls) > 1 and bool(exclusive_names)
+            for call, decoded_call in zip(calls, decoded_calls, strict=True):
                 indices.append(len(parts))
-                if mixed_exclusive:
+                repeated = history.failures.rejection(call.name, call.arguments)
+                if repeated is not None:
+                    actual = ContentPart("model.tool_rejection", {
+                        "name": call.name, "arguments": call.arguments, "error": repeated,
+                    })
+                elif mixed_exclusive:
                     actual = ContentPart("model.tool_rejection", {
                         "name": call.name, "arguments": call.arguments,
-                        "error": "此批次包含要求独占的工具；整批未执行，请单独调用该工具。",
+                        "error": f"此批次包含要求独占的工具 {', '.join(exclusive_names)}；整批未执行，请分别单独调用这些工具。",
                     })
                 elif decoded_call.rejection is not None:
                     actual = ContentPart("model.tool_rejection", decoded_call.rejection)
@@ -632,31 +1024,22 @@ async def react(
                 parts.append(ContentPart("context.summary", {"reference": summary["reference"]}))
             parts.extend(ContentPart("context.notice", notice)
                          for notice in cast(Sequence[str], prepared.get("notices", ())))
-            if request.history_recovery and not history_recovery_reported:
-                parts.append(ContentPart("context.notice",
-                    "部分历史模型调用回执不可用，已根据保存的消息和工具结果重新建立模型上下文。原调用的计费状态未知。"))
             mark("output.decoded", counts={"tool_calls": len(indices)})
-            more = bool(indices) or (pending_work is not None and pending_work())
-            if more and not indices:
-                previous = next((m.body for m in reversed(snapshot) if m.source == writer.source), None)
-                if isinstance(previous, Output) and previous.finish == "continue" and not any(
-                    isinstance(part, ToolCall) or part.kind == "model.tool_rejection" for part in previous.parts
-                ):
-                    parts.append(ContentPart("text", "\n\n执行暂停：仍有待办事项，但模型连续两步只返回了进度说明。"
-                                             "本次未取得新证据，已保留未完成事项与先前工具结果。"))
-                    more = False
             # 4. 内容完成后在窄事务内核对前提并提交；失败的草稿绝不触发工具。
             try:
                 message = await commit(
                     message_id,
-                    Output(tuple(parts), "continue" if more else "complete"),
+                    Output(tuple(parts), "continue" if indices or rejection is not None and not length_cut else "complete"),
                     metadata,
                 )
             except _Superseded:
                 raise asyncio.CancelledError from None
-            history_recovery_reported |= request.history_recovery
             mark("output.committed", request_id=response.call_record_id or "", parent_operation_id=message.message_id, counts={"seq": message.seq, "tool_calls": len(indices)})
-            if not more:
+            if rejection is not None and not length_cut:
+                _check_generation_recovery(
+                    len(history.generation_rejections) + 1, response.finish_reason, request.max_output_tokens,
+                )
+            elif not indices:
                 return message
         # Loop 保留当前历史，直到下轮真实快照替换它；弱解码缓存才能复用旧消息。
         # 不再使用的准备材料与提交闭包立即释放，结束或取消时释放整个 Loop。

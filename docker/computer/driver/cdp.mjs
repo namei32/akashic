@@ -1,36 +1,15 @@
 import { EventEmitter, once } from "node:events";
 import { randomInt } from "node:crypto";
-import { connect } from "node:net";
 
 // 导航由参考实现自己的等待与 stopLoading 收尾掌管；CDP 层只兜底，不能抢先以 10 秒超时打断。
 const NAVIGATE_CEILING_MS = 120_000;
-const HOST_PROBE_MS = 2_000;
-const HOST_NAMES = new Set(["host.docker.internal", "gateway.docker.internal"]);
-
-/** 宿主别名与私网地址先试连：被丢包的端口会让 Chromium 挂到 CDP 超时，这里提前给出可操作的原因。 */
-async function probeLocalTarget(url) {
-  let target;
-  try { target = new URL(url); } catch { return; }
-  if (!["http:", "https:"].includes(target.protocol)) return;
-  const host = target.hostname.replace(/^\[|\]$/g, "");
-  if (!HOST_NAMES.has(host) && !/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(host)) return;
-  const port = Number(target.port || (target.protocol === "https:" ? 443 : 80));
-  const outcome = await new Promise((resolve) => {
-    const socket = connect({ host, port });
-    const done = (value) => { socket.destroy(); resolve(value); };
-    socket.setTimeout(HOST_PROBE_MS, () => done("timeout"));
-    socket.once("connect", () => done("open"));
-    socket.once("error", (error) => done(error.code ?? "error"));
-  });
-  if (outcome !== "timeout") return;
-  throw new Error(
-    `Cannot reach ${host}:${port} from the browser: no answer within ${HOST_PROBE_MS / 1000}s. ` +
-    "The browser runs in its own container; the host firewall usually drops container connections " +
-    "to host ports, so a server started on the host is not visible to it. For static pages, write the " +
-    "files into the shared pages directory named in the computer tool description and open them " +
-    "with file:///data/pages/...; for a dev server, ask the user to allow this port. Nothing was opened.",
-  );
-}
+// 把页面行为交给 Agent 处理的拦截，以及关掉它的命令；关掉后 Chromium 恢复原生行为、放行已暂停的响应。
+const INTERCEPTIONS = new Map([
+  ["Fetch.enable", ["Fetch.disable", {}]],
+  ["Fetch.disable", ["Fetch.disable", {}]],
+  ["Page.setInterceptFileChooserDialog", ["Page.setInterceptFileChooserDialog", { enabled: false }]],
+  ["Input.setInterceptDrags", ["Input.setInterceptDrags", { enabled: false }]],
+]);
 
 /** 每个 WebSocket 拥有自己的请求表；断连同时拒绝全部等待者。 */
 class CdpConnection extends EventEmitter {
@@ -106,6 +85,8 @@ class CdpConnection extends EventEmitter {
   }
 }
 
+export const SPACE_SENTINEL_URL = "about:blank#akashic-space";
+
 /** 每个标签都是同一块屏幕上的窗口：新窗口铺满屏幕，观看者正在看的窗口始终留在最前。 */
 export class Screen {
   front = null;
@@ -119,6 +100,10 @@ export class Screen {
   async show(connection, targetId) {
     await connection.send("Target.activateTarget", { targetId });
     this.front = targetId;
+  }
+  async restoreFront(connection) {
+    if (!this.front) return;
+    await connection.send("Target.activateTarget", { targetId: this.front }).catch(() => {});
   }
 }
 
@@ -145,6 +130,11 @@ export class BrowserBackend extends EventEmitter {
   inputs = new Map();
   expressions = new Map();
   sessionNames = new Map();
+  interceptions = new Map();
+  intercepting = true;
+  hiddenTargets = new Set();
+  hiddenTargetRoots = new Map();
+  creatingInternalTargets = 0;
   async start() {
     const response = await fetch(`${this.url}/json/version`, {
       signal: AbortSignal.timeout(5000),
@@ -162,6 +152,8 @@ export class BrowserBackend extends EventEmitter {
     for (const target of targetInfos.filter(
       (item) =>
         item.type === "page" &&
+        !this.hiddenTargets.has(item.targetId) &&
+        item.url !== SPACE_SENTINEL_URL &&
         (this.browserContextId
           ? item.browserContextId === this.browserContextId
           : !this.excluded.has(item.browserContextId)),
@@ -232,8 +224,32 @@ export class BrowserBackend extends EventEmitter {
     );
     connection.on("close", () => {
       if (this.connections.get(id) === connection) this.connections.delete(id);
+      for (const [key, record] of this.interceptions)
+        if (record.connection === connection) this.interceptions.delete(key);
     });
     return connection;
+  }
+  // Agent 开的拦截按标签、子 session 和种类记下；暂停期间新开的拦截立即关掉，恢复时按原参数重开。
+  async recordInterception(target, method, params, connection) {
+    const off = INTERCEPTIONS.get(method);
+    const key = JSON.stringify([target.tabId, target.sessionId ?? "", off[0]]);
+    if (method === "Fetch.disable" || (method !== "Fetch.enable" && !params.enabled))
+      return void this.interceptions.delete(key);
+    this.interceptions.set(key, { connection, sessionId: target.sessionId, on: [method, params], off });
+    if (!this.intercepting) await connection.send(...off, target.sessionId);
+  }
+  // 关掉 Fetch 会放行全部已暂停的响应；关不掉就断开连接，Chromium 同样会放行并恢复原生行为。
+  async setInterception(on) {
+    if (this.intercepting === on) return;
+    this.intercepting = on;
+    await Promise.all([...this.interceptions.values()].map(async (record) => {
+      try {
+        await record.connection.send(...(on ? record.on : record.off), record.sessionId, 2000);
+      } catch (error) {
+        console.error("Computer request interception switch failed:", error.message);
+        record.connection.close();
+      }
+    }));
   }
   /** 记录已送出的输入，取消后用相同 CDP target 发送 release。 */
   async execute(params, context) {
@@ -282,13 +298,14 @@ export class BrowserBackend extends EventEmitter {
       const tab = this.tab(target.tabId);
       this.checkOwner(tab, context);
     }
-    if (method === "Page.navigate") await probeLocalTarget(commandParams.url);
     const result = await connection.send(
       method,
       commandParams,
       target.sessionId,
       params.timeoutMs ?? (method === "Page.navigate" ? NAVIGATE_CEILING_MS : undefined),
     );
+    if (INTERCEPTIONS.has(method))
+      await this.recordInterception(target, method, commandParams, connection);
     if (
       method === "Input.dispatchMouseEvent" &&
       commandParams.type === "mouseReleased"
@@ -415,14 +432,20 @@ export class BrowserBackend extends EventEmitter {
       }
       case "createTab": {
         // 每个 Agent 标签是独立窗口：互不遮挡渲染，也不切走用户正在看的标签。
-        const { targetId } = await this.browser.send("Target.createTarget", {
-          url: "about:blank",
-          newWindow: true,
-          background: true,
-          ...(this.browserContextId
-            ? { browserContextId: this.browserContextId }
-            : {}),
-        });
+        this.creatingInternalTargets++;
+        let targetId;
+        try {
+          ({ targetId } = await this.browser.send("Target.createTarget", {
+            url: "about:blank",
+            newWindow: true,
+            background: true,
+            ...(this.browserContextId
+              ? { browserContextId: this.browserContextId }
+              : {}),
+          }));
+        } finally {
+          this.creatingInternalTargets--;
+        }
         await this.screen.place(this.browser, targetId);
         await this.listTabs();
         const tab = this.tabs.get(targetId);

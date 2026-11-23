@@ -4,19 +4,26 @@ from __future__ import annotations
 from plugins.models.contract import ModelError
 import json
 import logging
-import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from bisect import bisect_right
 from collections.abc import Awaitable, Callable, Sequence
+from uuid import uuid4
 
-from plugins.models.contract import ModelRequest
+from plugins.models.contract import ModelRequest, StreamCallback
 from plugins.models.contract import (
     ContextLengthError,
     ModelTimeoutError,
     RateLimitError,
+    REJECTED_CALL_NOTICE,
+    REJECTED_INPUT_NOTICE,
+    REJECTED_KEEP_KINDS,
+    REJECTED_OUTPUT_NOTICE,
     TransportError,
+    rejected_result_notice,
+    rejected_segments,
 )
-from plugins.models.contract import BoundChatModel
-from plugins.ledger.contract import CallRef, ContentPart, Control, Message, Output, ToolCall, ToolResult
+from plugins.models.contract import BoundChatModel, LLMResponse
+from plugins.ledger.contract import CallRef, ContentPart, Control, Input, Message, Output, Part, ToolCall, ToolResult, origin
 from plugins.ledger.contract import body_to_dict
 from plugins.turn_projection.contract import TurnProjection
 
@@ -30,10 +37,11 @@ PROMPT = """更新当前长任务的上下文压缩摘要。
 
 只记录输入中已经出现的事实，不补充猜测，不把计划写成已完成。
 摘要只替代已结算的旧消息；完整原文和工具结果仍保留。
-用户消息是理解目标、要求、偏好和关系的核心证据。只有 author=user 的原话能够建立这些用户事实。
+对照 [Previous summary] 与 [Source messages]：已在本次消息中完成、解决或改道的事项，必须从 ### In Progress、### Blocked、## Next Steps 移入 ### Done 或移除，不得把已结束的阻塞和旧待办留在活跃章节。
+用户消息是理解目标、要求、偏好和关系的核心证据。只有 actor=user 的原话能够建立这些用户事实；actor=automation 是插件自动产生的输入，不是用户原话。
 助手消息只记录助手的判断、计划和执行过程；不得用助手转述或猜测补全用户没有表达的上下文。
 区分用户原话、助手判断及工具/后台结果，保留重要来源身份；转述不能升级成用户事实或偏好。
-必须严格使用以下标题，不得增加标题：
+建议使用以下标题组织摘要，可按资料调整：
 """ + "\n".join(HEADINGS) + """
 
 保留路径、符号、命令、错误、数值、外部效果和验证结果。
@@ -46,9 +54,33 @@ class SummaryError(ValueError):
     """摘要不能满足完整前缀、容量或输出合同。"""
 
 
+class SummaryCapacityError(SummaryError):
+    """摘要模型调用正常，但压缩已结算历史救不了当前请求；文案自带用户出口。"""
+
+
 # 同 Pi 截断摘要资料中的工具结果，这里按整条消息限长，覆盖参数、多段结果与长回复；
 # 放不下时逐级缩短。原文仍留在日志可回读，任何一条已结算消息都不会让摘要请求放不下。
 EXCERPT_CHARS = (4000, 1000, 200)
+# 本地估算放得下而 provider 仍拒绝时的裁剪次数。
+MAX_SUMMARY_TRIMS = 4
+# 摘要挡在回合前，上游要求的单次等待超过它就结束本次摘要，不把回合挂在退避上。
+SUMMARY_MAX_RETRY_WAIT = 300.0
+# 阻断回合的摘要：每个模型的裁剪和重试共用这份物理尝试额度，一次压缩还共用下面的总期限。
+# 上界：主选 11 + 回退 11 + 缩写每模型 1 = 24 次物理尝试。
+SUMMARY_MAX_ATTEMPTS = 11
+SUMMARY_DEADLINE_SECONDS = 900.0
+
+
+@dataclass(frozen=True)
+class SummaryCall:
+    """一次摘要在每个模型上的额度；trim 决定 provider 判超窗时能否丢弃更早的资料。"""
+    max_attempts: int
+    trim: bool
+
+
+BLOCKING_SUMMARY = SummaryCall(SUMMARY_MAX_ATTEMPTS, True)
+# 可选压缩有退路：摘要超窗就软失败保留原文，不为省空间丢历史；上界每模型 1 次。
+OPTIONAL_SUMMARY = SummaryCall(1, False)
 
 
 def _excerpt(body: dict[str, object], chars: int) -> object:
@@ -60,20 +92,20 @@ def _excerpt(body: dict[str, object], chars: int) -> object:
 
 
 def clip_summary(text: str, ratio: float) -> str:
-    """按固定标题重建摘要，每节正文（含标题前的正文）只留前 ratio 比例；0 时只剩标题。"""
-    bodies: list[list[str]] = [[] for _ in HEADINGS]
-    index = 0
+    """保留实际标题，每节正文只留前 ratio 比例；无标题正文也可缩短。"""
+    blocks: list[tuple[str, list[str]]] = [("", [])]
     for line in text.splitlines():
-        if line.strip() in HEADINGS:
-            index = HEADINGS.index(line.strip())
+        if line.lstrip().startswith("#"):
+            blocks.append((line, []))
         else:
-            bodies[index].append(line)
+            blocks[-1][1].append(line)
     sections: list[str] = []
-    for heading, body in zip(HEADINGS, bodies):
+    for heading, body in blocks:
         content = "\n".join(body).strip()
         keep = content[:int(len(content) * ratio)].rstrip()
-        sections.append(heading + ("\n" + keep if keep else "") + ("…（篇幅所限已截断）" if keep != content else ""))
-    return "\n".join(sections)
+        sections.append("\n".join(part for part in (heading, keep) if part)
+                        + ("…（篇幅所限已截断）" if keep != content else ""))
+    return "\n".join(section for section in sections if section)
 
 
 def recoverable(error: BaseException) -> bool:
@@ -83,7 +115,7 @@ def recoverable(error: BaseException) -> bool:
 
 
 def source_text(messages: Sequence[Message], *, excerpt: int | None = None) -> str:
-    """把精确原文作为低信任资料；不把模型私有 replay 当成待学习正文。"""
+    """把精确原文作为低信任资料；不把模型私有 replay 当成待学习正文。actor 是 Ledger 判定的主体，模型不必再解析作者。"""
     rows: list[dict[str, object]] = []
     for message in messages:
         body = message.body
@@ -91,12 +123,12 @@ def source_text(messages: Sequence[Message], *, excerpt: int | None = None) -> s
             body = replace(body, parts=tuple(
                 part for part in body.parts
                 if not isinstance(part, ContentPart) or part.kind not in {
-                    "model.facts", "context.summary", "context.notice", "model.selection", "tool.selection",
+                    "model.facts", "context.summary", "context.notice", "compaction.boundary", "model.selection", "tool.selection",
                 }
             ))
         data = body_to_dict(body)
         rows.append({"message_id": message.message_id, "source": message.source, "author": message.author,
-                     "seq": message.seq, "body": data if excerpt is None else _excerpt(data, excerpt)})
+                     "actor": origin(message).actor.value, "seq": message.seq, "body": data if excerpt is None else _excerpt(data, excerpt)})
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -133,20 +165,49 @@ def closed_groups(
     settled_prefixes: Callable[[tuple[Message, ...]], tuple[int, ...]],
     after: int = 0,
 ) -> tuple[tuple[Message, ...], ...]:
-    """只在已结算批次后切分请求视图；持久 Turn 和学习边界保持完整。"""
+    """已结算批次或失败输入可供摘要；失败不改变持久 Turn 与学习资格。"""
     groups: list[tuple[Message, ...]] = []
     ends = set(settled_prefixes(messages))
+    seqs = tuple(message.seq for message in messages)
     start = after
     for index in range(after, len(messages)):
         message = messages[index]
         body = message.body
         closed = (isinstance(body, Output) and body.finish != "continue"
                   or isinstance(body, ToolResult)
-                  or isinstance(body, Control) and body.action == "abandon")
+                  or isinstance(body, Control) and body.action in {"abandon", "failure"})
         if closed and index + 1 in ends:
-            groups.append(tuple(messages[start:index + 1]))
-            start = index + 1
+            # A late failure only releases the prefix it actually observed.
+            end = (bisect_right(seqs, body.through_seq, lo=start, hi=index + 1)
+                   if isinstance(body, Control) and body.action == "failure" else index + 1)
+            if end > start and end in ends:
+                groups.append(tuple(messages[start:end]))
+                start = end
     return tuple(groups)
+
+
+# Summaries must not carry what the abandon took out of the model view; outcomes stay as facts.
+def _without_rejected(message: Message, hidden: frozenset[str]) -> Message:
+    body = message.body
+    if isinstance(body, ToolResult) and body.call_ref.message_id in hidden:
+        notice = ContentPart("text", rejected_result_notice(body.outcome))
+        return replace(message, body=replace(body, parts=(notice,)))
+    if message.message_id not in hidden:
+        return message
+    if isinstance(body, Input):
+        return replace(message, body=Input((ContentPart("text", REJECTED_INPUT_NOTICE),)))
+    assert isinstance(body, Output)
+    parts: list[Part] = []
+    for part in body.parts:
+        if isinstance(part, ToolCall):
+            parts.append(replace(part, arguments={}))
+        elif part.kind == "model.tool_rejection":
+            parts.append(ContentPart("text", REJECTED_CALL_NOTICE))
+        elif part.kind in REJECTED_KEEP_KINDS:
+            parts.append(part)
+        elif not any(isinstance(item, ContentPart) and item.value == REJECTED_OUTPUT_NOTICE for item in parts):
+            parts.append(ContentPart("text", REJECTED_OUTPUT_NOTICE))
+    return replace(message, body=replace(body, parts=tuple(parts)))
 
 
 def summary_groups(groups: tuple[tuple[Message, ...], ...],
@@ -170,7 +231,8 @@ def summary_groups(groups: tuple[tuple[Message, ...], ...],
                              if call.source == message.source and call.seq <= body.through_seq)
             pending = {ref: call for ref, call in pending.items() if ref not in abandoned}
     # 2. 只改变本次摘要材料；原分组仍用于耐久覆盖范围和 raw tail 选择。
-    selected = tuple(tuple(message for message in group if message.message_id not in excluded)
+    hidden = rejected_segments(snapshot)
+    selected = tuple(tuple(_without_rejected(message, hidden) for message in group if message.message_id not in excluded)
                      for group in groups)
     return tuple(group for group in selected if group)
 
@@ -229,40 +291,70 @@ def _fit_inputs(model: BoundChatModel, groups: tuple[tuple[Message, ...], ...], 
     raise SummaryError("摘要提示加一条最短消息摘录已超过摘要模型容量")
 
 
-def _summary_headings(text: str) -> tuple[str, ...]:
-    """代码围栏内的 # 是代码，不参与固定标题合同；未闭合围栏不能隐藏后续标题。"""
-    headings: list[str] = []
-    fence = ""
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if fence:
-            if re.fullmatch(re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*", stripped):
-                fence = ""
-            continue
-        opening = re.match(r"(`{3,}|~{3,})(.*)$", stripped)
-        if opening is not None:
-            marker, info = opening.groups()
-            if marker[0] == "~" or "`" not in info:
-                fence = marker
-                continue
-        if stripped.startswith("#"):
-            headings.append(line.strip())
-    if fence:
-        raise SummaryError("摘要代码围栏未闭合")
-    return tuple(headings)
+# provider 拒绝说明本地估算偏低：已有摘要占比更大时先缩它，否则从最旧的组减半。
+# 组是已结算批次，整组丢弃不切开工具配对；只剩一组时缩短摘录，再缩已有摘要，都到头返回 None。
+def _trim_inputs(summary: str, groups: tuple[tuple[Message, ...], ...],
+                 excerpt: int) -> tuple[str, tuple[tuple[Message, ...], ...], int] | None:
+    clipped = clip_summary(summary, 0.5)
+    material = source_text(tuple(message for group in groups for message in group), excerpt=excerpt)
+    if len(summary) > len(material) and len(clipped) < len(summary):
+        return clipped, groups, excerpt
+    if len(groups) > 1:
+        return summary, groups[len(groups) // 2:], excerpt
+    shorter = next((chars for chars in EXCERPT_CHARS if chars < excerpt), None)
+    if groups and shorter is not None:
+        return summary, groups, shorter
+    return (clipped, groups, excerpt) if len(clipped) < len(summary) else None
+
+
+# 每个请求一个 key：同一请求的网络重试归 Models，裁剪后的新内容是新请求，不继承已终结的拒绝。
+# 新 key 不刷新额度：Models 每次物理尝试开始时发一个 call_record_id，这里按它递减。
+async def _complete_trimmed(model: BoundChatModel, inputs: tuple[str, tuple[tuple[Message, ...], ...], int],
+                            limit: int, *, call: SummaryCall, on_delta: StreamCallback | None,
+                            ) -> tuple[LLMResponse, tuple[tuple[Message, ...], ...]]:
+    summary, selected, excerpt = inputs
+    remaining, trims = call.max_attempts, 0
+    attempts: set[str] = set()
+
+    async def observe(value: dict[str, str]) -> None:
+        if value.get("call_record_id"):
+            attempts.add(value["call_record_id"])
+        if on_delta is not None:
+            await on_delta(value)
+
+    while True:
+        attempts.clear()
+        request = replace(_request(model, summary, selected, limit, excerpt), request_key=uuid4().hex,
+                          max_attempts=remaining, max_retry_wait=SUMMARY_MAX_RETRY_WAIT, on_delta=observe)
+        try:
+            return await model.complete(request), selected
+        except (RuntimeError, TimeoutError) as failure:
+            remaining -= max(1, len(attempts))
+            if (not call.trim or remaining < 1 or trims >= MAX_SUMMARY_TRIMS
+                    or not ModelError.matches(failure, ContextLengthError)):
+                raise
+            trimmed = _trim_inputs(summary, selected, excerpt)
+            if trimmed is None:
+                raise
+            trims += 1
+            logger.warning("摘要请求被 %s 判超窗，第 %d 次裁剪后重试", model.descriptor.model_id, trims)
+            summary, selected, excerpt = trimmed
 
 
 async def _summarize(model: BoundChatModel, groups: tuple[tuple[Message, ...], ...],
-                     previous: str, limit: int) -> tuple[str, tuple[str, ...], tuple[tuple[Message, ...], ...]]:
-    """输入先缩进摘要模型，再只发出一次摘要请求。"""
-    summary, selected, excerpt = _fit_inputs(model, groups, previous, limit)
-    response = await model.complete(_request(model, summary, selected, limit, excerpt))
+                     previous: str, limit: int, *, call: SummaryCall, on_delta: StreamCallback | None,
+                     ) -> tuple[str, tuple[str, ...], tuple[tuple[Message, ...], ...]]:
+    """输入先缩进摘要模型；阻断回合的摘要被 provider 判超窗时裁剪后重发，共用一份尝试额度。"""
+    response, selected = await _complete_trimmed(
+        model, _fit_inputs(model, groups, previous, limit), limit, call=call, on_delta=on_delta)
 
-    # 只接纳成功调用的真实正文；格式错误不会用空摘要掩盖。
+    # None is the shared response contract's unspecified normal completion.
+    if response.finish_reason not in (None, "stop"):
+        raise SummaryError(f"摘要生成未正常完成：{response.finish_reason}")
+    # 只接纳成功调用的真实正文；标题差异不影响内容与调用出处。
     text = (response.content or "").strip()
-    headings = _summary_headings(text)
-    if response.tool_calls or headings != HEADINGS:
-        raise SummaryError("摘要响应没有遵守固定标题合同")
+    if response.tool_calls or not text:
+        raise SummaryError("摘要响应必须有正文且不能包含工具调用")
     if response.call_record_id is None:
         raise SummaryError("摘要响应缺少成功模型调用出处")
     return text, (response.call_record_id,), selected
@@ -271,18 +363,19 @@ async def _summarize(model: BoundChatModel, groups: tuple[tuple[Message, ...], .
 async def summarize(groups: tuple[tuple[Message, ...], ...], *, previous: str, limit: int,
                     model: BoundChatModel, fallback: BoundChatModel,
                     on_fallback: Callable[[str], Awaitable[None]] | None = None,
+                    call: SummaryCall = OPTIONAL_SUMMARY, on_delta: StreamCallback | None = None,
                     ) -> tuple[str, tuple[str, ...], tuple[tuple[Message, ...], ...]]:
     """主模型在本层可恢复的生成失败后，使用本次作用域已固定的 DEFAULT。"""
     try:
-        return await _summarize(model, groups, previous, limit)
+        return await _summarize(model, groups, previous, limit, call=call, on_delta=on_delta)
     except (RuntimeError, TimeoutError, SummaryError) as failure:
         if not recoverable(failure):
             raise
         if fallback.descriptor.binding_id == model.descriptor.binding_id:
             raise
-        logger.warning("摘要模型 %s 失败，改用已固定的 DEFAULT %s: %s",
+        logger.warning("[fallback] 压缩摘要: 摘要模型 %s 失败，改用已固定的 DEFAULT %s: %s",
                        model.descriptor.model_id, fallback.descriptor.model_id, failure)
         if on_fallback is not None:
             await on_fallback(f"摘要模型 {model.descriptor.model_id} 失败：{failure}；"
                               f"改用 {fallback.descriptor.model_id}")
-        return await _summarize(fallback, groups, previous, limit)
+        return await _summarize(fallback, groups, previous, limit, call=call, on_delta=on_delta)

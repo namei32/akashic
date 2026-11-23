@@ -13,8 +13,10 @@ from uuid import uuid4
 
 from akashic_sdk import AsyncAkashic, RemoteError
 from agent.plugin_composition import load_endpoint_plan
+from plugins.programmatic.contract import parse_scope_pairs
 from core.common.file_io import run_file_io
 from .endpoint import is_tcp_endpoint
+from .protocol.errors import UPDATE_NOT_FOUND
 from .token import read_secret
 
 
@@ -102,7 +104,7 @@ async def _exec_until_stop(client: AsyncAkashic, session_id: str, input_id: str,
 
 async def run_exec(args: list[str], workspace: Path) -> int:
     """通过普通程序来源提交 Message，按原 Input 的持久结果退出。"""
-    # 1. 每个可重试写入都有调用方身份；CLI 不接受来源或学习属性覆盖。
+    # 1. 每个可重试写入都有调用方身份；学习资格与记忆范围只能在 --new 准入时定。
     parser = argparse.ArgumentParser(prog="exec")
     _ = parser.add_argument("prompt", nargs="?")
     _ = parser.add_argument("--new", action="store_true")
@@ -110,6 +112,10 @@ async def run_exec(args: list[str], workspace: Path) -> int:
     _ = parser.add_argument("--message-id")
     _ = parser.add_argument("--resume")
     _ = parser.add_argument("--persist-memory", action="store_true")
+    _ = parser.add_argument(
+        "--scope", action="append", default=[], metavar="DIM=VALUE",
+        help="把 Session 放进记忆范围，可重复；如 --scope project=github-review",
+    )
     _ = parser.add_argument("--detach", action="store_true")
     output = parser.add_mutually_exclusive_group()
     _ = output.add_argument("--json", action="store_true")
@@ -120,6 +126,8 @@ async def run_exec(args: list[str], workspace: Path) -> int:
         raise ValueError("exec 需要 --new 或 --session ID")
     if options.persist_memory and not options.new:
         raise ValueError("--persist-memory 只能在 --new 准入时选择")
+    if options.scope and not options.new:
+        raise ValueError("--scope 只能在 --new 准入时选择")
     if options.detach and options.final_only:
         raise ValueError("--detach 不能与 --final-only 一起使用")
     if options.resume is not None:
@@ -143,6 +151,7 @@ async def run_exec(args: list[str], workspace: Path) -> int:
         if options.new:
             _ = await client.request("programmatic/session/admit", {
                 "session_id": session_id, "persist_memory": options.persist_memory,
+                "scope": parse_scope_pairs(options.scope),
             })
         if options.resume is not None:
             receipt = await client.request("programmatic/message/resume", identity)
@@ -166,7 +175,7 @@ async def run_exec(args: list[str], workspace: Path) -> int:
             row = page["items"][0]
             if row["id"] != result["ending_message_id"]:
                 raise RuntimeError("程序结果引用与读取的 Message 不一致")
-            print("\n".join(part["value"] for part in row["body"]["parts"] if part["kind"] == "text"))
+            print(result.get("full_text") or "\n".join(part["value"] for part in row["body"]["parts"] if part["kind"] == "text"))
         else:
             print(json.dumps(result, ensure_ascii=False), file=sys.stderr)
         if stopped or result["status"] == "pause":
@@ -225,10 +234,50 @@ async def management(arguments: tuple[str, ...], *, workspace: Path, config_path
         print("Gateway 无可连接端点。用 plugin-doctor 查看实际 ID，运行 "
               "plugin-enable gateway@<marketplace> 后重启实例。", file=sys.stderr)
         return 1
-    except (ValueError, RuntimeError, RemoteError) as error:
+    except RemoteError as error:
+        print(str(error), file=sys.stderr)
+        if command == "plugin-status" and options.identity is not None and error.code == UPDATE_NOT_FOUND:
+            print("如需查看全部已安装插件的当前状态，请直接运行不带参数的 plugin-status。", file=sys.stderr)
+        return 1
+    except (ValueError, RuntimeError) as error:
         print(str(error), file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    return 0
+
+
+# 在线启停：返回 0 成功、1 被拒绝（原因已打印）、3 没有运行中的实例（调用方回落到只写 patch）。
+NO_INSTANCE = 3
+# 运行中的 Core 不认识这个方法（比磁盘上的命令旧），调用方可以退回本地检测。
+UNSUPPORTED = 4
+
+
+async def set_enabled_main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path) -> int:
+    plugin_id, switch = arguments
+    try:
+        result = await request(workspace, "plugin/set-enabled", {"plugin_id": plugin_id, "enabled": switch == "on"})
+    except (ConnectionError, OSError):
+        return NO_INSTANCE
+    except (RemoteError, ValueError, RuntimeError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(f"插件已{'启用' if switch == 'on' else '禁用'}（在线）: {plugin_id} {result.get('publication_state', '')}".strip())
+    return 0
+
+
+# 问运行中的 Core 哪些前置条件不满足，输出一行 JSON：{"unmet": [...]}。
+async def prerequisites_main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path) -> int:
+    try:
+        result = await request(workspace, "plugin/prerequisites", {"needs": list(arguments)})
+    except (ConnectionError, OSError):
+        return NO_INSTANCE
+    except RemoteError as error:
+        print(str(error), file=sys.stderr)
+        return UNSUPPORTED if error.code == -32601 else 1
+    except (ValueError, RuntimeError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    print(json.dumps({"unmet": result.get("unmet", [])}, ensure_ascii=False))
     return 0
 
 

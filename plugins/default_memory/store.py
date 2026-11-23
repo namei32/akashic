@@ -4,14 +4,15 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import re
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 from collections.abc import Iterator, Mapping, Sequence
 from .schema import Draft, Fact, Memory, Source
-from .retrieval import cosine, normalized
+from .retrieval import normalized
 
 _SCHEMA = """
 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -63,8 +64,33 @@ class Store:
                 db.execute("INSERT INTO metadata VALUES ('schema','1')")
                 db.commit()
             version = db.execute("SELECT value FROM metadata WHERE key='schema'").fetchone()
-            if version is None or version[0] != "1":
+            if version is None or version[0] not in {"1", "2", "3", "4"}:
                 raise ValueError("Unsupported Default Memory schema")
+            if version[0] == "1":
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("CREATE TABLE evidence_links (memory_id TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(memory_id,message_id))")
+                db.execute("CREATE TABLE replacements (source_key TEXT NOT NULL,previous_id TEXT NOT NULL,current_id TEXT NOT NULL,reason TEXT NOT NULL,evidence TEXT NOT NULL,PRIMARY KEY(source_key,previous_id,current_id))")
+                for origin in db.execute("SELECT memory_id,evidence_ids FROM origins").fetchall():
+                    refs = json.loads(origin["evidence_ids"])
+                    if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
+                        raise ValueError("Invalid historical origin; migration not committed")
+                    db.executemany("INSERT OR IGNORE INTO evidence_links VALUES (?,?)", [(origin["memory_id"], ref) for ref in refs])
+                db.execute("UPDATE metadata SET value='2' WHERE key='schema'")
+                db.commit()
+            # Partial event dates are valid in schema 3 but rejected by older
+            # readers. Advance before any new fact can be written.
+            if version[0] in {"1", "2"}:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("UPDATE metadata SET value='3' WHERE key='schema'")
+                db.commit()
+            # Source retractions must never be silently ignored by old readers.
+            if version[0] in {"1", "2", "3"}:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("CREATE TABLE source_retractions (graph TEXT NOT NULL, message_id TEXT NOT NULL, "
+                           "event_key TEXT NOT NULL, actor_message_id TEXT NOT NULL, reason TEXT NOT NULL, "
+                           "PRIMARY KEY(graph,message_id))")
+                db.execute("UPDATE metadata SET value='4' WHERE key='schema'")
+                db.commit()
 
     @contextmanager
     def connection(self, *, create: bool = False, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -103,17 +129,62 @@ class Store:
                       tuple(json.loads(row["embedding"])), row["reinforcement"],
                       row["created_at"], row["updated_at"], row["status"], row["source_key"])
 
+    @staticmethod
+    def _references(raw: str) -> tuple[str, ...]:
+        value = json.loads(raw)
+        if not isinstance(value, list) or not value or any(not isinstance(ref, str) or not ref for ref in value):
+            raise ValueError("Invalid stored source evidence")
+        return tuple(value)
+
+    @staticmethod
+    def _source_users(raw: str) -> tuple[str, ...]:
+        value = json.loads(raw)
+        if not isinstance(value, dict) or not isinstance(value.get("user_ids"), list):
+            raise ValueError("Invalid stored learning source")
+        users = value["user_ids"]
+        if not users or any(not isinstance(ref, str) or not ref for ref in users):
+            raise ValueError("Invalid stored learning source users")
+        return tuple(users)
+
+    @staticmethod
+    def _retracted(db: sqlite3.Connection, graph: str) -> set[str]:
+        return {row[0] for row in db.execute(
+            "SELECT message_id FROM source_retractions WHERE graph=?", (graph,))}
+
     def initiative_retracted(self, db: sqlite3.Connection, graph: str) -> set[str]:
-        # This schema supersedes whole items; source-level retractions arrive in v2.
-        return set()
+        return self._retracted(db, graph)
 
     def initiative_project(self, db: sqlite3.Connection, row: sqlite3.Row, removed: set[str]) -> Memory:
-        return self.decode(row)
+        return self.project(db, row, removed)
+
+    def retracted_evidence(self) -> frozenset[str]:
+        with self.connection() as db:
+            return frozenset(row[0] for row in db.execute("SELECT message_id FROM source_retractions"))
+
+    def project(self, db: sqlite3.Connection, row: sqlite3.Row,
+                retracted: set[str] | None = None) -> Memory:
+        """Read active facts with surviving evidence, retaining canonical rows."""
+        item = self.decode(row)
+        removed = self._retracted(db, item.graph) if retracted is None else retracted
+        if item.status != "active" or not removed:
+            return item
+        for origin in db.execute(
+            "SELECT o.evidence_ids,l.source FROM origins o LEFT JOIN learning l ON l.source_key=o.source_key "
+            "WHERE o.memory_id=? ORDER BY o.rowid", (item.id,)):
+            if origin[1] is None:
+                raise ValueError("Memory origin has no learning source")
+            refs = self._references(origin[0])
+            context = self._source_users(origin[1])
+            if not (set(refs) | set(context)) & removed:
+                return replace(item, fact=item.fact.model_copy(update={"evidence_ids": refs}))
+        raise ValueError("Active memory has no surviving source evidence")
 
     def items(self, graph: str) -> tuple[Memory, ...]:
         with self.connection() as db:
-            rows = db.execute("SELECT * FROM memory_items WHERE graph=? AND status='active' ORDER BY id", (graph,))
-            found = tuple(self.decode(row) for row in rows)
+            db.execute("BEGIN")
+            rows = db.execute("SELECT * FROM memory_items WHERE graph=? AND status='active' ORDER BY id", (graph,)).fetchall()
+            removed = self._retracted(db, graph)
+            found = tuple(self.project(db, row, removed) for row in rows)
         dimension = self.dimension()
         if found and dimension is None:
             raise ValueError("Stored memories have no embedding space")
@@ -126,6 +197,49 @@ class Store:
             return {}
         with self.connection() as db:
             return {r[0]: (r[1], r[2]) for r in db.execute("SELECT source_key,digest,state FROM learning")}
+
+    def applied_turn_users(self, excluded: frozenset[str]) -> dict[tuple[str, str], list[tuple[str, tuple[str, ...]]]]:
+        """Retain only completed turn extractions that did not see excluded inputs."""
+        found: dict[tuple[str, str], list[tuple[str, tuple[str, ...]]]] = {}
+        with self.connection() as db:
+            for source_key, raw in db.execute(
+                "SELECT source_key,source FROM learning WHERE state='applied' "
+                "AND (source_key LIKE 'turn:%' OR source_key LIKE 'turn-fragment:%')"):
+                source = json.loads(raw)
+                if (not isinstance(source, dict) or not isinstance(source.get("session_id"), str)
+                        or not isinstance(source.get("ending_id"), str)):
+                    raise ValueError("Invalid applied turn source")
+                users = self._source_users(raw)
+                if set(users) & excluded:
+                    continue
+                key = (source["session_id"], source["ending_id"])
+                found.setdefault(key, []).append((source_key, users))
+        return found
+
+    def forgotten_evidence(self) -> frozenset[str]:
+        with self.connection() as db:
+            db.execute("BEGIN")
+            removed: dict[str, set[str]] = {}
+            for graph, message_id in db.execute("SELECT graph,message_id FROM source_retractions"):
+                removed.setdefault(graph, set()).add(message_id)
+            result = {ref for values in removed.values() for ref in values}
+            rows = db.execute(
+                "SELECT m.graph,c.evidence,e.message_id FROM changes c "
+                "JOIN memory_items m ON m.id=c.memory_id "
+                "JOIN evidence_links e ON e.memory_id=m.id WHERE c.action='forget'")
+            for graph, raw, message_id in rows:
+                if not set(self._references(raw)) <= removed.get(graph, set()):
+                    result.add(message_id)
+            return frozenset(result)
+
+    def applied(self, source: Source) -> tuple[str, ...] | None:
+        with self.connection() as db:
+            row = db.execute("SELECT digest,state,result FROM learning WHERE source_key=?", (source.key,)).fetchone()
+        if row is None:
+            return None
+        if row["digest"] != source.digest:
+            raise ValueError("Source changed after memory admission")
+        return tuple(json.loads(row["result"])) if row["state"] == "applied" else None
 
     def draft(self, source: Source) -> Draft | None:
         with self.connection() as db:
@@ -160,14 +274,14 @@ class Store:
         with self.connection(write=True) as db:
             db.execute("BEGIN IMMEDIATE")
             saved = db.execute("SELECT * FROM learning WHERE source_key=?", (source.key,)).fetchone()
-            if saved is None or saved["digest"] != source.digest or saved["draft"] != draft.model_dump_json():
+            if saved is None or saved["digest"] != source.digest or Draft.model_validate_json(saved["draft"]) != draft:
                 raise ValueError("Learning must apply the durable draft from its exact source")
             if saved["state"] == "applied":
                 return tuple(json.loads(saved["result"]))
             for index, action in enumerate(draft.retract):
                 row = db.execute("SELECT * FROM memory_items WHERE id=? AND graph=?",
                                  (action.memory_id, source.graph)).fetchone()
-                if row is None or row["source_key"] == source.key:
+                if row is None or row["source_key"] == source.key or row["status"] != "active":
                     raise ValueError("Invalid retraction target")
                 db.execute("UPDATE memory_items SET status='superseded' WHERE id=?", (action.memory_id,))
                 db.execute("INSERT INTO changes VALUES (?,?,?,?,?)",
@@ -175,21 +289,27 @@ class Store:
                             action.reason, encode(action.evidence_ids)))
             result: list[str] = []
             for index, (fact, vector) in enumerate(zip(draft.facts, vectors, strict=True)):
-                content_hash = digest([fact.kind, fact.summary])
+                content_hash = digest([fact.kind, fact.summary, fact.happened_at] if fact.happened_at else [fact.kind, fact.summary])
                 existing = db.execute(
                     "SELECT * FROM memory_items WHERE graph=? AND kind=? AND content_hash=? AND status='active' ORDER BY id LIMIT 1",
                     (source.graph, fact.kind, content_hash)).fetchone()
                 if existing is None and fact.kind == "event":
+                    # Similarity alone cannot establish identity: 124 and 132 points
+                    # must remain different facts. Only equivalent wording may reuse.
+                    signature = re.sub(r"[^\w]", "", fact.summary.casefold())
                     for row in db.execute("SELECT * FROM memory_items WHERE graph=? AND kind='event' AND status='active' ORDER BY id", (source.graph,)):
                         old = self.decode(row)
                         age = (datetime.fromisoformat(source.timestamp) - datetime.fromisoformat(old.updated_at)).total_seconds()
-                        if 0 <= age <= 7 * 86400 and cosine(vector, old.vector) >= .92:
+                        same_text = signature == re.sub(r"[^\w]", "", old.fact.summary.casefold())
+                        if same_text and fact.happened_at == old.fact.happened_at and 0 <= age <= 7 * 86400:
                             existing = row
                             break
                 if existing is not None:
                     identity = existing["id"]
-                    db.execute("UPDATE memory_items SET reinforcement=reinforcement+1,updated_at=max(updated_at,?) WHERE id=?",
-                               (source.timestamp, identity))
+                    known = {r[0] for r in db.execute("SELECT message_id FROM evidence_links WHERE memory_id=?", (identity,))}
+                    if not set(fact.evidence_ids) <= known:
+                        db.execute("UPDATE memory_items SET reinforcement=reinforcement+1,updated_at=max(updated_at,?) WHERE id=?",
+                                   (source.timestamp, identity))
                 else:
                     identity = "dm_" + digest([source.key, index])[:24]
                     db.execute("INSERT INTO memory_items VALUES (?,?,?,?,?,?,1,?,?,'active',?)",
@@ -197,7 +317,16 @@ class Store:
                                 encode(vector), source.timestamp, source.timestamp, source.key))
                 db.execute("INSERT INTO origins VALUES (?,?,?,?)",
                            (source.key, index, identity, encode(fact.evidence_ids)))
+                db.executemany("INSERT OR IGNORE INTO evidence_links VALUES (?,?)",
+                               [(identity, ref) for ref in fact.evidence_ids])
                 result.append(identity)
+            for action in draft.retract:
+                if action.replacement_index is not None:
+                    if action.replacement_index >= len(result):
+                        raise ValueError("Replacement points outside this draft")
+                    db.execute("INSERT INTO replacements VALUES (?,?,?,?,?)",
+                               (source.key, action.memory_id, result[action.replacement_index],
+                                action.reason, encode(action.evidence_ids)))
             db.execute("UPDATE learning SET state='applied',result=? WHERE source_key=?",
                        (encode(result), source.key))
             self._metadata(db, "last_learned_at", datetime.now(UTC).isoformat())
@@ -398,6 +527,7 @@ class Store:
             return {
                 "initialized": True,
                 "learning": dict(db.execute("SELECT state,count(*) FROM learning GROUP BY state")),
+                "source_counts": dict(db.execute("SELECT CASE WHEN source_key LIKE 'turn:%' OR source_key LIKE 'turn-fragment:%' THEN 'turn' WHEN source_key LIKE 'checkpoint:%' THEN 'checkpoint' ELSE 'explicit' END,count(*) FROM learning WHERE state='applied' GROUP BY 1")),
                 "memories": dict(db.execute("SELECT status,count(*) FROM memory_items GROUP BY status")),
                 "kinds": dict(db.execute("SELECT kind,count(*) FROM memory_items WHERE status='active' GROUP BY kind")),
                 "receipts": db.execute("SELECT count(*) FROM receipts").fetchone()[0],

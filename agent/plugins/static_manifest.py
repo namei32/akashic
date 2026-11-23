@@ -8,7 +8,9 @@ import json
 import os
 import re
 import sys
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path, PurePosixPath
@@ -18,7 +20,14 @@ from agent.plugins.manifest import plugins_root
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_IMAGE_REF = re.compile(r"^[^\s@]+@sha256:[0-9a-f]{64}$")
 _PYTHON_COMMAND = re.compile(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?")
+
+
+# 插件名规则的唯一出处：manifest 与 extra 仓库 index 的名字校验共用。
+def is_plugin_name(value: object) -> bool:
+    return isinstance(value, str) and _NAME.fullmatch(value) is not None
+
 
 
 class PluginSourceContentError(ValueError):
@@ -57,6 +66,7 @@ class StaticPluginManifest:
     identity_digest: str
     entrypoints: tuple[tuple[str, str], ...] = ()
     ingress_guard: bool = False
+    images: tuple[str, ...] = ()
 
     @property
     def requirements(self) -> tuple[str, ...]:
@@ -77,6 +87,7 @@ def load_static_plugin_manifest(plugin_root: Path) -> StaticPluginManifest:
     python = _python_runtimes(root)
     entrypoints = _plugin_entrypoints(root / "plugin.py")
     ingress_guard = _plugin_ingress_guard(root / "plugin.py")
+    images = _plugin_images(root / "plugin.py")
     identity: dict[str, object] = {
         "name": name,
         "version": version,
@@ -93,6 +104,7 @@ def load_static_plugin_manifest(plugin_root: Path) -> StaticPluginManifest:
         identity["entrypoints"] = dict(entrypoints)
     if ingress_guard:
         identity["ingress_guard"] = True
+    # images 不进身份摘要：加入它会改变已有记录的 manifest_digest，历史归属凭证依赖该值。
     identity_digest = hashlib.sha256(
         json.dumps(
             identity,
@@ -109,6 +121,7 @@ def load_static_plugin_manifest(plugin_root: Path) -> StaticPluginManifest:
         identity_digest=identity_digest,
         entrypoints=entrypoints,
         ingress_guard=ingress_guard,
+        images=images,
     )
 
 
@@ -131,6 +144,45 @@ def _plugin_ingress_guard(path: Path) -> bool:
     guard = values[0].value
     _write_fact("ingress_guard", source, guard)
     return guard
+
+
+# 镜像声明只接受顶层字面量字符串元组，供安装侧在不执行插件的前提下预拉镜像。
+def _plugin_images(path: Path) -> tuple[str, ...]:
+    """按源码内容缓存镜像声明，和身份、命令入口共用事实缓存。"""
+    source = path.read_text(encoding="utf-8")
+    cached = _read_fact("images", source)
+    if isinstance(cached, list) and all(isinstance(item, str) for item in cast(list[object], cached)):
+        return tuple(cast(list[str], cached))
+    images = _parse_images_tree(path, source)
+    _write_fact("images", source, list(images))
+    return images
+
+
+def _parse_images_tree(path: Path, source: str) -> tuple[str, ...]:
+    tree = _parse_source_tree(path, source)
+    declarations: list[ast.expr | None] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            if not any(isinstance(target, ast.Name) and target.id == "images" for target in statement.targets):
+                continue
+            if len(statement.targets) != 1:
+                raise PluginSourceContentError("images 必须单独声明")
+            declarations.append(statement.value)
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.target.id == "images":
+            declarations.append(statement.value)
+    if not declarations:
+        return ()
+    declaration = declarations[0]
+    if len(declarations) != 1 or not isinstance(declaration, ast.Tuple):
+        raise PluginSourceContentError("images 必须是单次字面 tuple 声明")
+    images: list[str] = []
+    for item in declaration.elts:
+        if not isinstance(item, ast.Constant) or not isinstance(item.value, str) or _IMAGE_REF.fullmatch(item.value) is None:
+            raise PluginSourceContentError(f"images 只接受 sha256 digest 字面量: {path}")
+        if item.value in images:
+            raise PluginSourceContentError(f"images 重复: {item.value}")
+        images.append(item.value)
+    return tuple(images)
 
 
 def _plugin_entrypoints(path: Path) -> tuple[tuple[str, str], ...]:
@@ -252,9 +304,22 @@ def _cached_entrypoints(value: object) -> tuple[tuple[str, str], ...] | None:
     return entries if list(entries) == pairs else None
 
 
+_READ_ONLY_FACTS: ContextVar[bool] = ContextVar("manifest_facts_read_only", default=False)
+
+
+# 只读命令在此作用域内照常读取已有事实，但不创建目录或写入新事实。
+@contextmanager
+def read_only_manifest_facts() -> Generator[None]:
+    token = _READ_ONLY_FACTS.set(True)
+    try:
+        yield
+    finally:
+        _READ_ONLY_FACTS.reset(token)
+
+
 def _write_fact(kind: str, source: str, value: object) -> None:
     path = _fact_path(kind, source)
-    if path is None or sys.dont_write_bytecode:
+    if path is None or sys.dont_write_bytecode or _READ_ONLY_FACTS.get():
         return
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:

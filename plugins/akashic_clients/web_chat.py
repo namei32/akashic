@@ -4,10 +4,8 @@ import asyncio
 from core.common.diagnostic_log import log_timing
 import logging
 import mimetypes
-import os
 from datetime import datetime, timezone
-from pathlib import Path
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Callable, Coroutine, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
 from typing import Any, cast
 from uuid import uuid4
@@ -17,6 +15,8 @@ from plugins.channels.contract import (
     AttachmentReadLease,
     AttachmentRef,
     ChannelInboundMessage,
+    InputPartRejected,
+    read_input_parts,
     ChannelAttachmentReadPort,
     ChannelCommitRole,
     ChannelFactoryContext,
@@ -39,15 +39,16 @@ from plugins.channels.contract import (
     TurnStreamEventKind,
     DeliveryStatus as PresentationDeliveryStatus,
 )
+from core.common.file_io import drain_uninterruptible
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
-from .services import AttachmentStorePort as AttachmentStore
 from .services import ArtifactStorePort as ChannelAttachmentArtifactStore
-from plugins.ui.contract import MessageDisplayReader, follow_messages
+from plugins.ui.contract import MessageDisplayReader, PluginUiEmit, follow_messages
 from .services import (
     MessageCatalogPort as MessageCatalog,
     MessageConflict,
+    SteerPort,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,11 +203,9 @@ class WebChatChannel:
 
     def __init__(self, channel_name: str = "akashic") -> None:
         self.name = channel_name
-        self._attachments: AttachmentStore | None = None
         self._artifact_store: ChannelAttachmentArtifactStore | None = None
         self._connections: dict[str, set[WebSocket]] = {}
         self._pending_terminal: dict[str, dict[str, Any]] = {}
-        self._media_paths: set[str] = set()
         self._connection_lock = asyncio.Lock()
         self._events_bound = False
         self._v3_adapters: dict[str, WebNativeChannelAdapter] = {}
@@ -215,14 +214,17 @@ class WebChatChannel:
         self._reply_status: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None
         self._session_activity: Callable[[], AsyncGenerator[dict[str, object], None]] | None = None
         self._message_display: MessageDisplayReader | None = None
-        self._jobs: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None
-        self._stop_job: Callable[[str, str], Awaitable[bool]] | None = None
+        self._plugin_events: Callable[[str, PluginUiEmit], Coroutine[Any, Any, None]] | None = None
         self._followers: dict[WebSocket, tuple[str, asyncio.Task[None]]] = {}
         self._stopping = False
         self._presentation_subscription: StreamSubscription | None = None
         self._client_sessions: dict[str, str] = {}
         self._turn_sessions: dict[str, str] = {}
         self._turn_contents: dict[str, str] = {}
+        self._steer: SteerPort | None = None
+
+    def bind_steer(self, steer: SteerPort) -> None:
+        self._steer = steer
 
     def bind_session_activity(self, follow: Callable[[], AsyncGenerator[dict[str, object], None]]) -> None:
         """每条连接只拥有一个通道级摘要订阅，与当前会话的正文跟随独立。"""
@@ -243,8 +245,7 @@ class WebChatChannel:
         scope: Callable[[], Any],
         *,
         reply_status: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None,
-        jobs: Callable[[str], AsyncGenerator[dict[str, object], None]] | None = None,
-        stop_job: Callable[[str, str], Awaitable[bool]] | None = None,
+        plugin_events: Callable[[str, PluginUiEmit], Coroutine[Any, Any, None]] | None = None,
     ) -> None:
         """Bind a request scope factory instead of retaining a host provider."""
 
@@ -259,12 +260,10 @@ class WebChatChannel:
             if self._reply_status is not None and self._reply_status is not reply_status:
                 raise RuntimeError("Web reply status reader 不允许替换")
             self._reply_status = reply_status
-        if jobs is not None:
-            if self._jobs is not None and self._jobs != jobs:
-                raise RuntimeError("Web jobs reader 不允许替换")
-            self._jobs = jobs
-        if stop_job is not None:
-            self._stop_job = stop_job
+        if plugin_events is not None:
+            if self._plugin_events is not None and self._plugin_events != plugin_events:
+                raise RuntimeError("Web plugin events reader 不允许替换")
+            self._plugin_events = plugin_events
 
     @asynccontextmanager
     async def _open_message_catalog(self) -> AsyncIterator[MessageCatalog]:
@@ -302,12 +301,6 @@ class WebChatChannel:
         Core event type from becoming a hidden client dependency.
         """
         return None
-
-    def bind_attachment_store(self, store: AttachmentStore) -> None:
-        """在 channel 启动前为独立 Chat API 绑定显式附件目录。"""
-
-        if self._attachments is None:
-            self._attachments = store
 
     def bind_artifact_store(self, store: ChannelAttachmentArtifactStore) -> None:
         """绑定 Core-owned artifact store，供 Web upload/read API 使用。"""
@@ -541,8 +534,8 @@ class WebChatChannel:
         async with self._open_message_catalog() as messages:
             changes = messages.follow_metadata()
         async with aclosing(changes):
-            async for _ in changes:
-                await websocket.send_json({"type": "sessions.changed", "version": 2})
+            async for epoch in changes:
+                await websocket.send_json({"type": "sessions.changed", "version": 2, "catalog_epoch": epoch})
     async def _send_session_activity(self, websocket: WebSocket) -> None:
         """只发送变化的摘要；连接断开后由连接 scope 取消并排空。"""
         assert self._session_activity is not None
@@ -580,74 +573,34 @@ class WebChatChannel:
     ) -> dict[str, object]:
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
-        suffix = Path(filename).suffix
-        if not suffix:
-            guessed = mimetypes.guess_extension(mimetypes.guess_type(filename)[0] or "")
-            suffix = guessed or ".bin"
-        if self._artifact_store is not None:
-            data = bytearray()
-            total = 0
-            async for chunk in chunks:
-                if not isinstance(chunk, bytes):
-                    raise TypeError("上传 chunk 必须是 bytes")
-                total += len(chunk)
-                if total > max_bytes:
-                    raise UploadTooLargeError(
-                        f"上传内容超过 {max_bytes // (1024 * 1024)}MB 限制"
-                    )
-                data.extend(chunk)
-            if total == 0:
-                raise ValueError("上传内容不能为空")
-            media_type = mimetypes.guess_type(filename)[0]
-            kind = (
-                V3AttachmentKind.IMAGE
-                if media_type is not None and media_type.startswith("image/")
-                else V3AttachmentKind.FILE
-            )
-            ref = await self._artifact_store.import_bytes(
-                bytes(data),
-                kind=kind,
-                filename=filename,
-                media_type=media_type,
-            )
-            return self._artifact_result(ref)
-
-        store = self._require_attachment_store()
-        staging = store.create_staging_path(prefix=".web_", suffix=".part")
+        if self._artifact_store is None:
+            raise RuntimeError("Web artifact store 尚未绑定")
+        data = bytearray()
         total = 0
-        try:
-            fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                async for chunk in chunks:
-                    if not isinstance(chunk, bytes):
-                        raise TypeError("上传 chunk 必须是 bytes")
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise UploadTooLargeError(f"上传内容超过 {max_bytes // (1024 * 1024)}MB 限制")
-                    handle.write(chunk)
-                if total == 0:
-                    raise ValueError("上传内容不能为空")
-                handle.flush()
-                os.fsync(handle.fileno())
-            path = store.publish_staging(staging, prefix="web_", suffix=suffix)
-        except BaseException as exc:
-            try:
-                staging.unlink(missing_ok=True)
-            except OSError as cleanup_error:
-                raise BaseExceptionGroup(
-                    "Web 上传 staging 清理失败",
-                    [exc, cleanup_error],
-                ) from exc
-            raise
-        return self._upload_result(filename, path)
-
-    @staticmethod
-    def _upload_result(filename: str, path: Path) -> dict[str, Any]:
-        return {
-            "filename": filename,
-            "upload_path": str(path),
-            "upload_url": f"/api/chat/media?path={str(path)}",
-        }
+        async for chunk in chunks:
+            if not isinstance(chunk, bytes):
+                raise TypeError("上传 chunk 必须是 bytes")
+            total += len(chunk)
+            if total > max_bytes:
+                raise UploadTooLargeError(
+                    f"上传内容超过 {max_bytes // (1024 * 1024)}MB 限制"
+                )
+            data.extend(chunk)
+        if total == 0:
+            raise ValueError("上传内容不能为空")
+        media_type = mimetypes.guess_type(filename)[0]
+        kind = (
+            V3AttachmentKind.IMAGE
+            if media_type is not None and media_type.startswith("image/")
+            else V3AttachmentKind.FILE
+        )
+        ref = await self._artifact_store.import_bytes(
+            bytes(data),
+            kind=kind,
+            filename=filename,
+            media_type=media_type,
+        )
+        return self._artifact_result(ref)
 
     @staticmethod
     def _artifact_result(ref: AttachmentRef) -> dict[str, Any]:
@@ -694,27 +647,6 @@ class WebChatChannel:
             await lease.aclose()
         return data, ref.media_type, ref.filename
 
-    def upload_roots(self) -> list[Path]:
-        return [self._require_attachment_store().root]
-
-    def _require_attachment_store(self) -> AttachmentStore:
-        if self._attachments is None:
-            raise RuntimeError("WebChatChannel 尚未绑定附件目录")
-        return self._attachments
-
-    def remember_media(self, paths: list[str]) -> None:
-        for path in paths:
-            text = str(path or "").strip()
-            if not text or text.startswith(("http://", "https://")):
-                continue
-            try:
-                self._media_paths.add(str(Path(text).expanduser().resolve()))
-            except OSError:
-                continue
-
-    def has_media(self, path: Path) -> bool:
-        return str(path.resolve()) in self._media_paths
-
     async def deliver_v3(
         self,
         request: ProviderDeliveryRequest,
@@ -746,12 +678,8 @@ class WebChatChannel:
             if result is None:
                 metadata = cast(dict[str, Any], _thaw_json(request.metadata))
                 metadata.pop("_channel_commit_role", None)
-                if request.commit_role.value != "passive":
-                    metadata.setdefault("source", "message_push")
-                independent_delivery = (
-                    request.commit_role is not ChannelCommitRole.PASSIVE
-                    or metadata.get("source") == "message_push"
-                )
+                # 被动最终帧属于某次回复执行；其余投递（主动推送等）各自独立成帧。
+                independent_delivery = request.commit_role is not ChannelCommitRole.PASSIVE
                 if not independent_delivery and (
                     request.execution_attempt_id is None
                     or request.control_turn_id is None
@@ -892,27 +820,22 @@ class WebChatChannel:
             if tasks is None:
                 raise RuntimeError("消息订阅需要 WebSocket 任务 scope")
             return await self._follow_session(websocket, request_id, payload, tasks)
+        if frame_type == "session.unfollow":
+            # 回到空白页时只放下正文跟随，连接与侧栏订阅照旧；之后的 session.follow 会重新绑定。
+            await self._cancel_follow(websocket)
+            await self._remove_connection(websocket)
+            return ""
         if frame_type == "message.send":
             return await self._send_user_message(websocket, request_id, payload)
-        if frame_type == "job.stop":
-            await self._request_job_stop(websocket, request_id, payload)
-            return ""
+        if frame_type == "message.steer":
+            return await self._steer_message(websocket, request_id, payload)
+        if frame_type == "message.steer.withdraw":
+            return await self._withdraw_steer(websocket, request_id, payload)
         if frame_type == "ping":
             await websocket.send_json({"type": "pong", "request_id": request_id})
             return ""
         await self._send_error(websocket, request_id, f"未知消息类型: {frame_type}")
         return ""
-
-    # 用户停止后台任务：只回答是否受理，行状态经 session.jobs 帧收敛（停止中 → 已停止）。
-    async def _request_job_stop(self, websocket: WebSocket, request_id: str, payload: dict[str, Any]) -> None:
-        try:
-            session_id = self._normalize_session_id(payload.get("session_id"))
-        except ValueError:
-            session_id = ""
-        job_id = payload.get("job_id")
-        accepted = (self._stop_job is not None and bool(session_id) and isinstance(job_id, str) and bool(job_id)
-                    and await self._stop_job(session_id, job_id))
-        await websocket.send_json({"type": "job.stop.result", "request_id": request_id, "accepted": accepted})
 
     async def _follow_session(
         self, websocket: WebSocket, request_id: str, payload: dict[str, Any], tasks: asyncio.TaskGroup,
@@ -928,7 +851,7 @@ class WebChatChannel:
             if type(after_seq) is not int or after_seq < -1:
                 raise ValueError("after_seq 必须是大于等于 -1 的整数")
             async with self._open_message_catalog() as messages:
-                head = messages.reader(session_id).head()
+                head = await messages.reader(session_id).head_async()
             if after_seq > head:
                 raise ValueError("after_seq 超过当前消息 head")
         except ValueError as error:
@@ -974,9 +897,11 @@ class WebChatChannel:
 
         async with asyncio.TaskGroup() as tasks:
             _ = tasks.create_task(send_messages())
-            # 后台任务镜像可选：jobs 插件缺席时不发帧，前端按空列表处理。
-            if self._jobs is not None:
-                _ = tasks.create_task(send("session.jobs", self._jobs(session_id)))
+            # 插件推给自己界面的会话状态；宿主只转发，value 为 null 表示该插件的状态已失效。
+            if self._plugin_events is not None:
+                async def send_plugin_event(frame: dict[str, object]) -> None:
+                    await websocket.send_json({"type": "plugin_ui.event", "session_id": session_id, **frame})
+                _ = tasks.create_task(self._plugin_events(session_id, send_plugin_event))
             if self._reply_status is None:
                 await websocket.send_json({"type": "reply.status", "version": 2,
                     "session_id": session_id, "snapshot_id": None, "available": False, "items": []})
@@ -1025,6 +950,38 @@ class WebChatChannel:
         await self._add_connection(session_key, websocket)
         return session_key
 
+    # 生成中的插话：有回复在进行就暂存到下一步；否则按普通消息发送，客户端照常等 message.accepted。
+    async def _steer_message(self, websocket: WebSocket, request_id: str, payload: dict[str, Any]) -> str:
+        # 1. 插话只带正文；附件、引用和输入片段仍走普通发送。
+        try:
+            session_key = self._normalize_session_id(payload.get("session_id"))
+        except ValueError as error:
+            await self._send_error(websocket, request_id, str(error))
+            return ""
+        text = payload.get("text")
+        if not session_key or not isinstance(text, str) or not text.strip():
+            await self._send_error(websocket, request_id, "插话需要会话和非空正文")
+            return session_key
+        chat_id = self._chat_id(session_key)
+        message = ChannelInboundMessage(
+            channel=self.name, sender="web", chat_id=chat_id, content=_normalize_v3_content(text),
+            timestamp=datetime.now(timezone.utc), metadata=cast(Any, {"client_request_id": request_id}),
+        )
+        # 2. 暂存成功即确认；没有可接纳插话的回复时只回 staged=false，由客户端走普通发送并等它的确认。
+        staged = self._steer is not None and await self._steer.stage(session_key, request_id, message)
+        await websocket.send_json({"type": "message.steer.result", "request_id": request_id, "staged": staged})
+        return session_key
+
+    async def _withdraw_steer(self, websocket: WebSocket, request_id: str, payload: dict[str, Any]) -> str:
+        session_id = payload.get("session_id")
+        message_id = payload.get("message_id")
+        withdrawn = (
+            self._steer is not None and isinstance(session_id, str) and isinstance(message_id, str)
+            and await self._steer.withdraw(session_id, message_id)
+        )
+        await websocket.send_json({"type": "message.steer.result", "request_id": request_id, "withdrawn": withdrawn})
+        return ""
+
     async def _send_user_message(
         self,
         websocket: WebSocket,
@@ -1033,7 +990,7 @@ class WebChatChannel:
     ) -> str:
         try:
             return await self._send_user_message_in_binding(websocket, request_id, payload)
-        except MessageConflict as error:
+        except (MessageConflict, InputPartRejected) as error:
             await self._send_error(websocket, request_id, str(error))
             return ""
 
@@ -1071,11 +1028,25 @@ class WebChatChannel:
                 return session_key
             if item.strip():
                 media.append(item)
-        if not text.strip() and not media:
-            await self._send_error(websocket, request_id, "text 和 media 不能同时为空")
+        try:
+            retry_of = _read_retry_of(payload)
+        except ValueError as error:
+            await self._send_error(websocket, request_id, str(error))
+            return session_key
+        parts: tuple[tuple[str, object], ...] = ()
+        if "parts" in payload:
+            try:
+                parts = read_input_parts(payload["parts"])
+            except InputPartRejected as error:
+                await self._send_error(websocket, request_id, str(error))
+                return session_key
+        if not text.strip() and not media and not parts and retry_of is None:
+            await self._send_error(websocket, request_id, "text、media 和 parts 不能同时为空")
             return session_key
         reply_to_message_id = payload.get("reply_to_message_id")
         metadata: dict[str, object] = {"client_request_id": request_id}
+        if retry_of is not None:
+            metadata["retry_of_client_message_id"] = retry_of
         attachments: tuple[AttachmentRef, ...] = ()
         if media and self._artifact_store is not None:
             try:
@@ -1091,25 +1062,8 @@ class WebChatChannel:
         elif media:
             await self._send_error(websocket, request_id, "Web artifact store 尚未绑定")
             return session_key
-        if "model_runtime_id" in payload:
-            model_runtime_id = payload["model_runtime_id"]
-            if not isinstance(model_runtime_id, str):
-                await self._send_error(
-                    websocket,
-                    request_id,
-                    "model_runtime_id 必须是字符串",
-                )
-                return session_key
-            metadata["model_runtime_id"] = model_runtime_id.strip()
-            model_reasoning_effort = payload.get("model_reasoning_effort", "")
-            if not isinstance(model_reasoning_effort, str):
-                await self._send_error(
-                    websocket,
-                    request_id,
-                    "model_reasoning_effort 必须是字符串",
-                )
-                return session_key
-            metadata["model_reasoning_effort"] = model_reasoning_effort.strip()
+        if parts:
+            metadata["input_parts"] = [{"kind": kind, "value": value} for kind, value in parts]
         if reply_to_message_id is not None:
             if not isinstance(reply_to_message_id, str) or not reply_to_message_id.strip():
                 await self._send_error(
@@ -1342,6 +1296,20 @@ def _thaw_json(value: object) -> object:
     return value
 
 
+# 重试只引用原 Input 的消息 ID；正文、附件、引用和输入片段都沿用原输入，不能顺带修改。
+def _read_retry_of(payload: Mapping[str, object]) -> str | None:
+    value = payload.get("retry_of")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("retry_of 必须是非空字符串")
+    text = payload.get("text")
+    if (isinstance(text, str) and text.strip()) or payload.get("media") or payload.get("parts") \
+            or payload.get("reply_to_message_id") is not None:
+        raise ValueError("重试只引用原 Input，不能同时修改正文、附件或引用")
+    return value.strip()
+
+
 def _normalize_web_request_id(value: object) -> str:
     """验证客户端 request_id，空值由 exact ingress 分配不可伪造的 id。"""
 
@@ -1361,12 +1329,7 @@ def _normalize_web_request_id(value: object) -> str:
 async def _settle_cleanup_task(task: asyncio.Task[Any]) -> Any:
     """完成 message.send 精确清理后再恢复原始失败。"""
 
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
-    return task.result()
+    return await drain_uninterruptible(task)
 
 
 __all__ = [

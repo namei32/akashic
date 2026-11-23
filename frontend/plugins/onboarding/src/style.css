@@ -14,13 +14,20 @@
   font-size: 0.875rem;
 }
 
+/* 能力状态同设置其他页一样收进分组卡，行间发丝线。 */
 .onboarding-overview-list {
   display: grid;
   width: 100%;
   margin: 8px 0 0;
   padding: 0;
+  overflow: hidden;
   list-style: none;
+  border: 1px solid var(--ak-rule-subtle);
+  border-radius: var(--ak-radius-md);
+  background: var(--ak-paper-sheet);
 }
+
+.onboarding-overview-list li + li { border-block-start: 1px solid var(--ak-rule-subtle); }
 
 .onboarding-overview-list a {
   display: flex;
@@ -28,20 +35,16 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 10px 4px;
-  border-block-end: 1px solid var(--ak-rule-subtle);
+  padding: 10px 16px;
   color: inherit;
   text-decoration: none;
 }
 
-.onboarding-overview-list li:first-child a {
-  border-block-start: 1px solid var(--ak-rule-subtle);
-}
+.onboarding-overview-list a:hover { background: color-mix(in oklab, var(--ak-ink-primary) 4%, transparent); }
+.onboarding-overview-list a:focus-visible { outline: 2px solid var(--ak-rule-focus); outline-offset: -2px; }
 
-.onboarding-overview-list a:hover strong {
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
+.onboarding-overview .onboarding-primary { min-width: 0; min-height: 36px; padding-inline: 16px; font-size: 14px; }
+@media (pointer: coarse) { .onboarding-overview .onboarding-primary { min-height: 44px; } }
 
 .onboarding-overview-list span {
   display: grid;
@@ -50,7 +53,8 @@
 }
 
 .onboarding-overview-list strong {
-  font-weight: 600;
+  font-size: 14px;
+  font-weight: 500;
 }
 
 .onboarding-overview-list small {
@@ -154,6 +158,7 @@
   flex: 1 1 0;
   border-radius: 2px;
   background: var(--ak-rule-strong);
+  /* motion-exempt: 首跑引导进度条，一次性，ADR 0166 已知限制 */
   transition: flex-grow var(--ak-sys-duration-short, 200ms) ease, background-color var(--ak-sys-duration-short, 200ms) ease;
 }
 
@@ -170,7 +175,7 @@
   min-height: 44px;
   padding-inline: 10px;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--ak-radius-sm);
   background: transparent;
   color: var(--ak-ink-muted);
   font: inherit;
@@ -231,7 +236,7 @@
   min-width: 132px;
   padding-inline: 22px;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--ak-radius-sm);
   background: var(--ak-color-action-primary);
   color: var(--ak-paper-editing);
   font: inherit;
@@ -330,7 +335,7 @@
   gap: 4px 16px;
   padding: 16px 18px;
   border: 1px solid var(--ak-rule-default);
-  border-radius: 12px;
+  border-radius: var(--ak-radius-md);
   background: var(--ak-paper-editing);
   transition: border-color 160ms ease, background-color 160ms ease;
 }
@@ -368,7 +373,7 @@
   margin-top: 2px;
   padding: 0;
   border: 0;
-  border-radius: 999px;
+  border-radius: var(--ak-radius-full);
   background: var(--ak-rule-strong);
   cursor: pointer;
   transition: background-color 180ms ease;
@@ -390,7 +395,7 @@
   height: 20px;
   border-radius: 50%;
   background: var(--ak-paper-editing);
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.25);
+  box-shadow: var(--ak-elevation-raised);
   transition: transform 200ms var(--ak-sys-motion-standard, cubic-bezier(0.2, 0, 0, 1));
 }
 
@@ -407,7 +412,7 @@
   grid-row: 1;
   align-self: start;
   padding: 2px 10px;
-  border-radius: 999px;
+  border-radius: var(--ak-radius-full);
   background: color-mix(in oklab, var(--ak-color-status-success) 12%, transparent);
   color: var(--ak-color-status-success);
   font-size: 0.75rem;
@@ -419,7 +424,7 @@
   gap: 8px;
   margin-top: 12px;
   padding: 12px 14px;
-  border-radius: 8px;
+  border-radius: var(--ak-radius-sm);
   background: var(--ak-paper-quiet);
   font-size: 0.875rem;
 }
@@ -458,7 +463,7 @@
   gap: 4px;
   margin: 0;
   padding: 14px 16px;
-  border-radius: 8px;
+  border-radius: var(--ak-radius-sm);
   background: rgb(var(--ak-color-status-warning-rgb) / 0.08);
   color: var(--ak-ink-secondary);
   font-size: 0.9375rem;

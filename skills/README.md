@@ -1,6 +1,6 @@
 # Builtin Skills Index
 
-本目录是随 Core 发布的内置 Skill：发行版把 `skills/` 打进 Core 制品，`standard_tools` 的 Skill 目录把它作为 `builtin` 来源读取。优先级从低到高：插件随包资产 < 内置 `skills/` < `~/.akashic/skills` < `<workspace>/skills`，高层同名覆盖低层。
+本目录是随 Core 发布的内置 Skill：发行版把 `skills/` 打进 Core 制品，`skills` 插件的技能目录把它作为 `builtin` 来源读取。优先级从低到高：插件随包资产 < 内置 `skills/` < `~/.akashic/skills` < `<workspace>/skills`，高层同名覆盖低层。
 
 ## 目录与格式
 
@@ -18,6 +18,10 @@
   - 把写好的插件提交、安装到当前实例（`plugin_install` 工具或实例自带命令行），核对状态并实际用一次后汇报。
   - 文件：`skills/verify-akashic-plugin/SKILL.md`
 
+- `develop-and-verify`
+  - 改带界面或服务的项目（含 Akashic 自身）时，在宿主上隔离地起真实服务、假掉外部依赖、用 computer 浏览器（`http://localhost:<端口>`）真实操作截图，验完再提 PR；附 OpenAI 兼容假模型脚本与 Akashic 开发实例参考。
+  - 文件：`skills/develop-and-verify/SKILL.md`
+
 - `codex-delegate`
   - 把长代码库任务委托给本机 Codex CLI 后台执行，完成时由后台任务通知回到当前会话。
   - 文件：`skills/codex-delegate/SKILL.md`
@@ -25,6 +29,10 @@
 - `skill-creater`
   - 创建或改写技能 `SKILL.md`，用于新增技能与结构迁移。
   - 文件：`skills/skill-creater/SKILL.md`
+
+- `skill-installer`
+  - 从 GitHub 仓库、子树链接或本地目录安装、更新、卸载技能到工作区或用户目录，无需编写插件即可热生效。
+  - 文件：`skills/skill-installer/SKILL.md`
 
 - `plugin-system`
   - 说明安装、更新时机、局部换代、卸载排空和结果核对；由内置 `plugin_update` 插件注册，与外部 Skill 使用同一资产链。

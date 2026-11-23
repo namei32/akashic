@@ -1,7 +1,9 @@
 """对话完成、命令与输入来源检查的公共合同。"""
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 from agent.plugin_composition import ServiceKey
@@ -23,6 +25,24 @@ CONVERSATION_COMMANDS = ServiceKey[
 ]("conversation.commands.v1")
 
 
+@dataclass(frozen=True, slots=True)
+class SteerBinding:
+    # 每一步模型请求之前调用的注入函数。
+    before_step: Callable[[], Awaitable[None]]
+    # 有插话待写入时置位，注入时清除。
+    arrived: asyncio.Event
+
+
+class ConversationSteer(Protocol):
+    """回复程序一侧的插话：只有登记过的任务接纳插话，渠道一侧见 CHANNEL_STEER。"""
+
+    # 登记本任务可接纳插话。
+    def bind(self, task: Task, session_id: str) -> SteerBinding: ...
+
+
+CONVERSATION_STEER = ServiceKey[ConversationSteer]("conversation.steer.v1")
+
+
 class OriginCheck(Protocol):
     def __call__(self, part: ContentPart) -> ContentReferences: ...
 
@@ -30,13 +50,11 @@ class OriginCheck(Protocol):
 CHECK_ORIGIN = ServiceKey[OriginCheck]("conversation.check_origin.v1")
 
 
-class TaskSessions(Protocol):
-    """任务与报告的可见会话选择；分配身份不写数据，接纳复用 Ledger。"""
-
-    async def choices(self) -> tuple[Mapping[str, str], ...]: ...
-    async def resolve(self, session_id: str) -> Mapping[str, str]: ...
-    def allocate(self, key: str) -> Mapping[str, str]: ...
-    async def ensure(self, session_id: str, title: str, *, inherit_from: str | None = None) -> None: ...
+class InputPartCheck(Protocol):
+    def __call__(self, part: ContentPart, reader: MessageReader) -> ContentReferences: ...
 
 
-TASK_SESSIONS = ServiceKey[TaskSessions]("conversation.task-sessions.v1")
+# 客户端随输入附带的片段（例如模型选择）由片段 owner 声明并在目标会话里校验；没有 owner 的 kind 一律拒收。
+# 值不合格时 owner 抛 plugins.channels.contract.InputPartRejected，渠道把它作为该请求的错误回给发送者；其他异常按程序错误处理。
+def input_part_key(kind: str) -> ServiceKey[InputPartCheck]:
+    return ServiceKey[InputPartCheck](f"conversation.input_part:{kind}")

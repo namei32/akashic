@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections.abc import Hashable, Mapping
 from contextlib import AbstractContextManager, AsyncExitStack, nullcontext
 from typing import cast
 
 from agent.plugin_composition.tasks import Task, TaskAdmission, TaskSlot
+from agent.plugin_composition import CompositionError
 from plugins.ledger.contract import MessageCatalog, MessageReader, MessageWriter, OwnerRecord
 from plugins.delivery.contract import (
     StartGuard,
 )
 from core.common.file_io import run_file_io
-from plugins.ledger.contract import Body, Message
+from plugins.ledger.contract import Body, Message, with_truncated_head
 
 from .api import OpenSender, Receipt, Sink
 from .records import Delivery, DeliveryRecords, Selection, delivery_key
+
+logger = logging.getLogger(__name__)
 
 
 class Deliveries:
@@ -35,6 +39,9 @@ class Deliveries:
     async def prepare_async(self, reader: MessageReader, message: Message,
                             sinks: tuple[Sink | Mapping[str, object], ...], *, passive: bool = False) -> Selection:
         return await self._records.prepare_async(reader, message, sinks, passive=passive)
+
+    async def reject_async(self, reader: MessageReader, message: Message, reason: str) -> Selection:
+        return await self._records.reject_async(reader, message, reason)
 
     async def publish_async(self, writer: MessageWriter, message_id: str, body: Body,
                             sinks: tuple[Sink | Mapping[str, object], ...], *, passive: bool = False) -> tuple[Message, Selection]:
@@ -125,7 +132,7 @@ class Deliveries:
                 await _drain(task)
             raise
 
-    async def retry(self, message_id: str, sink: str, *, start_guard: StartGuard | None = None) -> Receipt:
+    async def retry(self, message_id: str, sink: str) -> Receipt:
         """显式重试被拒绝的原效果；不改消息、目的地、绑定或幂等键。"""
         async def rearm(slot: TaskSlot) -> Task | None:
             record, delivery = self._records.read(message_id, sink)
@@ -140,7 +147,7 @@ class Deliveries:
         while True:
             previous = await self._tasks.admit_async((self._task_key, message_id, sink), rearm)
             if previous is None:
-                return await self.send(message_id, sink, start_guard=start_guard)
+                return await self.send(message_id, sink)
             try:
                 _ = await previous.join()
             except asyncio.CancelledError:
@@ -193,7 +200,23 @@ class Deliveries:
             if delivery.phase in {"delivered", "rejected", "failed"}:
                 assert delivery.receipt is not None
                 return delivery.receipt
-            sender = await scope.enter_async_context(self._open_sender(delivery.sink.binding_id))
+            # Opening has no external send effect; retry briefly, then close the record visibly.
+            for attempt in range(3):
+                try:
+                    sender = await scope.enter_async_context(self._open_sender(delivery.sink.binding_id))
+                    break
+                except (CompositionError, KeyError, OSError, ValueError) as error:
+                    if attempt < 2:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    result = Receipt(status="rejected" if delivery.phase == "prepared" else "failed",
+                        error=f"发送者无法打开（{type(error).__name__}）；"
+                              + ("尚未发送" if delivery.phase == "prepared" else "原发送结果未知，不自动重发"))
+                    logger.warning("[paused] 发送者打不开，重试用尽，回执落为 %s：message=%s sink=%s 原因=%s",
+                                   result.status, message_id, sink, type(error).__name__)
+                    _ = await self._records.save_async(message_id, record, Delivery(
+                        sink=delivery.sink, phase=result.status, receipt=result))
+                    return result
             # 1. 恢复已开始的发送；查询原回执，只有幂等协议允许重发。
             if delivery.phase == "started":
                 found = await sender.query(key, delivery.sink.address)
@@ -206,6 +229,7 @@ class Deliveries:
                     return found
                 if not sender.idempotent:
                     result = Receipt(status="failed", error="原发送中断且没有可查询回执；可能已送达，不自动重发")
+                    logger.warning("[paused] 原发送中断且无可查询回执，回执落为 failed，不自动重发：message=%s sink=%s", message_id, sink)
                     _ = await self._records.save_async(message_id, record, Delivery(
                         sink=delivery.sink, phase="failed", receipt=result,
                     ))
@@ -238,11 +262,15 @@ class Deliveries:
                     return rejected
                 if not task.active:
                     raise asyncio.CancelledError
-                response = await sender.send(key, delivery.sink.address, message)
+                reader = self._catalog.reader(selection.session_id)
+                content = await reader.read_async(lambda current: with_truncated_head(current, message))
+                response = await sender.send(key, delivery.sink.address, content)
                 # 不同归档拥有独立 Python 类型；按本版本公开 schema 接纳跨插件回执。
                 result = Receipt.model_validate(response.model_dump())
-            except BaseException:
+            except BaseException as error:
                 if record.value["phase"] == "started":
+                    logger.warning("[paused] 发送已开始但未取得可确认回执，回执落为 failed：message=%s sink=%s 原因=%s",
+                                   message_id, sink, type(error).__name__)
                     _ = await self._records.save_async(message_id, record, Delivery(
                         sink=delivery.sink, phase="failed",
                         receipt=Receipt(status="failed", error="发送已开始但未取得可确认回执"),

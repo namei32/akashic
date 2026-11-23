@@ -11,11 +11,10 @@ import re
 import shlex
 import shutil
 import signal
-import sys
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial, wraps
 from pathlib import Path
 from typing import Any, AsyncGenerator, Awaitable, Callable, cast
@@ -41,14 +40,16 @@ from .protocol import (
     require_names,
 )
 from plugins.host_execution.contract import (
-    ExecutionCleanupReport
+    ExecutionCleanupFailure, ExecutionCleanupReport
 )
 from plugins.host_execution.contract import (
-    ExecutionResult, TerminalBackend, UnknownExecutionError, UnknownTerminalError
+    TerminalBackend, UnknownExecutionError, UnknownTerminalError
 )
 from ..process_runtime import ShellProcessManager
+from .egress import HostEgress
 from .path_info import PathInfoOperation
 from .filesystem import (
+    FileByteAccess,
     EditFileOperation,
     ListDirOperation,
     ReadFileOperation,
@@ -83,10 +84,23 @@ class _ManagerLease:
         self.operations_drained.set()
 
     async def shutdown(self) -> ExecutionCleanupReport:
-        """准入关闭后先挂断终端，解除阻塞写入，再排空并回收 manager。"""
-        await self.manager.terminals.shutdown()
+        """准入关闭后先挂断 raw 与终端，解除阻塞写入，再排空并回收 manager。"""
+        # 1. 每个阶段独立执行；前一阶段失败不能跳过排空和 manager 回收。
+        errors: list[Exception] = []
+        for stage in (self.manager.raw.shutdown, self.manager.terminals.shutdown):
+            try:
+                await stage()
+            except Exception as error:
+                errors.append(error)
         await self.operations_drained.wait()
-        return await self.manager.shutdown()
+        try:
+            report = await self.manager.shutdown()
+        except Exception as error:
+            errors.append(error)
+            report = ExecutionCleanupReport((), (), ())
+        # 2. 未确认的 raw/终端清理并入报告，沿用执行失败的保留与重试路径。
+        failures = tuple(ExecutionCleanupFailure(-1, type(error).__name__, str(error)) for error in errors)
+        return replace(report, failures=(*report.failures, *failures))
 
 
 class _ManagerUnavailable(Exception):
@@ -203,6 +217,7 @@ class HostBridgeService:
         toolchain_digest: str,
         runtime_checkout: Path,
         bridge_python: Path,
+        egress: HostEgress | None = None,
     ) -> None:
         if not token:
             raise ValueError("Host Bridge token 不能为空")
@@ -214,6 +229,7 @@ class HostBridgeService:
             raise ValueError("Host Bridge toolchain digest 必须是 SHA256")
         self._token = token
         self._lease_timeout_s = lease_timeout_s
+        self._egress = egress
         artifact_root.mkdir(parents=True, exist_ok=True)
         self._artifact_root = artifact_root
         self._release_commit = release_commit
@@ -384,8 +400,15 @@ class HostBridgeService:
                 "raw-bytes",
                 "skill-requirements",
                 "terminals",
+                *self._egress_capability(),
             ],
         )
+
+    # RPC 健康不代表出网入口可用：配置了出口时单独报告它当前是否在监听。
+    def _egress_capability(self) -> tuple[str, ...]:
+        if self._egress is None:
+            return ()
+        return ("host-egress",) if self._egress.ready else ("host-egress-unavailable",)
 
     @_rpc
     async def OpenManager(self, request: pb.ContextRequest) -> pb.HeartbeatReply:
@@ -411,7 +434,7 @@ class HostBridgeService:
             raise ValueError("Host Bridge argv 必须非空")
         require_names(request.argv, "argv")
         require_nonnegative(request.max_output_tokens, "max_output_tokens")
-        require_positive(request.hard_timeout_s, "hard_timeout_s")
+        require_nonnegative(request.hard_timeout_s, "hard_timeout_s")
         # 2. 进程与输出消费仍由原 manager 拥有。
         async with self._manager_operation(request.context) as manager:
             result = await manager.exec_command(
@@ -537,6 +560,28 @@ class HostBridgeService:
                 )
 
     @_rpc
+    async def RawProcess(self, request: pb.RawProcessRequest) -> pb.RawProcessReply:
+        require_text(request.owner_session_key, "owner_session_key")
+        async with self._manager_operation(request.context) as manager:
+            raw, owner = manager.raw, request.owner_session_key
+            if request.operation == "open":
+                identity = await raw.open(owner=owner, argv=tuple(request.argv),
+                                          cwd=request.cwd, env=dict(request.env))
+                return pb.RawProcessReply(identity=identity)
+            require_text(request.identity, "identity")
+            if request.operation == "read":
+                value = await raw.read(owner=owner, identity=request.identity,
+                                       stream=request.stream, offset=request.offset)
+                return pb.RawProcessReply(data=value.data, next_offset=value.next_offset,
+                                          eof=value.eof, exit_code=value.exit_code)
+            if request.operation == "write":
+                await raw.write(owner=owner, identity=request.identity, data=request.data)
+                return pb.RawProcessReply()
+            if request.operation == "close":
+                return pb.RawProcessReply(closed=await raw.close(owner=owner, identity=request.identity))
+            raise ValueError("unknown raw process operation")
+
+    @_rpc
     async def FileTool(self, request: pb.FileRequest) -> pb.FileReply:
         """校验文件操作后复用已有文件工具，不建立第二套文件实现。"""
         allowed_dir = (
@@ -544,6 +589,15 @@ class HostBridgeService:
         )
         # 1. 每支 oneof 只拥有对应工具的公开参数。
         match request.WhichOneof("operation"):
+            case "read_chunk":
+                chunk = request.read_chunk
+                require_fields(chunk, "path", "offset")
+                require_nonnegative(chunk.offset, "offset")
+                async with self._manager_operation(request.context):
+                    result = await FileByteAccess(enable_bridge=False).read(
+                        chunk.path, offset=chunk.offset,
+                        version=chunk.version if chunk.HasField("version") else None,
+                    )
             case "path_info":
                 info = request.path_info
                 async with self._manager_operation(request.context):
@@ -738,6 +792,7 @@ async def serve(
     toolchain_digest: str,
     runtime_checkout: Path,
     bridge_python: Path,
+    egress_dir: Path | None = None,
 ) -> None:
     """Serve one private UDS and clean every leased process on shutdown."""
 
@@ -749,6 +804,7 @@ async def serve(
         socket_path.unlink()
 
     # 2. 启动 RPC 与 lease watchdog，再发布仅 owner 可访问的 socket。
+    egress = None if egress_dir is None else HostEgress(egress_dir)
     service = HostBridgeService(
         token,
         lease_timeout_s,
@@ -757,6 +813,7 @@ async def serve(
         toolchain_digest=toolchain_digest,
         runtime_checkout=runtime_checkout,
         bridge_python=bridge_python,
+        egress=egress,
     )
     server = transport.Server(service)
     await server.start(socket_path)
@@ -770,6 +827,9 @@ async def serve(
         outcome="ready",
     )
     watchdog = asyncio.create_task(service.reap_expired(), name="host-bridge-reaper")
+    # 宿主出口起不来（如 socket 路径超长）只影响 Workload 上网，不拖垮 Shell；它自己记录原因并持续恢复。
+    if egress is not None:
+        await egress.start()
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -781,6 +841,8 @@ async def serve(
         await asyncio.gather(watchdog, return_exceptions=True)
         await service.shutdown()
         await server.stop()
+        if egress is not None:
+            await egress.close()
         socket_path.unlink(missing_ok=True)
         log_event(logger, logging.INFO, "host_bridge.stopped", outcome="completed")
 
@@ -853,6 +915,11 @@ async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path
     parser.add_argument("--toolchain-digest", required=True)
     parser.add_argument("--runtime-checkout", type=Path, required=True)
     parser.add_argument("--bridge-python", type=Path, required=True)
+    # 宿主出口目录：默认放在 runtime.env 给的 Workload 运行目录下，Controller 从同一处挂进 Workload。
+    # 变量为空或不是绝对路径时不开出口，避免把 socket 建到当前目录下。
+    runtime_dir = Path(os.environ.get("AKASHIC_WORKLOAD_RUNTIME_DIR", ""))
+    parser.add_argument("--egress-dir", type=Path,
+                        default=runtime_dir / "host-egress" if runtime_dir.is_absolute() else None)
     args = parser.parse_args(arguments)
     token = args.token_file.read_text(encoding="utf-8").strip()
     await serve(
@@ -864,6 +931,7 @@ async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path
         args.toolchain_digest,
         args.runtime_checkout.resolve(),
         args.bridge_python.absolute(),
+        None if args.egress_dir is None else args.egress_dir.resolve(),
     )
     return 0
 

@@ -16,6 +16,8 @@ from bootstrap.cleanup import run_cleanup_steps
 from bootstrap.runtime_readiness import RuntimeReadiness
 from bootstrap.tools import CoreRuntime, build_core_runtime
 from bootstrap.workspace_lock import WorkspaceInstanceLock
+from utils.timing import measure
+from agent.plugins.reload_journal import GenerationCleanupPending
 from agent.plugins.watcher import PluginWatcher
 from core.net.http import (
     SharedHttpResources,
@@ -23,6 +25,7 @@ from core.net.http import (
     configure_default_shared_http_resources,
 )
 from core.common.diagnostic_log import configure_logging
+from core.common.heap import trim_free_heap_forever
 
 configure_logging()
 logging.getLogger("agent.plugins.manager").setLevel(
@@ -123,6 +126,7 @@ class AppRuntime:
         self.web_shell_task: asyncio.Task[None] | None = None
         self.plugin_watcher: PluginWatcher | None = None
         self.plugin_watcher_task: asyncio.Task[None] | None = None
+        self.heap_trim_task: asyncio.Task[None] | None = None
         self._shutdown = False
         self._started = False
         self._plugin_candidate_tasks: set[asyncio.Task[Any]] = set()
@@ -138,14 +142,16 @@ class AppRuntime:
             self.readiness.mark_stage("workspace.locked")
         try:
             configure_default_shared_http_resources(self.http_resources)
-            self.core = build_core_runtime(
-                self.config,
-                self.workspace,
-                self.http_resources,
-                restart_gate=self.restart_gate,
-                host_ready=(lambda: self.readiness.ready) if self.readiness else None,
-            )
-            await self.core.start()
+            with measure("core.build"):
+                self.core = build_core_runtime(
+                    self.config,
+                    self.workspace,
+                    self.http_resources,
+                    restart_gate=self.restart_gate,
+                    host_ready=(lambda: self.readiness.ready) if self.readiness else None,
+                )
+            with measure("core.start"):
+                await self.core.start()
             if self.readiness is not None:
                 self.readiness.mark_stage("core.ready")
             plugin_manager = getattr(self.core, "plugin_manager", None)
@@ -178,6 +184,7 @@ class AppRuntime:
                     name="plugin_watcher",
                 )
 
+            self.heap_trim_task = asyncio.create_task(trim_free_heap_forever(), name="heap_trim")
             self._install_plugin_reload_signal()
             if self.readiness is not None:
                 self.readiness.mark_stage("runtime.started")
@@ -264,6 +271,18 @@ class AppRuntime:
 
         _raise_unexpected_task_errors("process shutdown task", results)
 
+    # 回收空闲堆的后台任务没有业务状态，关闭时直接取消。
+    async def _cancel_heap_trim(self) -> None:
+        task = self.heap_trim_task
+        if task is None:
+            return
+        _ = task.cancel()
+        try:
+            results = await asyncio.gather(task, return_exceptions=True)
+        finally:
+            self.heap_trim_task = None
+        _raise_unexpected_task_errors("heap trim task", results)
+
     async def _cancel_plugin_candidate_tasks(self) -> None:
         for task in self._plugin_candidate_tasks:
             _ = task.cancel()
@@ -292,6 +311,7 @@ class AppRuntime:
             # 已排空业务后先关闭入站连接；插件释放前保留数据库和 HTTP provider。
             await _run_cleanup_steps(
                 ("plugin_candidate_tasks.cancel", self._cancel_plugin_candidate_tasks),
+                ("heap_trim.cancel", self._cancel_heap_trim),
                 ("process_shutdown.cancel", self._cancel_shutdown_task),
                 ("servers.request_shutdown", self._request_server_shutdown),
                 ("web_shell.wait", _wait_server_task(self.web_shell_task)),
@@ -303,8 +323,15 @@ class AppRuntime:
                     ),
                 ),
             )
+            pending: tuple[str, ...] = ()
             if self.core is not None:
-                await self.core.stop()
+                try:
+                    await self.core.stop()
+                except GenerationCleanupPending as error:
+                    if not self._started or self.readiness is None or closing_root is None:
+                        raise
+                    pending = error.transactions
+                    logger.warning("已登记插件代清理，等待宿主核对容器退出: %s", pending)
             await _run_cleanup_steps(
                 ("http_resources.aclose", self.http_resources.aclose),
                 (
@@ -313,7 +340,7 @@ class AppRuntime:
                 ),
             )
             if self._started and self.readiness is not None:
-                self.readiness.mark_closed(None if closing_root is None else closing_root.generation_id)
+                self.readiness.mark_closed(None if closing_root is None else closing_root.generation_id, pending=pending)
         finally:
             self._workspace_lock.release()
             clear_default_shared_http_resources(self.http_resources)

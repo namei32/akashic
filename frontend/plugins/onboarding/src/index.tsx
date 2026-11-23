@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { createRoot } from "react-dom/client";
 import { createPortal } from "react-dom";
-import type { WebHostContextV1, WebUiDisposer } from "@akashic/web-ui-v1";
+import type { WebHostContextV1, WebResource, WebUiDisposer } from "@akashic/web-ui-v1";
 import type { RenderSettingsRoute, ShellSettingsRenderProps } from "@akashic/shell-ui-v1";
-import { Confirm, request, type EmbedProps, type Status } from "../../shared/src/configuration";
+import { Confirm, request, type EmbedProps, type Status } from "../../../../packages/akashic-plugin-kit/src/configuration";
 import { akashicBrandIcon } from "../../shell_ui/src/brand";
 import "./style.css";
 
@@ -19,6 +19,7 @@ interface Group { key: string; title: string; required: boolean; pitch: string; 
 interface Catalog { steps: Step[]; groups: Group[]; }
 interface StepStatus extends Partial<Status> { fault?: string; }
 type Statuses = Record<string, StepStatus>;
+type Snapshot = {catalog: Catalog; statuses: Statuses};
 type Phase = { kind: "welcome" } | { kind: "group"; key: string } | { kind: "abilities" } | { kind: "done" };
 
 function ready(status?: StepStatus): boolean {
@@ -34,12 +35,12 @@ function markSeen(): void {
   try { window.localStorage.setItem(SEEN_KEY, "1"); } catch { /* 存储不可用时下次仍会弹出，不影响使用 */ }
 }
 
-async function readCatalog(ctx: WebHostContextV1): Promise<{catalog: Catalog; statuses: Statuses}> {
-  const catalog = await request<Catalog>(ctx, "/api/dashboard/onboarding/catalog");
+async function readCatalog(ctx: WebHostContextV1, signal: AbortSignal): Promise<Snapshot> {
+  const catalog = await request<Catalog>(ctx, "/api/dashboard/onboarding/catalog", {signal});
   const entries = await Promise.all(catalog.steps.map(async step => {
     // The entry proxy rejects encoded slashes; keep path separators literal.
     const keyPath = step.id.split("/").map(encodeURIComponent).join("/");
-    try { return [step.id, await request<StepStatus>(ctx, `/api/dashboard/onboarding/status/${keyPath}`)] as const; }
+    try { return [step.id, await request<StepStatus>(ctx, `/api/dashboard/onboarding/status/${keyPath}`, {signal})] as const; }
     catch (reason) { return [step.id, {fault: reason instanceof Error ? reason.message : String(reason)}] as const; }
   }));
   return {catalog, statuses: Object.fromEntries(entries)};
@@ -49,16 +50,18 @@ async function readCatalog(ctx: WebHostContextV1): Promise<{catalog: Catalog; st
 const firstRun = { pending: false };
 
 // 首次打开且必需能力未就绪时，经 hash 深链接让 Shell 打开本分节；不抢已有的深链接。
-async function openOnFirstRun(ctx: WebHostContextV1): Promise<void> {
+async function openOnFirstRun(data: WebResource<Snapshot>): Promise<void> {
   if (readSeen() || window.location.hash) return;
-  const {catalog, statuses} = await readCatalog(ctx);
+  const {catalog, statuses} = await data.refresh();
   const required = new Set(catalog.groups.filter(group => group.required).map(group => group.key));
   const missing = catalog.steps.some(step => required.has(step.group) && !ready(statuses[step.id]) && !statuses[step.id]?.fault);
   if (missing && !window.location.hash) { firstRun.pending = true; window.location.hash = "onboarding"; }
 }
 
 export function activate(ctx: WebHostContextV1): WebUiDisposer {
-  void openOnFirstRun(ctx).catch(() => { /* 首跑探测失败只是不自动弹出，入口仍在设置里 */ });
+  // 目录与各步状态随模块保留（ADR 0127）：再次打开新手引导先画上次的状态，后台再核对。
+  const data = ctx.data.resource<Snapshot>("catalog", signal => readCatalog(ctx, signal));
+  void openOnFirstRun(data).catch(() => { /* 首跑探测失败只是不自动弹出，入口仍在设置里 */ });
   return ctx.ui.inject("shell.settings.v1", mount => mount.register({
     id: "onboarding", label: "新手引导", route: "onboarding", iconSvg: onboardingIcon, order: 90,
     render(host, _view, props) {
@@ -70,7 +73,7 @@ export function activate(ctx: WebHostContextV1): WebUiDisposer {
       const root = createRoot(host);
       const auto = firstRun.pending;
       firstRun.pending = false;
-      root.render(<OnboardingSection ctx={ctx} renderRoute={renderRoute} close={close} surfaceHost={surfaceHost} auto={auto} />);
+      root.render(<OnboardingSection data={data} renderRoute={renderRoute} close={close} surfaceHost={surfaceHost} auto={auto} />);
       return () => { root.unmount(); releaseStyle(); surfaceHost.remove(); };
     },
   }));
@@ -97,64 +100,67 @@ function initialChoice(catalog: Catalog, statuses: Statuses): Set<string> {
 }
 
 // 读取目录与各步状态；打开、保存后与窗口回到前台时重读，不轮询。
-function useCatalog(ctx: WebHostContextV1) {
-  const [catalog, setCatalog] = useState<Catalog | null>(null);
-  const [statuses, setStatuses] = useState<Statuses>({});
-  const [chosen, setChosen] = useState<Set<string> | null>(null);
-  const [error, setError] = useState("");
-  const alive = useRef(true);
-  const refresh = useCallback(async () => {
-    try {
-      const next = await readCatalog(ctx);
-      if (!alive.current) return;
-      setCatalog(next.catalog); setStatuses(next.statuses); setError("");
-      setChosen(current => current ?? initialChoice(next.catalog, next.statuses));
-    } catch (reason) {
-      if (alive.current) setError(`读取引导失败：${reason instanceof Error ? reason.message : String(reason)}`);
-    }
-  }, [ctx]);
+function useCatalog(data: WebResource<Snapshot>) {
+  const snapshot = useSyncExternalStore(data.subscribe, () => data.current);
+  const failure = useSyncExternalStore(data.subscribe, () => data.error);
+  const [chosen, setChosenState] = useState<Set<string> | null>(() => snapshot ? initialChoice(snapshot.catalog, snapshot.statuses) : null);
+  // 用户动过勾选之前，默认勾选跟着最新核对结果走：缓存里的旧状态不能定死默认值。
+  const touched = useRef(false);
+  const setChosen = useCallback((update: (current: Set<string> | null) => Set<string>) => { touched.current = true; setChosenState(update); }, []);
+  // 保存后要看到写入后的状态：开新读取，不并入写入前就在途的那次。
+  const refresh = useCallback(async () => { await data.refresh({fresh: true}).catch(() => undefined); }, [data]);
   useEffect(() => {
-    alive.current = true; void refresh();
-    const onFocus = () => { void refresh(); };
-    window.addEventListener("focus", onFocus);
-    return () => { alive.current = false; window.removeEventListener("focus", onFocus); };
-  }, [refresh]);
-  return {catalog, statuses, chosen, setChosen, error, refresh};
+    const load = () => { void data.refresh().catch(() => undefined); };
+    load();
+    window.addEventListener("focus", load);
+    return () => window.removeEventListener("focus", load);
+  }, [data]);
+  useEffect(() => { if (snapshot && !touched.current) setChosenState(initialChoice(snapshot.catalog, snapshot.statuses)); }, [snapshot]);
+  // 有上次的内容也照常报核对失败：界面上的状态可能已经过时。
+  const error = failure ? `读取引导失败：${failure.message}` : "";
+  return {catalog: snapshot?.catalog ?? null, statuses: snapshot?.statuses ?? {}, chosen, setChosen, error, refresh};
 }
 
 // 设置里的“新手引导”分节：平时是能力概览，可从这里重走整屏流程；首跑自动进入流程。
-function OnboardingSection({ctx, renderRoute, close, surfaceHost, auto}: {
-  ctx: WebHostContextV1; renderRoute?: RenderSettingsRoute; close?: () => void; surfaceHost: HTMLElement; auto: boolean;
+function OnboardingSection({data, renderRoute, close, surfaceHost, auto}: {
+  data: WebResource<Snapshot>; renderRoute?: RenderSettingsRoute; close?: () => void; surfaceHost: HTMLElement; auto: boolean;
 }) {
   const [running, setRunning] = useState(auto);
-  const {catalog, statuses, refresh} = useCatalog(ctx);
+  const {catalog, statuses, error, refresh} = useCatalog(data);
+  const failedSteps = catalog?.steps.filter(step => statuses[step.id]?.fault) ?? [];
   // 1. 首跑流程结束连同设置一起关闭，回到对话；2. 从设置里重走的流程结束后回到概览。
   const exit = useCallback(() => { markSeen(); if (auto) close?.(); else { setRunning(false); void refresh(); } }, [auto, close, refresh]);
   return <>
     <div className="onboarding-overview">
       <p className="onboarding-overview-intro">首次使用时的引导。这里能看到每项能力的状态，也可以重新走一遍。</p>
       <button type="button" className="onboarding-primary" onClick={() => setRunning(true)}>重新走一遍引导</button>
+      {(error || failedSteps.length > 0) && <div className="config-error" role="alert">
+        {error ? <p>{error}</p> : failedSteps.map(step => <p key={step.id}>{step.title}：{statuses[step.id]?.fault}</p>)}
+        <button type="button" className="onboarding-text-button" onClick={() => void refresh()}>重试</button>
+      </div>}
+      {!catalog && !error && <p role="status">正在检查已安装的功能…</p>}
       {catalog && <ul className="onboarding-overview-list">
         {catalog.groups.map(group => {
           const on = groupReady(catalog, statuses, group.key);
           const step = catalog.steps.find(item => item.group === group.key);
+          const failed = failedSteps.some(item => item.group === group.key);
           return <li key={group.key}>
             <a href={step ? `#${step.route}` : undefined}>
               <span><strong>{group.pitch || group.title}</strong><small>{group.title}</small></span>
-              <em className={on ? "is-on" : group.required ? "is-missing" : ""}>{on ? "已开启" : group.required ? "未连接" : "未开启"}</em>
+              <em className={failed ? "is-missing" : on ? "is-on" : group.required ? "is-missing" : ""}>{failed ? "读取失败" : on ? "已开启" : group.required ? "未连接" : "未开启"}</em>
             </a>
           </li>;
         })}
       </ul>}
     </div>
-    {running && <Onboarding ctx={ctx} renderRoute={renderRoute} exit={exit} surfaceHost={surfaceHost} />}
+    {running && <Onboarding data={data} renderRoute={renderRoute} exit={exit} surfaceHost={surfaceHost} />}
   </>;
 }
 
-function Onboarding({ctx, renderRoute, exit, surfaceHost}: {
-  ctx: WebHostContextV1; renderRoute?: RenderSettingsRoute; exit: () => void; surfaceHost: HTMLElement;
+function Onboarding({data, renderRoute, exit, surfaceHost}: {
+  data: WebResource<Snapshot>; renderRoute?: RenderSettingsRoute; exit: () => void; surfaceHost: HTMLElement;
 }) {
-  const {catalog, statuses, chosen, setChosen, error, refresh} = useCatalog(ctx);
+  const {catalog, statuses, chosen, setChosen, error, refresh} = useCatalog(data);
   const [planned, setPlanned] = useState<Set<string> | null>(null);
   const [index, setIndex] = useState(0);
   const [dirty, setDirty] = useState<Record<string, boolean>>({});
@@ -199,11 +205,14 @@ function Onboarding({ctx, renderRoute, exit, surfaceHost}: {
     </Surface>, surfaceHost);
 }
 
-// 换步时正文从可见态出发做一次短位移；样式表不能声明 @keyframes，动效走 Web Animations。
+// 换步沿用展开时长；样式表不能声明 @keyframes，短位移动效走 Web Animations。
 function enterStep(element: HTMLDivElement | null): void {
   if (!element || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const time = getComputedStyle(element).getPropertyValue("--ak-sys-duration-expand").trim();
+  // CSS 构建会把 200ms 压成 .2s；Web Animations 的数字时长只接受毫秒。
+  const duration = Number.parseFloat(time) * (time.endsWith("ms") ? 1 : 1000);
   element.animate([{opacity: 0.001, transform: "translateY(8px)"}, {opacity: 1, transform: "none"}],
-    {duration: 360, easing: "cubic-bezier(0.05, 0.7, 0.1, 1)"});
+    {duration, easing: "cubic-bezier(0.05, 0.7, 0.1, 1)"});
 }
 
 // 整屏图层：原生模态对话框，压在设置工作区之上；Esc 等同“稍后再说”。
@@ -369,7 +378,7 @@ function Footer({phase, at, catalog, statuses, chosen, editing, back, next}: {
   const blocked = !!group && (editing || !complete);
   const optional = catalog.groups.filter(item => !item.required && chosen.has(item.key)).length;
   const label = phase.kind === "done" ? "开始对话" : phase.kind === "abilities" && optional === 0 ? "先不用，直接开始" : "继续";
-  const hint = editing ? "先保存当前设置" : group?.required && !complete ? "连接成功后继续" : "";
+  const hint = editing ? "先保存当前设置" : group?.required ? complete ? "已连接，点「继续」进入下一步" : "连接成功后继续" : "";
   return <footer className="onboarding-footer">
     <button type="button" className="onboarding-text-button" hidden={at <= 1} onClick={back}>上一步</button>
     <span className="onboarding-hint">

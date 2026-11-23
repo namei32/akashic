@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+import re
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -8,6 +9,7 @@ from typing import Literal, cast
 from plugins.ledger.contract import MessageReader, MessageWriter, OwnerStore
 from plugins.ledger.contract import (
     CallRef,
+    ContentPart,
     Control,
     Output,
     ToolCall,
@@ -18,6 +20,7 @@ from plugins.tools.contract import (
     CallSource as CallSource,
     ProviderBoundTool as ProviderBoundTool,
     Result as Result,
+    ToolDisplay as ToolDisplay,
     ResultLike as ResultLike,
     durable_call_key as durable_call_key,
     StartCheck,
@@ -33,11 +36,15 @@ def result_message_id(call_ref: CallRef) -> str:
 
 def coerce_result(value: object) -> Result:
     """在 tools 执行边界接纳 provider 结果并重新校验内容。"""
-    if isinstance(value, Result):
-        return value
     if not isinstance(value, ResultLike):
         raise TypeError("工具结果必须提供 outcome 和 parts")
-    return Result(value.outcome, tuple(value.parts))
+    # JSON 可携带被 UTF-16 截断的文本；替换孤立代理字符后才能写入 UTF-8 账本。
+    parts = tuple(
+        ContentPart("text", re.sub(r"[\ud800-\udfff]", "\ufffd", part.value))
+        if part.kind == "text" and isinstance(part.value, str) else part
+        for part in value.parts
+    )
+    return Result(value.outcome, parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +98,15 @@ class MessageReply:
                    and message.body.action == "abandon" and message.body.through_seq >= call.seq
                    for message in self.reader.snapshot(after_seq=call.seq))
 
+    def stopped(self) -> bool:
+        """调用之后有同来源的持久停止；是否已被恢复由结算方按日志判定。"""
+        call = self.reader.get(self.call_ref.message_id)
+        if call is None:
+            raise ValueError("工具调用消息缺失")
+        return any(message.source == call.source and isinstance(message.body, Control)
+                   and message.body.action == "pause"
+                   for message in self.reader.snapshot(after_seq=call.seq))
+
     def read(self, pointer: object) -> Result:
         """按持久指针读取正文，不在工具回执中保留第二份结果。"""
         if not isinstance(pointer, Mapping):
@@ -113,15 +129,17 @@ class MessageReply:
         return Result(body.outcome, body.parts)
 
 
-def display_name(metadata: Mapping[str, object]) -> str:
-    """从原 binding 读取工具名称，不打开工具或暴露其恢复配置。"""
+def display_tool(metadata: Mapping[str, object]) -> ToolDisplay:
+    """从原 binding 读取工具名称与 owner，不打开工具或暴露其恢复配置。"""
     tool = metadata.get("tool")
     if not isinstance(tool, Mapping):
         raise ValueError("工具 binding 描述无效")
-    name = cast(Mapping[str, object], tool).get("name")
+    description = cast(Mapping[str, object], tool)
+    name = description.get("name")
     if not isinstance(name, str) or not name:
         raise ValueError("工具 binding 缺少工具名")
-    return name
+    owner = description.get("owner")
+    return ToolDisplay(name, owner if isinstance(owner, str) and owner else None)
 
 
 class InvalidArguments(ValueError):

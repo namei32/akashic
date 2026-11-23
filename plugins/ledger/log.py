@@ -8,15 +8,16 @@ import json
 import inspect
 import logging
 import re
+import secrets
 import sqlite3
 import threading
-from collections.abc import AsyncGenerator, Callable, Generator, Iterable, Iterator, Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import AsyncGenerator, Callable, Generator, Iterable, Mapping, Sequence
 from bisect import bisect_right
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from dataclasses import dataclass, field
-from typing import Literal, TypeVar, cast, overload
-from itertools import islice
+from typing import Literal, TypeVar, cast
 from pathlib import Path
 from types import MappingProxyType
 from weakref import WeakValueDictionary
@@ -25,6 +26,7 @@ from core.common.file_io import run_file_io
 from plugins.ledger.contract import (
     MessageReader as Reader, MessageWriter as Writer, OwnerStore as Store,
     OwnerTransaction as Transaction, PreparedAppend as Append,
+    HistoryWindow,
     InvalidPage,
     MessageConflict,
     MessagePage,
@@ -34,10 +36,12 @@ from plugins.ledger.contract import (
     SessionEntry,
     SessionPage,
     SourceHeadConflict,
+    TextSearch,
     WriterExpired,
 )
 from plugins.ledger.contract import AttachmentKind, AttachmentRef
 from .artifact_store import ARTIFACT_SCHEMA
+from .text_search import TextIndexes
 from plugins.ledger.contract import (
     Body,
     CallRef,
@@ -52,7 +56,9 @@ from plugins.ledger.contract import (
     freeze_json,
     freeze_metadata,
 )
-from plugins.ledger.contract import decode_body, encode_body, json_value
+from plugins.ledger.contract import (
+    decode_body, encode_body, json_value, mark_process_call_output, resolve_process_call_output,
+)
 
 _T = TypeVar("_T")
 _logger = logging.getLogger(__name__)
@@ -65,6 +71,17 @@ _DECODE_STRONG_BODY = 8192
 # 附件引用备忘：长会话一次材料准备就引用全部历史 id，容量小于历史时
 # FIFO 必抖穿且每轮重查；值多为共享空元组，32768 条约占几 MB。
 _ATTACHMENT_MEMO_SIZE = 32768
+# 已确认绑定的进程内核对：每个 payload 约 0.2–1KB，256 条覆盖每轮工具菜单与近期摘要。
+_SAVED_BINDINGS_LIMIT = 256
+# 共享读面的短暂保留：同一轮先后到达的全史读者（改动记录、回复选择）共用一次解码；
+# 只留最近一个会话，到期即释放，峰值不变，常驻只在活跃的几秒内增加。
+_VIEW_GRACE_SECONDS = 10.0
+# 回复窗口受上下文容量约束（摘要之后通常几百条）：不超过这个条数的读面跨轮保留，
+# 下一轮只补新尾部，闲置后也不必回盘重读；只留最近一个会话，约十几 MB。
+_VIEW_KEEP_MESSAGES = 2048
+_VIEW_KEEP_SECONDS = 1800.0
+# 摘要边界前移后，起点之前超过这么多条的旧部分不再随读面常驻：复制窗口段到新前缀，不重新解码。
+_VIEW_REBASE_MESSAGES = 512
 MESSAGE_BODY_KIND_INDEX_SCHEMA = """CREATE INDEX IF NOT EXISTS message_source_kind_seq
     ON messages (session_key, source, json_extract(body, '$.kind'), seq,
                  json_extract(body, '$.finish'));"""
@@ -413,7 +430,11 @@ class MessageLog:
         self._listener_lock = threading.Lock()
         self._decode_lock = threading.RLock()
         self._view_lock = threading.Lock()
+        self._saved_bindings: OrderedDict[str, str] = OrderedDict()
+        self._saved_bindings_lock = threading.Lock()
+        self._fill_lock = threading.Lock()
         self._message_views: WeakValueDictionary[str, _MessagePrefix] = WeakValueDictionary()
+        self._retained_view: tuple[_MessagePrefix, threading.Timer] | None = None
         self._decoded: WeakValueDictionary[tuple[object, ...], Message] = WeakValueDictionary()
         self._decoded_strong: dict[tuple[object, ...], Message] = {}
         self._decoded_owners: dict[tuple[object, ...], OwnerRecord] = {}
@@ -424,9 +445,15 @@ class MessageLog:
         self._attachment_memo: dict[tuple[str, str], tuple[AttachmentRef, ...]] = {}
         self._reads = _ReadLocal()
         self._path = Path(path).resolve()
+        # 查找索引是派生数据，放在库旁边的独立目录，删掉只会让下次首查重建。
+        self._text_indexes = TextIndexes(self._path.parent / f"{self._path.name}.text-index")
         self._closed = False
         self._notify_pending: set[type[Body]] | None = set()
         self._notify_owed: set[type[Body]] | None = set()
+        # 目录纪元：本实例每次管理提交（ensure_session、软删/恢复、标题）递增；带实例 token，重启后不会与旧值相等。
+        # 追加消息时顺带建出的会话行不算管理提交、不递增，它由消息活动水位通知；纪元不变不代表目录行集合不变。
+        self._metadata_instance = secrets.token_hex(8)
+        self._metadata_epoch = 0
         # 写入方维护的已提交 heads：提交成功后合并，follower 不再各自扫描全部会话。
         self._heads: dict[str, int] | None = None
         self._heads_epoch = 0
@@ -484,6 +511,9 @@ class MessageLog:
             self._has_title = "title" in {
                 row["name"] for row in self._connection.execute("PRAGMA table_info(sessions)")
             }
+            self._has_source_index = self._connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index' AND name='message_source_seq'"
+            ).fetchone() is not None
         except BaseException:
             self._connection.close()
             raise
@@ -498,8 +528,15 @@ class MessageLog:
         read = self._reads.current
         return self._writer_lock if read is None else read.lock
 
-    def _decode(self, row: sqlite3.Row) -> Message:
-        """查询仍读真实行；解码结果先进弱引用共享，小行另有有界强缓存。"""
+    def _decode(self, row: sqlite3.Row, *, cache: bool = True) -> Message:
+        """查询仍读真实行；解码结果先进弱引用共享，小行另有有界强缓存。
+
+        cache=False 供共享前缀的整段填充使用：前缀自身就是该读面的复用机制，
+        冷恢复长会话时不查也不写缓存，避免为每条消息支付键构造与弱引用记账。
+        前缀外的点查仍走缓存。
+        """
+        if not cache:
+            return _message(row)
         key = tuple(row)
         # 独立只读连接共享解码结果；此短锁不等待 writer 的事务或磁盘操作。
         with self._decode_lock:
@@ -526,12 +563,6 @@ class MessageLog:
                 pass
             with closing(sqlite3.connect(destination)) as snapshot:
                 self._connection.backup(snapshot)
-
-    def read_bindings(self) -> tuple[Mapping[str, object], ...]:
-        """列出不可变绑定，供宿主保存数据库副本所需的归档闭包。"""
-        with self._read():
-            identities = self._connection.execute("SELECT binding_id FROM bindings ORDER BY binding_id").fetchall()
-            return tuple(self.read_binding(row[0]) for row in identities)
 
     def owner(self, name: str) -> OwnerStore:
         """组合只向 owner 授予自身的记录空间，不授予 SQL 或其他空间。"""
@@ -710,6 +741,10 @@ class MessageLog:
                         result.close()
                     raise TypeError("存储事务回调必须同步，不能跨 await")
             self._merge_heads()
+            # 提交成立后、通知之前递增：先读纪元再查询的读者，纪元相同就一定看到了这次提交。
+            if self._notify_pending is None:
+                with self._listener_lock:
+                    self._metadata_epoch += 1
             # owner 账本或 embedding 的单独提交不会改变消息订阅结果。
             if self._notify_pending is None or self._notify_pending:
                 if getattr(self._defer_notify, "active", False):
@@ -751,21 +786,11 @@ class MessageLog:
                 prefix = self._message_views.get(message.session_id)
                 if prefix is None:
                     continue
-                expected = prefix.seqs[-1] + 1 if prefix.seqs else 0
+                expected = (prefix.seqs[-1] if prefix.seqs else prefix.after) + 1
                 if message.seq == expected:
                     prefix.messages.append(message)
                     prefix.seqs.append(message.seq)
         self._pending_messages = []
-
-    # 前缀已在内存且距最新提交只差少量消息时，同步读取的 SQL 只核对 revision 与 head。
-    def warm_prefix(self, session_id: str, *, max_tail: int = 8) -> bool:
-        with self._listener_lock:
-            heads = self._heads
-            head = None if heads is None else heads.get(session_id)
-        prefix = self._message_views.get(session_id)
-        if head is None or prefix is None or not prefix.seqs:
-            return False
-        return head - prefix.seqs[-1] <= max_tail
 
     def committed_heads(self, load: Callable[[], Mapping[str, int]]) -> Mapping[str, int]:
         """返回进程内已提交 heads；缓存缺失时用 load 查询，期间无新提交才采用结果。"""
@@ -856,6 +881,7 @@ class MessageLog:
         update_metadata: Callable[[Body], Mapping[str, object | None]] | None = None,
         message_metadata_keys: frozenset[str] = frozenset(),
         check_metadata: Callable[[Mapping[str, object]], None] | None = None,
+        update_activity: bool = True,
     ) -> MessageWriter:
         """绑定纯检查与元数据投影；投影只改获授键，None 移除键，不执行外部效果。"""
         if ToolResult in body_types and call_ref is None:
@@ -873,6 +899,7 @@ class MessageLog:
             update_metadata,
             message_metadata_keys,
             check_metadata,
+            update_activity,
         )
 
     def save_binding(self, binding_id: str, descriptor: Mapping[str, object]) -> None:
@@ -885,6 +912,15 @@ class MessageLog:
             sort_keys=True,
             allow_nan=False,
         )
+        # 绑定只增不改：本进程近期确认过的身份直接核对 payload，每轮建工具菜单不再取写锁开事务。
+        with self._saved_bindings_lock:
+            saved = self._saved_bindings.get(binding_id)
+            if saved is not None:
+                self._saved_bindings.move_to_end(binding_id)
+        if saved is not None:
+            if saved != payload:
+                raise MessageConflict("资源身份已用于另一份 descriptor")
+            return
         with self._lock, self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             row = self._connection.execute(
@@ -894,10 +930,16 @@ class MessageLog:
             if row is not None:
                 if row[0] != payload:
                     raise MessageConflict("资源身份已用于另一份 descriptor")
-                return
-            _ = self._connection.execute(
-                "INSERT INTO bindings VALUES (?, ?)", (binding_id, payload)
-            )
+            else:
+                _ = self._connection.execute(
+                    "INSERT INTO bindings VALUES (?, ?)", (binding_id, payload)
+                )
+        # 摘要等身份会持续出现，按最近使用淘汰；淘汰后的身份仍走上面的事务核对。
+        with self._saved_bindings_lock:
+            self._saved_bindings[binding_id] = payload
+            self._saved_bindings.move_to_end(binding_id)
+            while len(self._saved_bindings) > _SAVED_BINDINGS_LIMIT:
+                _ = self._saved_bindings.popitem(last=False)
 
     def read_binding(self, binding_id: str) -> Mapping[str, object]:
         """读取不可变绑定；缺失引用不能用当前实现补齐。
@@ -918,6 +960,26 @@ class MessageLog:
             value = cached[binding_id] = _json_object(row[0], f"binding {binding_id}")
         return value
 
+    # 调用者持有 _view_lock；每次发布或复用都重新计时，换会话时旧前缀交还弱引用。
+    # close 先置 _closed 再进 _view_lock 清理，此处检查后不会在关闭后留下定时器。
+    def _retain_view(self, prefix: _MessagePrefix) -> None:
+        if self._closed:
+            return
+        previous = self._retained_view
+        if previous is not None:
+            previous[1].cancel()
+        grace = _VIEW_KEEP_SECONDS if len(prefix.messages) <= _VIEW_KEEP_MESSAGES else _VIEW_GRACE_SECONDS
+        timer = threading.Timer(grace, self._release_view)
+        timer.daemon = True
+        self._retained_view = (prefix, timer)
+        timer.start()
+
+    # 已开始的回调无法 cancel；只清自己登记的那份，续期后的新登记不受影响。
+    def _release_view(self) -> None:
+        with self._view_lock:
+            if self._retained_view is not None and self._retained_view[1] is threading.current_thread():
+                self._retained_view = None
+
     def close(self) -> None:
         """释放数据库并唤醒所有追赶者，让它们正常退出。"""
         with self._writer_lock:
@@ -926,6 +988,10 @@ class MessageLog:
                     return
                 self._closed = True
                 idle_reads, self._idle_reads = self._idle_reads, []
+            with self._view_lock:
+                retained, self._retained_view = self._retained_view, None
+            if retained is not None:
+                retained[1].cancel()
             for read in idle_reads:
                 read.connection.close()
             self._writer_connection.close()
@@ -964,6 +1030,10 @@ class MessageCatalog:
         key = (prefix, visibility)
         with log._read(snapshot=False) as connection:
             # 1. data_version 只可在同一连接上比较；writer 未提交视图不能复用。
+            # _reads 是 threading.local：run_file_io worker 里该线程的 current
+            # 指向自己借用的连接，缓存仍只按该连接自己的 data_version 命中，
+            # 不跨线程共享事务状态；worker 外（如事件循环直接调用）current 为
+            # None 时退化为每次真实查询，两种分支都保持同一语义。
             read = log._reads.current
             current = None if read is None else connection.execute("PRAGMA data_version").fetchone()[0]
             if read is not None:
@@ -993,7 +1063,10 @@ class MessageCatalog:
             return heads
 
     def prefix_revision(self) -> int | None:
-        """已提交消息前缀的改写计数；缺少标记时不能复用跨重启续读点。"""
+        """已提交消息前缀的改写计数：只追加时不变，UPDATE/DELETE/改写式插入后递增。
+
+        跨重启保存的投影续读点据此判断前缀未被改写；库缺少该标记时返回 None，调用方不能复用。
+        """
         log = self._log
         if not log._has_prefix_revision:
             return None
@@ -1002,9 +1075,43 @@ class MessageCatalog:
                 "SELECT revision FROM message_prefix_revision WHERE singleton=1"
             ).fetchone()[0])
 
+    async def open_input_sources_async(self) -> frozenset[tuple[str, str]]:
+        """最后一条 Input 晚于最后一条完结 Output 的（会话，来源）；待回复集合的超集。
+
+        单条聚合只走 (session, source, kind, seq, finish) 覆盖索引，不解码正文，
+        让启动全量核对只碰可能待回复的来源，而不是逐会话读取。
+        """
+        self._log._check_async_operation()
+
+        def query() -> frozenset[tuple[str, str]]:
+            with self._log._read(snapshot=False) as connection:
+                rows = connection.execute(
+                    "SELECT session_key, source FROM messages GROUP BY session_key, source "
+                    "HAVING MAX(CASE WHEN json_extract(body,'$.kind')='input' THEN seq END) > "
+                    "COALESCE(MAX(CASE WHEN json_extract(body,'$.kind')='output' "
+                    "AND json_extract(body,'$.finish') IN ('complete','quiet') THEN seq END), -1)"
+                ).fetchall()
+            return frozenset((row[0], row[1]) for row in rows)
+
+        return await run_file_io(query)
+
+    async def sessions_async(
+        self, *, prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
+        after: tuple[str, str] | None = None, limit: int = 50,
+    ) -> SessionPage:
+        """sessions 的异步孪生：同一真实 SQL 在可排空 worker 内执行，取消先排空。
+
+        结果、分页与失效语义和同步版完全一致，只是把磁盘读取移出事件循环。
+        """
+        self._log._check_async_operation()
+        return await run_file_io(
+            lambda: self.sessions(prefix=prefix, visibility=visibility, after=after, limit=limit)
+        )
+
     async def snapshot_heads_async(
         self, *, prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
     ) -> Mapping[str, int]:
+        """snapshot_heads 的异步孪生：目录水位读取在 worker 内完成，取消先排空。"""
         self._log._check_async_operation()
         return await run_file_io(lambda: self.snapshot_heads(prefix=prefix, visibility=visibility))
 
@@ -1085,10 +1192,17 @@ class MessageCatalog:
             rows = self._log._connection.execute("SELECT key, attributes FROM sessions ORDER BY key").fetchall()
         return MappingProxyType({row["key"]: decode_attributes(row["attributes"]) for row in rows})
 
-    async def follow_metadata(self) -> AsyncGenerator[None, None]:
+    @property
+    def metadata_epoch(self) -> str:
+        """本实例的目录纪元；在目录查询之前读取，与 follow_metadata 产出的值相等说明其间没有本实例管理提交。"""
+        log = self._log
+        with log._listener_lock:
+            return f"{log._metadata_instance}:{log._metadata_epoch}"
+
+    async def follow_metadata(self) -> AsyncGenerator[str, None]:
         """订阅目录元数据失效；先登记再通知首次重读，后续仅响应本实例管理提交。
 
-        通知可以合并，消费者必须重读当前目录；不携带事实副本或写入权限。
+        通知可以合并，消费者必须重读当前目录；不携带事实副本或写入权限。每次产出当时的目录纪元。
         普通消息追加不唤醒，关闭日志结束订阅。进程外改动在重新订阅时读取。
         """
         event = asyncio.Event()
@@ -1099,7 +1213,7 @@ class MessageCatalog:
         try:
             while not self._log._closed:
                 event.clear()
-                yield None
+                yield self.metadata_epoch
                 await event.wait()
         finally:
             with self._log._listener_lock:
@@ -1133,8 +1247,9 @@ class MessageCatalog:
                 event.clear()
                 if self._log._closed:
                     return
-                # 无筛选订阅复用已提交水位；目录筛选与周期核对读取当前 SQL。
-                heads = (self.snapshot_heads(prefix=prefix, visibility=visibility)
+                # 无筛选订阅复用已提交水位；目录筛选与周期核对读取当前 SQL，
+                # 这段全会话水位查询在 worker 内排水，不阻塞事件循环上的其他订阅者。
+                heads = (await self.snapshot_heads_async(prefix=prefix, visibility=visibility)
                          if polled or prefix or visibility is not None
                          else self._log.committed_heads(self.snapshot_heads))
                 if heads != previous:
@@ -1156,11 +1271,15 @@ class MessageCatalog:
 
 
 class _MessagePrefix:
-    """一个日志实例内可追加的已提交前缀；旧快照用固定长度隔离后续追加。"""
+    """一个日志实例内可追加的已提交前缀；旧快照用固定长度隔离后续追加。
 
-    def __init__(self, session_id: str, revision: int | None):
+    after 是前缀起点：只含 seq > after 的消息，完整前缀为 -1。
+    """
+
+    def __init__(self, session_id: str, revision: int | None, after: int = -1):
         self.session_id = session_id
         self.revision = revision
+        self.after = after
         self.messages: list[Message] = []
         self.seqs: list[int] = []
 
@@ -1174,52 +1293,90 @@ class MessageReader:
         """创建本次程序的只读视图，旧前缀复用解码结果，后续读取追赶新增消息。"""
         return _IncrementalMessageReader(self._log, self._session_id)
 
-    def committed_snapshot(self, *, through_seq: int | None = None) -> MessageSnapshot:
+    def committed_snapshot(self, *, through_seq: int | None = None, after_seq: int = -1) -> MessageSnapshot:
         """从同一 SQL 快照核对上界与前缀版本，只加载新尾部。
 
+        after_seq 给出窗口起点，只读取并返回 seq > after_seq 的消息；起点不晚于它的共享前缀可直接复用。
         已有读写事务使用自己的真实 SQL 视图，不发布或复用共享前缀。
         旧快照保持固定内容；最后一个消费者释放后，日志不保留该会话正文。
         """
+        if after_seq < -1:
+            raise ValueError("窗口起点不能小于 -1")
         log = self._log
         # 1. 显式事务保留原读面，包括调用者尚未提交的写入。
         if log._reads.current is not None:
-            return self._transaction_snapshot(through_seq)
-        with log._view_lock, log._read() as connection:
+            return self._transaction_snapshot(through_seq, after_seq)
+        # 冷读之间仍串行，后到者复用先到者填好的前缀；提交方只争 _view_lock 的短临界区。
+        with log._fill_lock, log._read() as connection:
             if connection is log._writer_connection:
-                return self._transaction_snapshot(through_seq)
+                return self._transaction_snapshot(through_seq, after_seq)
             # 2. 两项事实来自同一 RO 事务，外部追加和前缀改写都可见。
             revision = None if not log._has_prefix_revision else connection.execute(
                 "SELECT revision FROM message_prefix_revision WHERE singleton=1"
             ).fetchone()[0]
             head = self.head()
             upper = head if through_seq is None else min(head, through_seq)
-            prefix = log._message_views.get(self._session_id)
-            if prefix is None or revision is None or prefix.revision != revision:
-                prefix = _MessagePrefix(self._session_id, revision)
-            previous = prefix.seqs[-1] if prefix.seqs else -1
-            if upper > previous:
-                tail = MessageReader.scan(self, tuple, after_seq=previous, through_seq=upper)
-                prefix.messages.extend(tail)
-                prefix.seqs.extend(message.seq for message in tail)
-            # 3. 只有真实提交后的读取进入共享读面，不依赖 observer 唤醒。
-            log._message_views[self._session_id] = prefix
-            return MessageSnapshot(prefix, bisect_right(prefix.seqs, upper), upper)
+            with log._view_lock:
+                prefix = log._message_views.get(self._session_id)
+                if (prefix is None or revision is None or prefix.revision != revision
+                        or prefix.after > after_seq):
+                    prefix = _MessagePrefix(self._session_id, revision, after_seq)
+                elif (start := bisect_right(prefix.seqs, after_seq)) > _VIEW_REBASE_MESSAGES:
+                    # 旧快照仍持有原前缀；新前缀只引用窗口段的已解码消息。
+                    rebased = _MessagePrefix(self._session_id, revision, after_seq)
+                    rebased.messages.extend(prefix.messages[start:])
+                    rebased.seqs.extend(prefix.seqs[start:])
+                    prefix = rebased
+                previous = prefix.seqs[-1] if prefix.seqs else prefix.after
+            # 3. 长会话冷扫描不持 _view_lock；填充段由前缀自身持有，不回填解码缓存。
+            tail = MessageReader.scan(
+                self, tuple, after_seq=previous, through_seq=upper, _cache=False,
+            ) if upper > previous else ()
+            with log._view_lock:
+                # 4. 扫描期间提交方可能已接上一段连续尾部，只补仍缺的部分。
+                end = prefix.seqs[-1] if prefix.seqs else -1
+                missing = [message for message in tail if message.seq > end]
+                prefix.messages.extend(missing)
+                prefix.seqs.extend(message.seq for message in missing)
+                # 5. 只有真实提交后的读取进入共享读面，不依赖 observer 唤醒。
+                log._message_views[self._session_id] = prefix
+                log._retain_view(prefix)
+                # 起点晚于上界（窗口倒置）时是空窗口，与冷读同一区间一致。
+                end = bisect_right(prefix.seqs, upper)
+                return MessageSnapshot(prefix, end, upper, after_seq, min(end, bisect_right(prefix.seqs, after_seq)))
 
-    def _transaction_snapshot(self, through_seq: int | None) -> MessageSnapshot:
+    def _transaction_snapshot(self, through_seq: int | None, after_seq: int = -1) -> MessageSnapshot:
         """事务内快照独占前缀，不能为之后的已提交读取签发复用证明。"""
-        messages = MessageReader.scan(self, tuple, through_seq=through_seq)
-        prefix = _MessagePrefix(self._session_id, None)
+        messages = MessageReader.scan(self, tuple, after_seq=after_seq, through_seq=through_seq)
+        prefix = _MessagePrefix(self._session_id, None, after_seq)
         prefix.messages.extend(messages)
         prefix.seqs.extend(message.seq for message in messages)
-        return MessageSnapshot(prefix, len(messages), messages[-1].seq if messages else -1)
+        return MessageSnapshot(prefix, len(messages), messages[-1].seq if messages else -1, after_seq)
 
-    async def committed_snapshot_async(self, *, through_seq: int | None = None) -> MessageSnapshot:
+    def committed_window(self, window: HistoryWindow | None, *, through_seq: int | None = None) -> MessageSnapshot:
+        """窗口只在签发它的前缀版本上成立，且窗口内回执的调用都须在窗口内；否则读完整历史。"""
+        if window is None or window.after_seq < 0 or window.revision is None:
+            return self.committed_snapshot(through_seq=through_seq)
+        snapshot = self.committed_snapshot(through_seq=through_seq, after_seq=window.after_seq)
+        if snapshot.prefix_revision == window.revision and not _late_results(snapshot):
+            return snapshot
+        return self.committed_snapshot(through_seq=through_seq)
+
+    async def committed_window_async(
+        self, window: HistoryWindow | None, *, through_seq: int | None = None,
+    ) -> MessageSnapshot:
+        self._check_async_snapshot()
+        return await run_file_io(lambda: self.committed_window(window, through_seq=through_seq))
+
+    async def committed_snapshot_async(
+        self, *, through_seq: int | None = None, after_seq: int = -1,
+    ) -> MessageSnapshot:
         """在线程内签发一次固定读面；取消先排空实际读取。"""
         self._check_async_snapshot()
         # 热前缀只证明「本地 head 距前缀尾部不超过若干条」，不验证数据库 revision；外部
         # 改写旧行后仍会在新 revision 上重读整段历史。签发一律留在可排空 worker 内，
         # 否则失效重读会把历史级扫描放回事件循环。
-        return await run_file_io(lambda: self.committed_snapshot(through_seq=through_seq))
+        return await run_file_io(lambda: self.committed_snapshot(through_seq=through_seq, after_seq=after_seq))
 
     def _check_async_snapshot(self) -> None:
         """异步读取不得离开调用线程自己的未提交事务。"""
@@ -1321,11 +1478,15 @@ class MessageReader:
         through_seq: int | None = None,
         source: str | None = None,
         limit: int = 1000,
+        _cache: bool = True,
     ) -> tuple[Message, ...]:
         """读取固定序号范围，不创建 Session，也不持有修改或发送能力。"""
         if limit < 1 or after_seq < -1:
             raise ValueError("读取需要正 limit 和不小于 -1 的 after_seq")
-        sql = "SELECT * FROM messages WHERE session_key=? AND seq>?"
+        # 按来源读取必须走 (session, source, seq)：规划器默认选 (session, seq)，会把整段会话行读一遍再过滤。
+        sql = ("SELECT * FROM messages INDEXED BY message_source_seq WHERE session_key=? AND seq>?"
+               if source is not None and self._log._has_source_index else
+               "SELECT * FROM messages WHERE session_key=? AND seq>?")
         values: list[object] = [self._session_id, after_seq]
         if through_seq is not None:
             sql += " AND seq<=?"
@@ -1337,7 +1498,7 @@ class MessageReader:
         values.append(limit)
         with self._log._read(snapshot=False):
             rows = self._log._connection.execute(sql, values).fetchall()
-            return tuple(self._log._decode(row) for row in rows)
+            return tuple(self._log._decode(row, cache=_cache) for row in rows)
 
     def source_names(self) -> frozenset[str]:
         """只读取本 Session 中出现过的来源，不解码消息正文。"""
@@ -1356,6 +1517,46 @@ class MessageReader:
                 (self._session_id, source, through_seq),
             ).fetchone()
             return None if row is None else self._log._decode(row)
+
+    def message_ids(self) -> tuple[str, ...]:
+        """按 seq 列出本 Session 全部消息身份；在调用者的读面内执行，不解码正文。"""
+        with self._log._read() as connection:
+            return tuple(row[0] for row in connection.execute(
+                "SELECT id FROM messages WHERE session_key=? ORDER BY seq", (self._session_id,),
+            ))
+
+    def covered_window(self, message_ids: Sequence[str]) -> HistoryWindow:
+        """按 seq 顺序给出的身份从会话开头连续覆盖到的最后一条 seq（首条就不属于时为 -1），
+        与账本前缀版本取自同一读事务；不解码正文。"""
+        log = self._log
+        with log._read() as connection:
+            revision = None if not log._has_prefix_revision else connection.execute(
+                "SELECT revision FROM message_prefix_revision WHERE singleton=1"
+            ).fetchone()[0]
+            return HistoryWindow(self._covered_through(connection, message_ids), revision)
+
+    def _covered_through(self, connection: sqlite3.Connection, message_ids: Sequence[str]) -> int:
+        if not message_ids:
+            return -1
+        # 1. 常见无空洞：身份都在本会话、且末位之前恰好就是这些消息，集合相等即连续覆盖；只走索引。
+        count, last = connection.execute(
+            "SELECT COUNT(*), MAX(seq) FROM messages WHERE session_key=? "
+            "AND id IN (SELECT value FROM json_each(?))", (self._session_id, json.dumps(list(message_ids))),
+        ).fetchone()
+        if count == len(message_ids) and connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_key=? AND seq<=?", (self._session_id, last),
+        ).fetchone()[0] == count:
+            return last
+        # 2. 有空洞或身份被改写时按 seq 找到第一条未覆盖消息。
+        covered = frozenset(message_ids)
+        through = -1
+        for identity, seq in connection.execute(
+            "SELECT id, seq FROM messages WHERE session_key=? ORDER BY seq", (self._session_id,),
+        ):
+            if identity not in covered:
+                break
+            through = seq
+        return through
 
     def latest_input_seq(self, source: str, *, through_seq: int) -> int | None:
         """Read the last Input position without loading its content or metadata."""
@@ -1379,6 +1580,19 @@ class MessageReader:
                 (self._session_id, source, after_seq, through_seq),
             ).fetchone()
         return None if row is None else row[0]
+
+    def result_committed(self, call: CallRef) -> bool:
+        """本调用的 ToolResult 是否已落盘；走 call_ref 唯一索引，不全前缀扫描。"""
+        with self._log._read(snapshot=False):
+            row = self._log._connection.execute(
+                "SELECT 1 FROM messages INDEXED BY message_call_result "
+                "WHERE json_extract(body,'$.kind')='tool_result' "
+                "AND json_extract(body,'$.call_ref.message_id')=? "
+                "AND json_extract(body,'$.call_ref.part_index')=? "
+                "AND session_key=? LIMIT 1",
+                (call.message_id, call.part_index, self._session_id),
+            ).fetchone()
+        return row is not None
 
     def scan_controls(
         self, consume: Callable[[Iterable[tuple[int, Control]]], _T], *,
@@ -1423,6 +1637,7 @@ class MessageReader:
     def scan(
         self, consume: Callable[[Iterable[Message]], _T], *, after_seq: int = -1,
         through_seq: int | None = None, source: str | None = None,
+        _cache: bool = True,
     ) -> _T:
         """在同一读快照内分页消费；回调必须同步完成，不能保留迭代器。"""
         with self._log._read():
@@ -1431,7 +1646,7 @@ class MessageReader:
             def messages() -> Generator[Message, None, None]:
                 cursor = after_seq
                 while cursor < head:
-                    page = self.read(after_seq=cursor, through_seq=head, source=source, limit=256)
+                    page = self.read(after_seq=cursor, through_seq=head, source=source, limit=1024, _cache=_cache)
                     if not page:
                         break
                     yield from page
@@ -1460,6 +1675,49 @@ class MessageReader:
     ) -> MessagePage:
         """取结尾或更早的一页，始终按原始 seq 升序返回。"""
         return self._page(after_seq=-1, before_seq=before_seq, through_seq=through_seq, limit=limit, tail=True)
+
+    async def read_tail_async(
+        self, *, before_seq: int | None = None, through_seq: int | None = None, limit: int = 50,
+    ) -> MessagePage:
+        """read_tail 的异步孪生：同一真实 SQL 在可排空 worker 内执行，取消先排空。
+
+        结果与同步版逐字节一致，只是把磁盘读取移出事件循环。
+        """
+        self._check_async_snapshot()
+        return await run_file_io(
+            lambda: self.read_tail(before_seq=before_seq, through_seq=through_seq, limit=limit)
+        )
+
+    async def find_text_async(self, query: str, *, limit: int = 200) -> TextSearch:
+        """会话内正文查找：首次建该会话的正文索引，之后只追加新消息；读取与匹配都在 worker 内。"""
+        if not 1 <= limit <= 500:
+            raise InvalidPage("查找结果 limit 无效")
+        self._check_async_snapshot()
+
+        def find() -> TextSearch:
+            log = self._log
+            with log._read() as connection:
+                revision = None if not log._has_prefix_revision else connection.execute(
+                    "SELECT revision FROM message_prefix_revision WHERE singleton=1"
+                ).fetchone()[0]
+                head = connection.execute(
+                    "SELECT COALESCE(MAX(seq),-1) FROM messages WHERE session_key=?", (self._session_id,),
+                ).fetchone()[0]
+                return log._text_indexes.search(
+                    connection, self._session_id, query=query, head=head, revision=revision, limit=limit,
+                )
+
+        return await run_file_io(find)
+
+    async def deleted_async(self) -> bool:
+        """deleted 属性的异步孪生：软删标记的点查询在 worker 内完成。"""
+        self._check_async_snapshot()
+        return await run_file_io(lambda: self.deleted)
+
+    async def head_async(self, *, source: str | None = None) -> int:
+        """head 的异步孪生：水位点查询在 worker 内完成，取消先排空。"""
+        self._check_async_snapshot()
+        return await run_file_io(lambda: self.head(source=source))
 
     def _page(
         self, *, after_seq: int, before_seq: int | None, through_seq: int | None, limit: int, tail: bool,
@@ -1784,6 +2042,7 @@ class MessageWriter:
         update_metadata: Callable[[Body], Mapping[str, object | None]] | None,
         message_metadata_keys: frozenset[str],
         check_metadata: Callable[[Mapping[str, object]], None] | None,
+        update_activity: bool = True,
     ):
         self._log: MessageLog = log
         self._session_id: str = session_id
@@ -1797,6 +2056,7 @@ class MessageWriter:
         self._check_metadata = check_metadata
         self._metadata_keys = frozenset(metadata_keys)
         self._update_metadata = update_metadata
+        self._update_activity = update_activity
         self._active = True
         self._grant_lock = threading.RLock()
 
@@ -2001,10 +2261,14 @@ class MessageWriter:
                 "INSERT INTO message_bindings VALUES (?, ?)",
                 (message_id, binding_id),
             )
-        _ = connection.execute(
-            "UPDATE sessions SET next_seq=?, updated_at=? WHERE key=?",
-            (seq + 1, stamp, self._session_id),
-        )
+        if self._update_activity:
+            _ = connection.execute(
+                "UPDATE sessions SET next_seq=?, updated_at=? WHERE key=?",
+                (seq + 1, stamp, self._session_id),
+            )
+        else:
+            # 诊断消息仍追加并通知读者，但不改变用户会话的活跃时间。
+            _ = connection.execute("UPDATE sessions SET next_seq=? WHERE key=?", (seq + 1, self._session_id))
 
         # 3. 只合并获授键；失败回滚消息、序号与元数据，不覆盖其他 owner 的键。
         if session_metadata:
@@ -2021,6 +2285,12 @@ class MessageWriter:
                     "UPDATE sessions SET metadata=? WHERE key=?", (payload, self._session_id),
                 )
 
+        if isinstance(body, Output):
+            call_indexes = [idx for idx, part in enumerate(body.parts) if isinstance(part, ToolCall)]
+            if call_indexes:
+                mark_process_call_output(message_id, call_indexes)
+        elif isinstance(body, ToolResult):
+            resolve_process_call_output(body.call_ref.message_id, body.call_ref.part_index)
         self._log._changed(type(body), message)
         return message
 
@@ -2241,6 +2511,21 @@ class OwnerTransaction:
             lambda: self._save(key, value, expected_version=expected_version)
         )
 
+    def delete(self, key: str, *, expected_version: int) -> None:
+        """删除 owner 自有的派生索引项；与保存相同的版本 CAS，事实记录不应删除。"""
+        self._perform(lambda: self._delete(key, expected_version=expected_version))
+
+    def _delete(self, key: str, *, expected_version: int) -> None:
+        self._check_active()
+        if type(expected_version) is not int or expected_version < 0:
+            raise ValueError("状态版本必须是非负整数")
+        cursor = self._store._log._connection.execute(
+            "DELETE FROM owner_records WHERE owner=? AND key=? AND version=?",
+            (self._store._owner, key, expected_version),
+        )
+        if cursor.rowcount != 1:
+            raise MessageConflict("owner 记录版本已变化")
+
     def _save(
         self, key: str, value: Mapping[str, object], *, expected_version: int | None
     ) -> OwnerRecord:
@@ -2352,6 +2637,13 @@ def _timestamp(raw: str, label: str) -> datetime:
     return value
 
 
+# 回执的调用落在窗口之前（被放弃调用的迟到回执）：投影要看到调用与放弃，窗口不自洽。
+def _late_results(messages: Sequence[Message]) -> bool:
+    calls = {message.message_id for message in messages if isinstance(message.body, Output)}
+    return any(isinstance(message.body, ToolResult) and message.body.call_ref.message_id not in calls
+               for message in messages)
+
+
 def _session_entry(row: sqlite3.Row) -> SessionEntry:
     """目录列与首条 Message 共用数据库快照，标题留给表示边界生成。"""
     key = row["key"]
@@ -2415,6 +2707,13 @@ def _message_metadata(raw: str, session_id: str, message_id: str) -> Mapping[str
 
 
 def _message(row: sqlite3.Row) -> Message:
+    try:
+        raw_metadata = row["metadata"]
+    except IndexError:
+        # 窄列查询没有 metadata 列；列存在但为 NULL 仍按损坏处理。
+        metadata: Mapping[str, object] = {}
+    else:
+        metadata = _message_metadata(raw_metadata, row["session_key"], row["id"])
     return Message(
         row["id"],
         row["session_key"],
@@ -2423,7 +2722,7 @@ def _message(row: sqlite3.Row) -> Message:
         row["author"],
         row["source"],
         decode_body(row["body"]),
-        _message_metadata(row["metadata"], row["session_key"], row["id"]) if "metadata" in row.keys() else {},
+        metadata,
     )
 
 

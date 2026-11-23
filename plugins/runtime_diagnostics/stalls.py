@@ -1,8 +1,8 @@
-"""事件循环停顿现场：独立看门狗线程在停顿期间抓取线程栈，只保留代码位置，不读取变量或对象值。"""
+"""事件循环停顿与内存突增现场：独立看门狗线程抓取线程栈，只保留代码位置，不读取变量或对象值。"""
 from __future__ import annotations
 
 import asyncio
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 import logging
@@ -29,6 +29,14 @@ FOLLOW_UP_SECONDS = (6.0, 18.0)
 CPU_BASELINE_SECONDS = 4.0
 MAX_THREADS = 48
 MAX_FRAMES = 20
+# 运维发起的 CPU 采样：每 20ms 抓一次栈并读各线程 /proc CPU；30 个线程时约占 5% 单核。
+CPU_SAMPLE_SECONDS = 0.02
+CPU_TOP_STACKS = 40
+# RSS 在一秒内涨过这么多时抓一次线程栈：正常回合分配远低于此，整段解码历史这类临时大分配会越过它。
+GROWTH_MB = 256
+GROWTH_SECONDS = 1.0
+# 突增日志带循环线程与最热线程由内向外的这么多层，不读记录也能定位调用方。
+GROWTH_LOG_FRAMES = 8
 _CLOCK_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
@@ -65,9 +73,15 @@ class _Capture:
                 "cpu_window_ms": self.cpu_window_ms, "threads": [row.value() for row in self.threads[:MAX_THREADS]],
                 "threads_omitted": max(0, len(self.threads) - MAX_THREADS)}
 
-    def top(self, *, loop: bool) -> str | None:
-        return next((row.frames[0] for row in self.threads
-                     if (row.loop if loop else row.hot) and row.frames), None)
+    # depth > 1 时优先取插件代码帧（<install>/ 下），标准库在 prod 只剩基名，混进来会挤掉调用方。
+    def top(self, *, loop: bool, depth: int = 1) -> str | None:
+        for row in self.threads:
+            if not (row.loop if loop else row.hot) or not row.frames:
+                continue
+            frames = row.frames if depth == 1 else \
+                [frame for frame in row.frames if frame.startswith("<install>/")] or row.frames
+            return " < ".join(frames[:depth])
+        return None
 
 
 @dataclass
@@ -94,20 +108,80 @@ def _python_threads() -> dict[int, threading.Thread]:
     return {thread.ident: thread for thread in threading.enumerate() if thread.ident is not None}
 
 
-# 由内向外保留最多 MAX_FRAMES 层「文件:行 in 函数」；只读代码对象与行号。
-def _frames(frame: FrameType | None, locators: dict[str, str]) -> tuple[list[str], int]:
-    rows: list[str] = []
+# 当前进程常驻内存（MB）；没有 /proc 时返回 None，突增检查随之停用。
+def _rss_mb() -> int | None:
+    try:
+        resident = int(Path("/proc/self/statm").read_text().split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    return resident * os.sysconf("SC_PAGE_SIZE") // (1024 * 1024)
+
+
+# 快照后立刻由内向外取最多 MAX_FRAMES 层原始位置，只读代码对象与行号。
+# 被采样线程仍在运行：生成器一旦挂起，其帧的 f_back 变成 None，遍历必须赶在 GIL 切走之前。
+def _raw_frames(frame: FrameType | None) -> tuple[list[tuple[str, int, str]], int]:
+    rows: list[tuple[str, int, str]] = []
     depth = 0
     while frame is not None:
         if len(rows) < MAX_FRAMES:
             code = frame.f_code
-            locator = locators.get(code.co_filename)
-            if locator is None:
-                locator = locators[code.co_filename] = _export_locator(code.co_filename)
-            rows.append(f"{locator}:{frame.f_lineno or 0} in {code.co_qualname}")
+            rows.append((code.co_filename, frame.f_lineno or 0, code.co_qualname))
         depth += 1
         frame = frame.f_back
     return rows, depth - len(rows)
+
+
+# 格式化为「文件:行 in 函数」；路径脱敏较慢，放在遍历之后。
+def _frames(raw: list[tuple[str, int, str]], locators: dict[str, str]) -> list[str]:
+    rows: list[str] = []
+    for filename, line, name in raw:
+        locator = locators.get(filename)
+        if locator is None:
+            locator = locators[filename] = _export_locator(filename)
+        rows.append(f"{locator}:{line} in {name}")
+    return rows
+
+
+# 最内层帧是这些空闲等待时不算命中：线程只是停在等待里，没有在执行。
+_IDLE_FRAMES = frozenset({"EpollSelector.select", "PollSelector.select", "SelectSelector.select",
+                          "KqueueSelector.select", "Condition.wait", "Event.wait", "Thread.join", "_worker"})
+
+
+# 线程总量取两次采样间 /proc CPU 增量；栈按非空闲命中计数。采样线程拿到 GIL 时，
+# 正在执行 Python 的线程恰好停在执行位置，事件循环上的短回调也能被按比例抓到。
+def sample_cpu(stop: threading.Event) -> dict[str, object]:
+    me = threading.get_ident()
+    hits: defaultdict[tuple[str, ...], int] = defaultdict(int)
+    by_thread: defaultdict[str, float] = defaultdict(float)
+    first: dict[int, float] = {}
+    last: dict[int, float] = {}
+    names: dict[int, str] = {}
+    locators: dict[str, str] = {}
+    samples = 0
+    started = time.monotonic()
+    while not stop.wait(CPU_SAMPLE_SECONDS):
+        frames = sys._current_frames()  # pyright: ignore[reportPrivateUsage]
+        raw = {ident: _raw_frames(frame)[0] for ident, frame in frames.items() if ident != me}
+        del frames
+        samples += 1
+        for stack in raw.values():
+            if stack and stack[0][2] not in _IDLE_FRAMES:
+                hits[tuple(_frames(stack, locators))] += 1
+        for thread in _python_threads().values():
+            if thread.native_id is not None and thread.ident != me:
+                names[thread.native_id] = thread.name
+        for native, seconds in _thread_cpu(names).items():
+            _ = first.setdefault(native, seconds)
+            last[native] = seconds
+    for native, seconds in last.items():
+        by_thread[names[native]] += seconds - first[native]
+    step = CPU_SAMPLE_SECONDS * 1000
+    return {"cpu_samples": samples, "cpu_window_seconds": round(time.monotonic() - started, 1),
+            "cpu_sample_ms": step,
+            "cpu_threads": [{"name": name, "cpu_ms": round(seconds * 1000)}
+                            for name, seconds in sorted(by_thread.items(), key=lambda row: -row[1])[:20] if seconds > 0],
+            "cpu_stacks": [{"hits": count, "estimated_ms": round(count * step), "frames": list(frames)}
+                           for frames, count in sorted(hits.items(), key=lambda row: -row[1])[:CPU_TOP_STACKS]]}
 
 
 class StallWatch:
@@ -124,6 +198,7 @@ class StallWatch:
         self._cpu = _Cpu(time.monotonic(), {})
         self._open: _Stall | None = None
         self._reported_due = 0.0
+        self._rss = (time.monotonic(), _rss_mb())
 
     async def run(self) -> None:
         """本任务拥有看门狗线程；线程确实退出后任务才结束。"""
@@ -203,8 +278,31 @@ class StallWatch:
             self._capture(stall, now, delay)
             self._close(stall, beat, lag)
             return
+        self._check_growth(now, delay)
         if now - self._cpu.at >= CPU_BASELINE_SECONDS:
             self._cpu = self._read_cpu(now)
+
+    # 健康时每秒读一次 RSS；突增时抓栈，循环线程与占用 CPU 的线程就是分配现场。
+    def _check_growth(self, now: float, delay: float) -> None:
+        at, previous = self._rss
+        if previous is None or now - at < GROWTH_SECONDS:
+            return
+        current = _rss_mb()
+        self._rss = (now, current)
+        # 停顿期间不采样；跨过停顿的间隔只重建基线，不把累计增长当作一秒突增。
+        if current is None or now - at > 2 * GROWTH_SECONDS or current - previous < GROWTH_MB:
+            return
+        sample = _Stall(due=at, started_at=time.time() - (now - at), cpu=self._cpu)
+        self._capture(sample, now, delay)
+        self._cpu = sample.cpu
+        capture = sample.captures[0]
+        self._records.append("growth", {"started_at": sample.started_at, "rss_mb": current,
+                                        "delta_mb": current - previous, "threshold_mb": GROWTH_MB,
+                                        "captures": [capture.value()]})
+        self._logger.warning("内存 %.1f 秒内增长 %d MB（RSS %d MB）；循环线程位于 %s，占用 CPU 的线程位于 %s",
+                             now - at, current - previous, current,
+                             capture.top(loop=True, depth=GROWTH_LOG_FRAMES) or "未知",
+                             capture.top(loop=False, depth=GROWTH_LOG_FRAMES) or "无")
 
     def _read_cpu(self, now: float) -> _Cpu:
         threads = _python_threads().values()
@@ -213,23 +311,21 @@ class StallWatch:
     # 抓所有 Python 线程的栈：循环线程在前，其余按停顿窗口内 CPU 时间排序。
     def _capture(self, stall: _Stall, now: float, delay: float) -> None:
         frames = sys._current_frames()  # pyright: ignore[reportPrivateUsage]
+        raw = {ident: _raw_frames(frame) for ident, frame in frames.items() if ident != self._watch_ident}
+        del frames
         threads = _python_threads()
         cpu = self._read_cpu(now)
         locators: dict[str, str] = {}
         rows: list[_ThreadStack] = []
-        for ident, frame in frames.items():
-            if ident == self._watch_ident:
-                continue
+        for ident, (stack, omitted) in raw.items():
             thread = threads.get(ident)
             native = thread.native_id if thread is not None else None
             used = None
             if native is not None and native in cpu.seconds:
                 # 基线之后才启动的线程，全部 CPU 时间都落在本窗口内。
                 used = round((cpu.seconds[native] - stall.cpu.seconds.get(native, 0.0)) * 1000, 1)
-            stack, omitted = _frames(frame, locators)
             rows.append(_ThreadStack(thread.name if thread is not None else "unregistered", native,
-                                     ident == self._loop_ident, used, stack, omitted))
-        del frames
+                                     ident == self._loop_ident, used, _frames(stack, locators), omitted))
         rows.sort(key=lambda row: (not row.loop, -(row.cpu_ms or 0.0)))
         window = round((now - stall.cpu.at) * 1000, 1)
         elapsed = round((now - stall.due) * 1000, 1)

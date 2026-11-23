@@ -4,16 +4,17 @@ import asyncio
 
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import TypedDict
 
-from agent.plugin_composition import Context, Effect
+from agent.plugin_composition import CompositionError, Context, Effect, RuntimeScope
 from agent.plugin_composition.model import FiberState
 from plugins.models.contract import ContextModel, ModelRequest
 from plugins.models.contract import BoundChatModel
 from agent.plugin_composition.tasks import child_task_context
-from plugins.ledger.contract import Message, is_user_input
+from plugins.ledger.contract import HistoryWindow, Message
 from plugins.context.contract import (
-    MaterialData, MaterialKind, Prepare, PrepareVisible, ReductionStatus, SummaryData, SummaryReducer,
+    HistoryStart, MaterialData, MaterialKind, Prepare, ReductionStatus, SummaryData, SummaryReducer,
 )
 
 from .api import (
@@ -23,7 +24,6 @@ from .api import (
     decode_material,
     decode_summary,
     material_data,
-    summary_cutoff,
 )
 
 
@@ -36,7 +36,7 @@ class _Source:
     summary: bool
     context: Context
     reduce: SummaryReducer | None
-    prepare_visible: PrepareVisible | None = None
+    history_start: HistoryStart | None = None
 
     @property
     def plugin_id(self) -> str:
@@ -46,11 +46,10 @@ class _Source:
 class MaterialView:
     """固定本次请求的贡献者；只收集材料，不调用模型或修改消息。"""
 
-    def __init__(self, ctx: Context, sources: tuple[tuple[str, _Source], ...], *,
-                 global_prompt_only: bool = False):
+    def __init__(self, ctx: Context, sources: tuple[tuple[str, _Source], ...], prepare_timeout_seconds: float):
         self._ctx = ctx
         self._sources = sources
-        self._global_prompt_only = global_prompt_only
+        self._prepare_timeout_seconds = prepare_timeout_seconds
         self._active = True
 
     def close(self) -> None:
@@ -74,7 +73,7 @@ class MaterialView:
                 key = (plugin_id, item.name)
                 if key in blocks:
                     raise ValueError(f"提醒身份重复: {key}")
-                blocks[key] = item
+                blocks[key] = replace(item, owner=plugin_id)
 
         if reminders:
             if caller is None or caller.root_instance_token is not self._ctx.root_instance_token:
@@ -82,39 +81,55 @@ class MaterialView:
             collect(caller.runtime.plugin_id, decode_material({"reminders": reminders}).reminders)
         summary: Summary | None = None
         references: dict[str, Mapping[str, object]] = {}
-        tasks: dict[str, asyncio.Task[Materials | Exception]] = {}
-        summary_name = next((name for name, owner in self._sources if owner.summary), None)
+        # One preparation owns one deadline, shared by every concurrent contributor.
+        deadline = asyncio.get_running_loop().time() + self._prepare_timeout_seconds
+        captured_scopes: list[RuntimeScope | None] = []
+        try:
+            for _, owner in self._sources:
+                try:
+                    captured = owner.context.capture_runtime_scope()
+                except CompositionError as error:
+                    # 仅当调用方并非进入 bind 的 Task 时回退到当场申请 scope；
+                    # 同 Task 调用必须复用 bind 已持有的许可，避免 owner 进入排空期后子任务被拒。
+                    if error.code != "OWNER_CALL_CONTEXT":
+                        raise
+                    captured = None
+                captured_scopes.append(captured)
+        except BaseException:
+            for scope in captured_scopes:
+                if scope is not None:
+                    scope.discard()
+            raise
 
-        async def prepare_owner(owner: _Source) -> Materials | Exception:
+        async def prepare_owner(name: str, owner: _Source, scope: RuntimeScope | None) -> Materials | Exception:
             """Keep each independent contribution inside its actual owner scope."""
+            budget = asyncio.timeout_at(deadline)
             try:
-                if owner.prepare_visible is not None:
-                    selected_summary: Summary | None = None
-                    if summary_name is not None:
-                        summary_material = await tasks[summary_name]
-                        if isinstance(summary_material, Exception):
-                            raise summary_material
-                        selected_summary = summary_material.summary
-                    cutoff = summary_cutoff(snapshot, selected_summary)
-                    latest = next((message.message_id for message in reversed(snapshot)
-                                   if message.source == source and is_user_input(message)), None)
-                    visible = tuple(message for message in snapshot
-                                    if message.seq > cutoff or message.message_id == latest)
-                    async with owner.context.runtime_scope():
-                        return decode_material(await owner.prepare_visible(snapshot, source, visible))
-                async with owner.context.runtime_scope():
+                async with (owner.context.runtime_scope() if scope is None else scope), budget:
                     return decode_material(await owner.prepare(snapshot, source))
+            except TimeoutError as error:
+                if budget.expired():
+                    return TimeoutError(
+                        f"材料 {owner.plugin_id}/{name} 准备超过 {self._prepare_timeout_seconds:g} 秒总期限，"
+                        "已停止且不会自动重试；请检查材料 provider 后发送新输入。")
+                return error
             except Exception as error:
                 # Drain every started owner, then report errors in frozen order.
                 return error
 
         # Preparation may overlap; merging still follows the frozen source order.
-        async with asyncio.TaskGroup() as group:
-            ordered_sources = sorted(self._sources, key=lambda item: item[0] != summary_name)
-            for name, owner in ordered_sources:
-                tasks[name] = group.create_task(prepare_owner(owner), context=child_task_context())
-        for name, owner in self._sources:
-            material = tasks[name].result()
+        try:
+            async with asyncio.TaskGroup() as group:
+                tasks = [
+                    group.create_task(prepare_owner(name, owner, scope), context=child_task_context())
+                    for (name, owner), scope in zip(self._sources, captured_scopes, strict=True)
+                ]
+        finally:
+            for scope in captured_scopes:
+                if scope is not None:
+                    scope.discard()
+        for (name, owner), task in zip(self._sources, tasks, strict=True):
+            material = task.result()
             if isinstance(material, Exception):
                 raise material
             self._check_active()
@@ -122,8 +137,6 @@ class MaterialView:
                 if not owner.prompt:
                     raise PermissionError("此材料 owner 没有 Prompt 贡献权")
                 prompts.append((owner.priority, owner.plugin_id.encode("utf-8"), name.encode("utf-8"), material.system_prompt))
-            if self._global_prompt_only:
-                continue
             collect(owner.plugin_id, material.reminders)
             if material.summary is not None:
                 if not owner.summary:
@@ -142,25 +155,33 @@ class MaterialView:
         ordered = tuple(block for _, block in sorted(
             blocks.items(), key=lambda item: (item[1].priority, item[0][0].encode("utf-8"), item[0][1].encode("utf-8")),
         ))
-        return material_data(Materials("\n\n".join(item[3] for item in sorted(prompts)), ordered, summary, tuple(references.values())))
+        sections = tuple((item[2].decode("utf-8"), item[3]) for item in sorted(prompts))
+        return material_data(Materials("\n\n".join(text for _, text in sections), ordered, summary,
+                                       tuple(references.values()), prompt_sections=sections))
 
     async def reduce(
         self, snapshot: tuple[Message, ...], materials: MaterialData,
         request: ModelRequest, model: BoundChatModel, projection: ContextModel,
-        *, source: str, force: bool, on_status: ReductionStatus | None = None,
+        *, source: str, force: bool, required: bool = True, on_status: ReductionStatus | None = None,
+        summary_limit: int | None = None,
     ) -> SummaryData | None:
         """只有同一个摘要 owner 能缩减；其余已取得材料保持原样。"""
         self._check_active()
-        if self._global_prompt_only:
-            return None
         current = decode_material(materials)
         for _, owner in self._sources:
             if owner.reduce is not None:
+                # Only pass optional values that this call needs to override.
+                options: _ReduceOptions = {}
+                if not required:
+                    options["required"] = False
+                if on_status is not None:
+                    options["on_status"] = on_status
+                if summary_limit is not None:
+                    options["summary_limit"] = summary_limit
                 async with owner.context.runtime_scope():
                     summary_value = await owner.reduce(
                         snapshot, material_data(current), request, model, projection,
-                        source=source, force=force,
-                        **({"on_status": on_status} if on_status is not None else {}),
+                        source=source, force=force, **options,
                     )
                 self._check_active()
                 summary = decode_summary(summary_value)
@@ -170,7 +191,8 @@ class MaterialView:
                 if previous is not None:
                     if summary.reference == previous.reference and summary != previous:
                         raise ValueError("同一持久摘要引用的内容不能改变")
-                    if summary.source_message_ids[:len(previous.source_message_ids)] != previous.source_message_ids:
+                    previous_ids = set(previous.source_message_ids)
+                    if tuple(identity for identity in summary.source_message_ids if identity in previous_ids) != previous.source_message_ids:
                         raise ValueError("缩减不能撤回已覆盖的摘要来源")
                     if (summary.source_message_ids, summary.content) == (previous.source_message_ids, previous.content):
                         return None
@@ -182,25 +204,31 @@ class MaterialView:
         return None
 
 
+class _ReduceOptions(TypedDict, total=False):
+    required: bool
+    on_status: ReductionStatus
+    summary_limit: int
+
+
 class ContextMaterials:
     """普通材料注册和生命周期；Prompt 权由组合配置授予，检索默认低信任。"""
 
     def __init__(
         self, ctx: Context, *, prompt_sources: Mapping[str, str],
         summary_source: tuple[str, str] | None = None,
-        recall_source: tuple[str, str] | None = None,
+        prepare_timeout_seconds: float = 900.0,
     ):
         self._ctx = ctx
         self._prompt_sources = dict(prompt_sources)
         self._summary_source = summary_source
-        self._recall_source = recall_source
+        self._prepare_timeout_seconds = prepare_timeout_seconds
         self._sources: dict[str, _Source] = {}
 
     async def register(
         self, ctx: Context, *, name: str, prepare: Prepare,
         kind: MaterialKind, priority: int = 0, prompt: bool = False,
         reduce: SummaryReducer | None = None,
-        prepare_visible: PrepareVisible | None = None,
+        history_start: HistoryStart | None = None,
     ) -> Effect:
         """Register an independent owner; priority orders output, not execution.
 
@@ -232,28 +260,37 @@ class ContextMaterials:
                 raise PermissionError("只有获授的摘要材料 owner 能注册缩减")
             if not callable(reduce):
                 raise TypeError("摘要缩减必须可调用")
-        if prepare_visible is not None and (kind != "recall" or not callable(prepare_visible)):
-            raise TypeError("可见原文准备回调只供召回材料 owner 使用")
+        if history_start is not None:
+            if not summary:
+                raise PermissionError("只有获授的摘要材料 owner 能声明历史起点")
+            if not callable(history_start):
+                raise TypeError("历史起点必须可调用")
 
         def setup():
             if name in self._sources:
                 raise ValueError(f"材料 owner 重复: {name}")
-            self._sources[name] = _Source(prepare, priority, kind, prompt, summary, ctx, reduce, prepare_visible)
+            self._sources[name] = _Source(prepare, priority, kind, prompt, summary, ctx, reduce, history_start)
             return lambda: self._sources.pop(name)
 
         return await ctx.effect(setup, label=f"materials:{name}")
+
+    async def history_start(self, session_id: str) -> HistoryWindow | None:
+        """摘要 owner 证明已连续覆盖的前缀；没有获授 owner 或它不声明时返回 None，调用方读完整历史。"""
+        if self._summary_source is None:
+            return None
+        source = self._sources.get(self._summary_source[0])
+        if (source is None or source.history_start is None or not source.summary
+                or source.context.fiber.state is not FiberState.ACTIVE):
+            return None
+        async with self._ctx.runtime_scope(), source.context.runtime_scope():
+            return await source.history_start(session_id)
 
     def binding_contributors(self) -> tuple[Context, ...]:
         """材料目录的实际注册者随同服务归档；来源仍在 bind 时选择排除项。"""
         return tuple(source.context for source in self._sources.values())
 
-    def global_prompt_contributors(self) -> tuple[Context, ...]:
-        return tuple(source.context for source in self._sources.values()
-                     if source.kind == "context" and source.prompt)
-
     @asynccontextmanager
-    async def bind(self, *, exclude_kinds: frozenset[MaterialKind] = frozenset(),
-                   global_prompt_only: bool = False) -> AsyncIterator[MaterialView]:
+    async def bind(self, *, exclude_kinds: frozenset[MaterialKind] = frozenset()) -> AsyncIterator[MaterialView]:
         """固定 ACTIVE 材料并持有 provider 与贡献者的局部 scope。"""
         if not exclude_kinds <= {"context", "recall", "profile"}:
             raise ValueError("材料用途选择不能包含未知用途")
@@ -264,14 +301,8 @@ class ContextMaterials:
                 name: source
                 for name, source in active.items()
                 if source.kind not in exclude_kinds
-                and (not global_prompt_only or (source.kind == "context" and source.prompt))
             }
-            if self._recall_source is not None and "recall" not in exclude_kinds and not global_prompt_only:
-                name, plugin_id = self._recall_source
-                selected = sources.get(name)
-                if selected is None or selected.kind != "recall" or selected.plugin_id != plugin_id:
-                    raise ValueError(f"所选长期记忆尚未就绪: {plugin_id}；请恢复提供者或显式切换记忆配置")
-            if self._summary_source is not None and not global_prompt_only:
+            if self._summary_source is not None:
                 name, plugin_id = self._summary_source
                 source = sources.get(name)
                 if source is None or not source.summary or source.plugin_id != plugin_id:
@@ -287,7 +318,7 @@ class ContextMaterials:
             async with AsyncExitStack() as scopes:
                 for context in contributors:
                     await scopes.enter_async_context(context.runtime_scope())
-                view = MaterialView(self._ctx, selected, global_prompt_only=global_prompt_only)
+                view = MaterialView(self._ctx, selected, self._prepare_timeout_seconds)
                 try:
                     yield view
                 finally:

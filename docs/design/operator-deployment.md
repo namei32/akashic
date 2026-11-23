@@ -133,6 +133,17 @@ python3 scripts/akashic_release/cli.py install \
 必须使用目标版本脚本。已安装的 `akashic-release` 从当前 `runtime.env` 加载当前版本发布器；
 从旧版首次切到此实现时，使用上面的 bootstrap 或目标 checkout，旧 CLI 不认识新选项。
 
+### 本实例相对 preset 改了什么
+
+```sh
+akashic-release preset-diff
+```
+
+只读，列出 workspace `bundle.patch.toml` 相对正在运行的 preset：`changed` 是覆盖了 preset 的字段，
+`added` 是 preset 没有的 row（外置插件或可选插件），`same` 是和 preset 相同、可以删掉的 row，
+`notShipped` 是指向本发行版已不带插件的 row。用户 patch 按字段覆盖 preset，没写的启停和配置跟随 preset
+（ADR-0109）；在设置里把插件切回 preset 的启停时，这一行会被删除。
+
 ## 更新指定外置插件
 
 先读取实际基线：
@@ -269,8 +280,6 @@ Source body-kind reads also use `message_source_kind_seq` on Session, source, `j
 
 ## Shell 自部署
 
-### Docker
-
 Docker 默认执行 `gateway`；AppRuntime 拥有 Web Shell、readiness 和关闭顺序，
 Docker init 负责回收子进程，systemd 负责服务生命周期。原生直接运行模式仍使用 Supervisor。
 首次启用需由部署者用既有安装流程启动支持 [0091](../decisions/0091-shell-self-deployment.md)
@@ -287,13 +296,21 @@ Docker init 负责回收子进程，systemd 负责服务生命周期。原生直
 `activationAttempt` 引用既有发布回执。后续回合用 `akashic-release status <requestId>`
 及 `journalctl --user -u akashic-deploy-<requestId>.service` 读取实际结果；
 任务记录的 running 必须结合实际 unit 状态解释，worker 死亡不代表更新成功。
+目标发行版含待执行的 Core 或内置迁移时，worker 在预检后、排空前拒绝自部署，把迁移 ID 写入失败原因。原服务继续运行，由运维核对数据恢复点后通过普通 install 发布。
+排空后的 Core 如果仍有已登记的插件代清理，会在该 boot 的退出回执中写入 `generation_cleanup_pending` 和事务 ID。
+发布器核对同一 boot、Root、Core 容器退出、Controller 空租约及服务停止状态后，在发布锁内结算该 boot 的纯运行期代清理。
+涉及选择切换、未决安装或配置的事务仍阻止发布；已启用的外置插件在新版本重新加载，失败原因进入部署结果。
 宿主不自动重放失败任务。备份由本次部署者明确选择 `--backup`，默认不备份。
 
 正常关闭证据包括同一 boot/Root 的 Core receipt、同一 Controller 的租约清理 receipt、
 旧容器退出状态和 systemd 停止结果。任何证据缺失都阻止发布。等待失败恢复旧实例准入；
 停止后失败沿既有发布器保留维护现场与发布回执，由部署者审计恢复。
 
-本地停止协议 E2E：
+以下两条 E2E 命令记录历史验收入口，脚本已在临时脚本清理中退役；
+可用 `git show dc5be63d2:<路径>` 回溯。当前 checkout 无法直接执行，
+部署前须在隔离环境按现行合同准备验收，不能将历史通过视为当前验证。
+
+历史本地停止协议 E2E：
 
 ```sh
 PYTHONPATH=sdk/python/src:. .venv/bin/python scripts/verify_self_deploy_runtime.py
@@ -321,46 +338,3 @@ Docker socket 的 privileged systemd 容器。虚拟机内先完成正式初始�
 新 boot/commit、原消息全文与顺序、下一回合和默认组合的 Skill 可见性。
 更新全程核对无关服务 PID、重启次数、容器身份、机器 boot 及连续心跳。
 外部 HTTP 模型响应受控；这证明执行协议，不证明真实模型总会遵守最后一次调用要求。
-
-### 原生 WSL
-
-WSL 复用 Shell 的调用身份、送达凭据、排空与正常关闭回执。宿主用独立 systemd 用户任务完成发布。Core 仍以普通用户和原生 Supervisor 运行。
-
-部署者首次在固定的宿主 checkout 安装 `akashic-release`，使它用宿主 Python 环境运行 `scripts.akashic_release.cli`。配置 `/etc/akashic/wsl-release.json`，由 root 持有并禁止组及其他用户写入。
-
-```json
-{
-  "root": "/home/namei/.local/state/akashic-wsl-release",
-  "state": "/home/namei/.akashic",
-  "repository": "/home/namei/akashic",
-  "unit": "akashic.service",
-  "port": 2236
-}
-```
-
-创建独立发布目录，保持 systemd 用户管理器持续运行。系统服务复用 `/usr/local/libexec/akashic-wsl-service` 的固定状态、启动和带 invocation ID 的停止权限。启动失败进入 `failed` 时，允许宿主为这一个服务执行 `sudo -n /usr/bin/systemctl reset-failed akashic.service`。这项权限由部署者按需配置。
-
-现有实例先用 `akashic-release wsl register --adopt --distribution DIR --core DIR --python PATH` 登记实际运行的发行制品，再把固定 unit 的 `ExecStart` 指向 `akashic-release wsl launch`。固定启动入口和发布配置由部署者维护，不能设置 `User=root`。隔离实例可用独立的 `--profile`、`akashic-wsl-*.service` 用户服务、全新的 state/HOME 和独立端口。
-
-日常在配置仓库取回用户确认的提交后，通过 `wsl prepare --commit SHA` 构建。只有兼容的外置插件更新时，使用 `wsl plugin-install --source SOURCE --ref SHA` 和 `wsl plugin-status UPDATE_ID`，由现有网关负责安装与激活。发行版或混合改动用 `wsl submit --commit SHA`，混合改动同时指定 `--plan` 和 `--inputs`。清单使用上文的格式。独立宿主重新核对当前 Root 和已经确认的清单，使用同一个安装器发布。任务回执由 `wsl status REQUEST_ID` 查询。
-
-停止后，启动入口会暂时阻止新进程读到未结算的组合。有完整发布回执时，用 `wsl resume REQUEST_ID` 继续启动和验收。回到旧版本时先确认旧代码和旧插件都能读取当前数据，再执行 `wsl rollback REQUEST_ID --compatible-data`。旧外置制品与旧发行版一同发布。回执缺失且实际 Root 已变化时，先核对发布指针和迁移账本。数据库恢复与向前修复仍按对应数据 owner 的合同执行。
-
-若排空后、调用 systemd 停止前写入停机回执失败，宿主先尝试取消同一请求的停止准备，让原 boot 恢复接单，再尽力落失败回执。若停机失败发生在迁移和发布阶段之前，宿主核对原 systemd invocation 已退出、workspace 生命周期锁空闲，以及启动指针和 Root 仍指向旧版。条件满足时，宿主通过现有启动入口重新启动旧版，核对新 boot、旧 Root、插件激活和 Web Chat。发布任务仍以 `failed_stop` 结算，恢复结果另存，原会话会收到失败原因和旧版是否已恢复的报告。重试时在停机前复用安装器的账本检查，发现插件清理等未结算记录就取消排空并保留当前实例。进入发布阶段后的故障按发布回执处理。
-
-完整发布后若候选启动失败，原生 WSL 按 [0145](../decisions/0145-wsl-rolls-back-proven-startup-failures.md) 尝试自动回退。旧版验收通过时，`wsl status` 显示 `rolled_back` 和原启动错误，原会话收到「发布失败，旧版已恢复」。未回退时，回执的 `recovery` 说明原因，按实际启动指针、Root 和迁移账本选择人工处理。
-
-接单时先验证原来源的最终回复投递能力。来自无最终回复 provider 的后台作业回调会在启动 worker 前被拒绝。在线预检按正式安装器选出的候选组合启动一次性 Core，使用临时 HOME、配置和状态，复制保留的外置制品，切断外部网络并隔开正式状态目录。真实 Web Chat 使用隔离网络内的测试模型验证接发。实际停止前再次核对原 boot 和 Root。
-
-每个请求由独立 systemd 计时器从宿主回执生成结果，成功、失败和恢复分别记录。报告通过本机 Gateway 追加到原会话，并按回执身份去重。聊天不可用时写入 `<release-root>/desktop-notifications/`，恢复后再次补发。将 [持续检查的用户 unit](../../integrations/wsl_release_notifications/akashic-release-report.timer) 及同名 service 安装进 `~/.config/systemd/user/` 并启用 timer，可以跨 WSL 重启继续读回执。正式 profile 默认生成桌面发件箱，隔离 profile 可显式设 `desktop_notifications`。
-
-Windows 桌面由登录用户运行 [通知发件箱读取器](../../integrations/wsl_release_notifications/Watch-ReleaseNotifications.ps1)。其 `-Queue` 指向发布根下的桌面发件箱 UNC 路径。可用 Windows 任务计划程序设置在该用户登录时启动脚本，选择仅在该用户登录时运行。Windows 显示事件后写 ACK，宿主将其与原会话的入账回执分别记录。
-
-在 WSL 用户 systemd 和项目 Python 环境中运行隔离验收，参数为已构建发行制品的 `wheels/` 目录。
-
-```sh
-.venv/bin/python scripts/verify_wsl_self_deploy.py /path/to/distribution/wheels
-```
-
-该脚本创建独立服务、状态目录和端口，通过实际网关和安装器验收外置热更新、内置发布、混合发布及失败恢复。使用受控模型回复触发真实 Shell 调用，并从原频道读到回复后继续等待宿主完成。运行证据目录会在开头输出。
-传入 `--desktop` 时，隔离启动故障会在当前 Windows 桌面显示带「隔离验收」标签的提醒。

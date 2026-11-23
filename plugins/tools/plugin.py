@@ -9,10 +9,12 @@ from dataclasses import dataclass
 from typing import cast
 
 from agent.plugin_composition import (
+    stop_spawned,
     RUNTIME_STARTED,
     RUNTIME_STOPPING,
     Context,
     Effect,
+    FiberState,
 )
 from plugins.ledger.contract import BINDINGS, Bindings
 from plugins.ledger.contract import (
@@ -21,11 +23,9 @@ from plugins.ledger.contract import (
     OWNER_STATE,
     MessageReader,
 )
-from agent.plugin_composition.tasks import TASKS, ExternalRootPermit, TaskAdmission
+from agent.plugin_composition.tasks import TASKS, ExternalRootPermit, Task, TaskAdmission
 from plugins.ledger.contract import (
     CallRef,
-    ContentPart,
-    ContentReferences,
     ToolResult,
     Output,
     ToolCall,
@@ -37,10 +37,15 @@ from plugins.content.contract import (
 from plugins.tools.contract import (
     ALL_TOOLS as ALL_TOOLS,
     TOOL_BIND_SAVED as TOOL_BIND_SAVED,
-    TOOL_DISPLAY_NAME as TOOL_DISPLAY_NAME,
+    TOOL_CLEANUP as TOOL_CLEANUP,
+    TOOL_DISPLAY as TOOL_DISPLAY,
+    ToolDisplay,
+    ToolIcon,
     TOOLS as TOOLS,
     ToolRef as ToolRef,
+    ToolRelease,
     ToolView as ToolView,
+    normalize_tool_icon,
     tool_key,
 )
 
@@ -53,11 +58,11 @@ from .api import (
     ProviderBoundTool,
     Result,
     coerce_result,
-    display_name,
+    display_tool,
     result_message_id,
 )
+from .cleanup import Release, tool_cleanup
 from .execution import ToolExecution
-from .api import CallSource
 from .program import TOOL_PROGRAM, ToolProgramFactory
 
 api_version = 3
@@ -72,11 +77,13 @@ def _batch_error(bindings: Bindings, source: CallSource) -> str | None:
     if not isinstance(output, Output):
         raise ValueError("工具调用来源必须是 Output")
     calls = tuple(part for part in output.parts if isinstance(part, ToolCall))
-    if len(calls) > 1 and any(
-        cast(Mapping[str, object], bindings.describe(call.binding_id, TOOLS)["tool"]).get("exclusive_batch") is True
-        for call in calls
-    ):
-        return "此批次包含要求独占的工具；整批未执行，请单独调用该工具。"
+    if len(calls) > 1:
+        exclusive = tuple(
+            str(description["name"]) for call in calls
+            if (description := cast(Mapping[str, object], bindings.describe(call.binding_id, TOOLS)["tool"])).get("exclusive_batch") is True
+        )
+        if exclusive:
+            return f"此批次包含要求独占的工具 {', '.join(exclusive)}；整批未执行，请分别单独调用这些工具。"
     return None
 
 
@@ -114,6 +121,26 @@ class _Registration:
     preparation: _Preparation | None = None
     authorization: _Authorization | None = None
     parallel: bool = False
+    release: ToolRelease | None = None
+    icon: Mapping[str, object] | None = None
+    label: str | None = None
+
+
+# 旧 binding 可能带已退役的 "authorize" 字段；限制改为执行时读取当前注册，这里只忽略它。
+def _binding_fields(metadata: Mapping[str, object]) -> set[str]:
+    return set(metadata) - {"authorize"}
+
+
+def _expected_fields(registration: _Registration) -> set[str]:
+    return {"tool", "prepare", *(("state",) if registration.capture is not None else ())}
+
+
+def _owners_active(registration: _Registration) -> bool:
+    contributors = (
+        registration.context,
+        *(() if registration.preparation is None else (registration.preparation.context,)),
+    )
+    return all(contributor.fiber.state == FiberState.ACTIVE for contributor in contributors)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,15 +205,23 @@ class ToolCatalog:
         self._ctx = ctx
         self._task_admission = task_admission
         self._tools: dict[str, _Registration] = {}
-        self._groups: dict[str, tuple[bool, str]] = {}
+        self._groups: dict[str, tuple[bool, str, Mapping[str, object] | None]] = {}
 
-    async def declare_group(self, ctx: Context, *, always_on: bool = False, description: str = "未声明用途") -> Effect:
+    async def declare_group(
+        self,
+        ctx: Context,
+        *,
+        always_on: bool = False,
+        description: str = "未声明用途",
+        icon: ToolIcon | None = None,
+    ) -> Effect:
         """由真实插件 owner 在注册工具前声明唯一组级展示事实。"""
         self._check_context(ctx)
         if type(always_on) is not bool:
             raise TypeError("工具组 always_on 必须是 bool")
         if not isinstance(description, str) or not description.strip():
             raise ValueError("工具组用途不能为空")
+        normalized_icon = normalize_tool_icon(icon)
         owner = ctx.runtime.plugin_id
         if any(item.context.runtime.plugin_id == owner for item in self._tools.values()):
             raise ValueError("工具组必须在工具注册前声明")
@@ -194,7 +229,7 @@ class ToolCatalog:
         def setup() -> Callable[[], None]:
             if owner in self._groups:
                 raise ValueError(f"工具组重复声明: {owner}")
-            self._groups[owner] = (always_on, description)
+            self._groups[owner] = (always_on, description, normalized_icon)
 
             def cleanup() -> None:
                 _ = self._groups.pop(owner)
@@ -216,6 +251,9 @@ class ToolCatalog:
         idempotent: bool = False,
         parallel: bool = False,
         exclusive_batch: bool = False,
+        release: ToolRelease | None = None,
+        icon: ToolIcon | None = None,
+        label: str | None = None,
     ) -> ToolRef:
         """目标自行校验参数 schema；注册表固定发现描述与真实资源入口。"""
         self._check_context(ctx)
@@ -230,6 +268,11 @@ class ToolCatalog:
             raise TypeError("工具执行选项必须是 bool")
         if capture is not None and not callable(capture):
             raise TypeError("工具 capture 必须是可调用对象")
+        if release is not None and not callable(release):
+            raise TypeError("工具 release 必须是可调用对象")
+        if label is not None and (not isinstance(label, str) or not label.strip() or len(label) > 16):
+            raise ValueError("工具显示名必须是 1–16 字的短语")
+        normalized_icon = normalize_tool_icon(icon)
         descriptor = cast(
             Mapping[str, object],
             freeze_json(
@@ -246,7 +289,16 @@ class ToolCatalog:
         )
 
         reference = ToolRef(name, descriptor)
-        registration = _Registration(reference, ctx, open, capture, parallel=parallel)
+        registration = _Registration(
+            reference,
+            ctx,
+            open,
+            capture,
+            parallel=parallel,
+            release=release,
+            icon=normalized_icon,
+            label=label.strip() if label is not None else None,
+        )
 
         def setup() -> Callable[[], None]:
             if name in self._tools:
@@ -298,7 +350,7 @@ class ToolCatalog:
     async def register_authorize(
         self, ctx: Context, *, tool: ToolRef, name: str, authorize: BindingAuthorize
     ) -> Effect:
-        """每个工具的独立限制只有一个 owner，并随 binding 固定。"""
+        """每个工具的独立限制只有一个 owner；执行时读取当前注册，不写进 binding。"""
         self._check_context(ctx)
         if not name:
             raise ValueError("工具限制必须有贡献名")
@@ -318,6 +370,11 @@ class ToolCatalog:
 
         return await ctx.effect(setup, label=f"tool-authorize:{name}")
 
+    # 收尾入口固定当时声明了 release 的注册及其 Context；之后换代或撤下不改变本次释放对象。
+    def releases(self) -> dict[str, Release]:
+        return {name: Release(item.context.runtime.plugin_id, item.release, item.context, item.capture is not None)
+                for name, item in self._tools.items() if item.release is not None}
+
     def allows_parallel(self, name: str) -> bool:
         """调度只读取 owner 声明；未知工具一律不能重叠。"""
         registration = self._tools.get(name)
@@ -336,16 +393,23 @@ class ToolCatalog:
         async def authorize_binding(
             binding_id: str, arguments: Mapping[str, object]
         ) -> Mapping[str, object] | str:
-            async with bindings.open(binding_id, TOOLS) as (catalog, metadata):
-                refusal = await catalog.authorize(metadata, arguments)
-                if refusal is not None:
-                    return refusal
+            async with self._ctx.runtime_scope():
+                async with bindings.open(binding_id, TOOLS) as (catalog, metadata):
+                    refusal = await catalog.authorize(metadata, arguments)
+                    if refusal is not None:
+                        return refusal
             return await authorize(binding_id, arguments)
+
+        @asynccontextmanager
+        async def open_scoped_tool(identity: str) -> AsyncIterator[BoundTool]:
+            async with self._ctx.runtime_scope():
+                async with open_tool(bindings, identity) as target:
+                    yield target
 
         return ToolExecution(
             self._ctx.require(OWNER_STATE).open(self._ctx),
             self._ctx.require(TASKS).open(self._ctx),
-            lambda identity: open_tool(bindings, identity),
+            open_scoped_tool,
             authorize_binding,
             task_key="effects",
             child_permit=child_permit,
@@ -358,17 +422,42 @@ class ToolCatalog:
             _ = self._registration(ref)
         return ToolView(tuple(refs))
 
+    # 只列出贡献者都已激活的工具：插件 apply 中途就注册工具，加载或重载期间绑定它会让整轮回复失败。
     def _all_view(self) -> ToolView:
         return ToolView(tuple(self._tools[name].ref for name in sorted(self._tools)
-                              if self._tools[name].ref.description["public"]))
+                              if self._tools[name].ref.description["public"]
+                              and _owners_active(self._tools[name])))
 
     def group_always_on(self, ref: ToolRef) -> bool:
         registration = self._registration(ref)
-        return self._groups.get(registration.context.runtime.plugin_id, (False, "未声明用途"))[0]
+        return self._groups.get(registration.context.runtime.plugin_id, (False, "未声明用途", None))[0]
 
     def group_description(self, ref: ToolRef) -> str:
         registration = self._registration(ref)
-        return self._groups.get(registration.context.runtime.plugin_id, (False, "未声明用途"))[1]
+        return self._groups.get(registration.context.runtime.plugin_id, (False, "未声明用途", None))[1]
+
+    def display_label(self, name: str, owner: str | None) -> str | None:
+        """只读当前活跃工具声明的显示名；分组没有显示名，归档里已换 owner 的同名工具不借用。"""
+        registration = self._tools.get(name)
+        if registration is None or not _owners_active(registration):
+            return None
+        return registration.label if owner is None or registration.context.runtime.plugin_id == owner else None
+
+    def display_icon(self, name: str, owner: str | None) -> Mapping[str, object] | None:
+        """只读当前活跃工具或分组声明的图标；不打开工具，不改写归档描述。"""
+        registration = self._tools.get(name)
+        if registration is not None and _owners_active(registration):
+            reg_owner = registration.context.runtime.plugin_id
+            if owner is None or reg_owner == owner:
+                if registration.icon is not None:
+                    return registration.icon
+                group = self._groups.get(reg_owner)
+                return None if group is None else group[2]
+        if owner is not None:
+            group = self._groups.get(owner)
+            if group is not None:
+                return group[2]
+        return None
 
     async def drain_calls(self, calls: tuple[CallRef, ...]) -> None:
         """清理 owner 等待原效果退出；终态结果不等于资源已经释放。"""
@@ -393,13 +482,11 @@ class ToolCatalog:
         """从真实注册 Context 固定闭包，不让调用者省略准备贡献或重选目标。"""
         registration = self._registration(ref)
         preparation = registration.preparation
-        authorization = registration.authorization
         if configuration is not None and registration.capture is None:
             raise ValueError("该工具未声明 binding 配置入口")
         contributors = (
             registration.context,
             *(() if preparation is None else (preparation.context,)),
-            *(() if authorization is None else (authorization.context,)),
         )
         async with self._ctx.runtime_scope(), AsyncExitStack() as stack:
             # capture 可以挂起；实际贡献者在绑定提交前都不能被排空。
@@ -423,7 +510,6 @@ class ToolCatalog:
                 {
                     "tool": ref.description,
                     "prepare": None if preparation is None else preparation.name,
-                    **({"authorize": authorization.name} if authorization is not None else {}),
                     **({"state": state} if state is not None else {}),
                 },
                 contributors=contributors,
@@ -454,19 +540,10 @@ class ToolCatalog:
         ):
             raise ValueError("工具 binding 与归档注册不一致")
         preparation = registration.preparation
-        authorization = registration.authorization
-        expected = {
-            "tool",
-            "prepare",
-            *(("authorize",) if authorization is not None else ()),
-            *(("state",) if registration.capture is not None else ()),
-        }
-        if set(metadata) != expected or metadata["prepare"] != (
+        if _binding_fields(metadata) != _expected_fields(registration) or metadata["prepare"] != (
             None if preparation is None else preparation.name
         ):
             raise ValueError("工具 binding 参数准备与归档注册不一致")
-        if authorization is not None and metadata["authorize"] != authorization.name:
-            raise ValueError("工具 binding 限制与归档注册不一致")
         return await self.bind_scoped(
             registration.ref,
             bindings,
@@ -489,26 +566,15 @@ class ToolCatalog:
         name = description["name"]
         if not isinstance(name, str):
             raise ValueError("工具 binding 缺少工具名")
-        registration = self._tools[name]
+        registration = self._tools.get(name)
+        if registration is None:
+            raise ValueError(f"工具已撤下，binding 无法打开: {name}")
         preparation = registration.preparation
         if not _matches_saved_description(registration.ref.description, description) or metadata["prepare"] != (
             None if preparation is None else preparation.name
         ):
             raise ValueError("归档工具描述或参数准备与 binding 不一致")
-        expected: set[str] = {"tool", "prepare"}
-        authorization = registration.authorization
-        if "authorize" in metadata:
-            saved_authorization = metadata["authorize"]
-            if not isinstance(saved_authorization, str):
-                raise ValueError("工具 binding 限制字段无效")
-            if authorization is None or saved_authorization != authorization.name:
-                raise ValueError("归档工具限制与 binding 不一致")
-            expected.add("authorize")
-        elif authorization is not None:
-            raise ValueError("归档工具限制与 binding 不一致")
-        if registration.capture is not None:
-            expected.add("state")
-        if set(metadata) != expected:
+        if _binding_fields(metadata) != _expected_fields(registration):
             raise ValueError("工具 binding 字段无效")
         state: Mapping[str, object] = {}
         if registration.capture is not None:
@@ -530,21 +596,16 @@ class ToolCatalog:
     async def authorize(
         self, metadata: Mapping[str, object], arguments: Mapping[str, object]
     ) -> str | None:
-        """只执行 binding 固定的独立限制；无独立限制时返回 None。"""
-        if "authorize" not in metadata:
-            return
+        """执行该工具当前注册的独立限制；限制插件撤下或换代后按当前状态执行。"""
         description = metadata.get("tool")
         if not isinstance(description, Mapping) or not isinstance(description.get("name"), str):
             raise ValueError("工具 binding 描述无效")
         registration = self._tools.get(cast(str, description["name"]))
-        authorization = (
-            None
-            if registration is None or not _matches_saved_description(
-                registration.ref.description, description
-            ) else registration.authorization
-        )
-        if authorization is None or metadata["authorize"] != authorization.name:
-            raise ValueError("归档工具限制与 binding 不一致")
+        if registration is None or registration.authorization is None:
+            return None
+        if not _matches_saved_description(registration.ref.description, description):
+            raise ValueError("归档工具描述与 binding 不一致")
+        authorization = registration.authorization
         async with self._ctx.runtime_scope():
             async with authorization.context.runtime_scope():
                 return await authorization.authorize(arguments)
@@ -577,15 +638,24 @@ async def apply(ctx: Context) -> None:
     task_admission = ctx.require(TASKS).open(ctx)
     catalog = ToolCatalog(ctx, task_admission)
     _ = await ctx.provide(TOOL_BIND_SAVED, bind_saved_tool)
+
+    def cleanup_entry(reader: MessageReader, source: str, from_seq: int, *, task: Task | None = None,
+                      drain: Callable[[tuple[CallRef, ...]], Awaitable[None]] | None = None,
+                      ) -> AbstractAsyncContextManager[None]:
+        return tool_cleanup(ctx, task_admission, catalog.releases(), reader, source, from_seq, task=task, drain=drain)
+
+    _ = await ctx.provide(TOOL_CLEANUP, cleanup_entry)
     _ = await ctx.provide(TOOLS, catalog)
     _ = await ctx.provide(TOOL_PROGRAM, ToolProgramFactory(ctx, catalog))
     _ = await ctx.provide(ALL_TOOLS, catalog._all_view)
 
-    def read_name(binding_id: str) -> str:
-        """只读原 binding 的名称；诊断消费者不能打开或执行工具。"""
-        return display_name(ctx.require(BINDINGS).describe(binding_id, TOOLS))
+    def read_display(binding_id: str) -> ToolDisplay:
+        """只读原 binding 的名称与 owner，并附带当前注册的展示图标与显示名；展示消费者不能打开或执行工具。"""
+        base = display_tool(ctx.require(BINDINGS).describe(binding_id, TOOLS))
+        return ToolDisplay(base.name, base.owner, catalog.display_icon(base.name, base.owner),
+                           catalog.display_label(base.name, base.owner))
 
-    _ = await ctx.provide(TOOL_DISPLAY_NAME, read_name)
+    _ = await ctx.provide(TOOL_DISPLAY, read_display)
     watcher: asyncio.Task[None] | None = None
 
     async def start(_event: object) -> None:
@@ -611,12 +681,7 @@ async def apply(ctx: Context) -> None:
         ), name="tools-abandon")
 
     async def stop(_event: object) -> None:
-        if watcher is not None:
-            _ = watcher.cancel()
-            try:
-                await watcher
-            except asyncio.CancelledError:
-                pass
+        await stop_spawned(watcher)
 
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from agent.plugin_composition.effect import _join_cleanup
+from functools import cache
 import inspect
+import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -11,12 +13,14 @@ from typing import Any, Literal, Protocol
 
 import httpx
 
+from core.common.file_io import shield_until_done
 from .definitions import (
     WorkloadBinding,
     WorkloadDescriptor,
 )
 from plugins.host_execution.contract import (
     WorkloadEffectUnknown,
+    WorkloadStartRejected,
     WorkloadLease,
     WorkloadMode,
     WorkloadStartRequest,
@@ -25,6 +29,7 @@ from plugins.host_execution.contract import (
 )
 HealthCallback = Callable[[str, str, bool, str], Awaitable[None] | None]
 IncidentCallback = Callable[[str, str, str, str], Awaitable[None] | None]
+_BORROW_DRAIN_TIMEOUT = 300.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +164,12 @@ class WorkloadGenerationHost:
                 generation.pending[name] = (binding, request)
                 # 普通错误也可能出现在 Controller 已创建容器之后；只有有效回执
                 # 才能把 pending 请求转为可执行 stop 的 lease，不能按异常类型丢弃责任。
-                receipt = await self._controller.start(request)
+                try:
+                    receipt = await self._controller.start(request)
+                except WorkloadStartRejected:
+                    # Controller 已核实没有容器也没有 lease：这次请求没有副作用，不保留 pending。
+                    generation.pending.pop(name, None)
+                    raise
                 endpoints = _check_start_receipt(request, receipt)
                 entry = _Entry(binding, receipt, endpoints)
                 generation.entries[name] = entry
@@ -292,7 +302,13 @@ class WorkloadGenerationHost:
     async def _cleanup(self, generation: _Generation) -> None:
         generation.state = "stopping"
         if generation.borrowers:
-            _ = await generation.drained.wait()
+            try:
+                _ = await asyncio.wait_for(generation.drained.wait(), _BORROW_DRAIN_TIMEOUT)
+            except TimeoutError as error:
+                raise TimeoutError(
+                    f"Workload {generation.generation_id} 借用超过 {_BORROW_DRAIN_TIMEOUT:g} 秒仍未归还；"
+                    "资源和 lease 保留，请在借用归还后显式重试清理"
+                ) from error
         errors: list[BaseException] = []
         # 缺少有效 lease 时，现有 Controller 没有核实或取消 start 的接口。
         # 保留原请求并阻断关闭；重发 start 可能创建新资源，不是清理操作。
@@ -489,6 +505,8 @@ def _start_request(
         limits=limits,
         loopback_ports=loopback_ports,
         user_namespaces=descriptor.user_namespaces,
+        udp_ports=descriptor.udp_ports,
+        host_egress=descriptor.host_egress,
     )
 
 
@@ -555,27 +573,23 @@ async def _http_health(url: str, timeout_seconds: float) -> tuple[bool, str]:
         await asyncio.sleep(min(0.2, remaining))
 
 
+# 进程内共用一个与 httpx 默认 verify=True 相同的 TLS 上下文：每次新建客户端都重读 CA 证书包，
+# 约 14ms CPU，而健康检查每 5 秒一次。
+@cache
+def _tls_context() -> ssl.SSLContext:
+    return httpx.create_ssl_context()
+
+
 def _health_status(url: str, timeout_seconds: float) -> int:
     # 客户端只由本次请求持有；取消等待后，线程仍能关闭自己的连接。
-    with httpx.Client() as client:
+    with httpx.Client(verify=_tls_context()) as client:
         return client.get(url, timeout=timeout_seconds).status_code
 
 
 async def _await_task_after_cancellation(task: asyncio.Task[Any]) -> Any:
     """Finish cleanup before restoring caller cancellation."""
 
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                break
-            cancelled = True
-    result = task.result()
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
+    return await shield_until_done(task)
 
 
 def _error_text(error: BaseException) -> str:

@@ -85,7 +85,7 @@ Shell ── 固定公共 socket ──┬── 默认 listener
                          └── owner 发布的链接 ── 自定义 listener
 ```
 
-临时场景 orthology_web_endpoint.py 使用真实双层 UDS listener，验证 HTTP 代理和
+临时场景 orthology_web_endpoint.py（已删除）使用真实双层 UDS listener，当时验证 HTTP 代理和
 WebSocket ping/pong、默认/自定义切换、缺席状态、冲突拒绝与节点身份清理。
 不调用模型、不访问正式 workspace。恢复点 c2fad5e8 与
 /tmp/akashic-orthology-before-web-endpoint-c2fad5e8.tar；无 schema 或数据迁移。
@@ -167,6 +167,8 @@ Bus 不再定义第二个 AttachmentKind，而是继续从原 import 路径导�
 /tmp/akashic-orthology-before-attachment-kind-6ad739de.tar。
 
 ### 模型统计与管理各走自己的窄入口
+
+> 勘误（2026-10，插件边界收口）：下文的 `/api/chat/model-calls/{id}` 和 Channel 借用 `MODEL_CALL_STATS` 已删除。调用统计现在由 models 插件经插件界面查询（`call.latest`）提供给 `composer.status` 插槽，akashic_clients 不再依赖 models 合同。
 
 聊天输入栏原来仍请求已断开接线的 /api/settings/model/calls/{id}。现在改为
 /api/chat/model-calls/{id}；Channel 声明 MODEL_CALL_STATS 可选能力，在当前请求 scope

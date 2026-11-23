@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractContextManager
 from typing import Protocol
 
 from agent.plugin_composition import RuntimeScope, ServiceKey
-from plugins.ledger.contract import MessageReader, MessageWriter, OwnerStore
+from plugins.ledger.contract import HistoryWindow, MessageReader, MessageWriter, OwnerStore
 from plugins.models.contract import StreamCallback
 from plugins.models.contract import BoundChatModel
 from plugins.ledger.contract import Message
@@ -35,6 +36,7 @@ class OrderedReact(Protocol):
         tools: ToolMenu,
         max_output_tokens: int,
         max_steps: int,
+        max_retry_wait: float | None = None,
         reduce: SummaryReducer | None = None,
         preview: Preview | None = None,
         terminal_tools: frozenset[str] = frozenset(),
@@ -42,7 +44,10 @@ class OrderedReact(Protocol):
         state: OwnerStore,
         check_start: StartCheck,
         max_parallel_calls: int = 1,
-        pending_work: Callable[[], bool] | None = None,
+        before_step: Callable[[], Awaitable[None]] | None = None,
+        retry_wake: asyncio.Event | None = None,
+        aborted: Callable[[str], Awaitable[Message]] | None = None,
+        window: HistoryWindow | None = None,
     ) -> Message: ...
 
 

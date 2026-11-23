@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from typing import cast
 
-from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING
+from agent.plugin_composition import Context, RUNTIME_STARTED, RUNTIME_STOPPING, stop_spawned
 from plugins.assets.contract import INSTALLED_ASSETS
 from plugins.ledger.contract import BINDINGS
 from plugins.ledger.contract import MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE
@@ -71,6 +71,7 @@ async def apply(ctx: Context) -> None:
         open=open_tool,
         capture=capture,
         idempotent=False,
+        icon="package-plus",
     )
     async def report(identity: str, request: Request, status: UpdateStatus) -> None:
         """Send one durable result without overwriting historical result messages."""
@@ -145,12 +146,7 @@ async def apply(ctx: Context) -> None:
         watcher = await ctx.spawn(follow(), name="plugin-updates")
 
     async def stop(_event: object) -> None:
-        if watcher is not None:
-            _ = watcher.cancel()
-            try:
-                await watcher
-            except asyncio.CancelledError:
-                pass
+        await stop_spawned(watcher)
 
     _ = await ctx.on(RUNTIME_STARTED, start)
     _ = await ctx.on(RUNTIME_STOPPING, stop)

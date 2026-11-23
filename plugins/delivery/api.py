@@ -11,7 +11,6 @@ from plugins.delivery.contract import (
     FINAL_OUTPUT_DELIVERY as FINAL_OUTPUT_DELIVERY,
     FinalOutputTurn as FinalOutputTurn,
     FinalOutputWaiter as FinalOutputWaiter,
-    Receipt as SenderResult,
     Sender as Sender,
 )
 
@@ -44,6 +43,18 @@ class FinalOutputDelivery:
     def __init__(self) -> None:
         self._providers: dict[str, FinalOutputWaiter] = {}
 
+    def _resolve(self, source: str) -> FinalOutputWaiter | None:
+        provider = self._providers.get(source)
+        if provider is not None:
+            return provider
+        prefix, sep, _ = source.partition(":")
+        if sep:
+            return self._providers.get(prefix + sep)
+        return None
+
+    def supports(self, source: str) -> bool:
+        return self._resolve(source) is not None
+
     def register(self, source: str, provider: FinalOutputWaiter) -> None:
         if not source or source in self._providers:
             raise ValueError("最终 Output provider 已有 owner")
@@ -54,10 +65,8 @@ class FinalOutputDelivery:
         if self._providers.get(source) is provider:
             del self._providers[source]
 
-    def require_source(self, source: str) -> None:
-        if source not in self._providers:
-            raise ValueError(f"没有来源 {source!r} 的最终 Output provider")
-
     async def wait(self, reader: MessageReader, turn: FinalOutputTurn) -> None:
-        self.require_source(turn.source)
-        await self._providers[turn.source].wait(reader, turn)
+        provider = self._resolve(turn.source)
+        if provider is None:
+            raise ValueError(f"没有来源 {turn.source!r} 的最终 Output provider")
+        await provider.wait(reader, turn)

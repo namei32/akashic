@@ -13,14 +13,13 @@
   grid-template-columns: minmax(26rem, 1fr) 1px minmax(22.5rem, var(--conversation-tools-width));
 }
 
-.conversation-page-frame {
+.conversation-page-chat {
   grid-column: 1;
   grid-row: 1;
-  display: block;
+  position: relative;
   min-width: 0;
-  width: 100%;
   height: 100%;
-  border: 0;
+  overflow: hidden;
   background: var(--ak-paper-canvas);
 }
 
@@ -35,12 +34,12 @@
   background: var(--ak-paper-sheet);
 }
 
-/* 铺满：对话列收起但保留 iframe，不重载、不丢草稿 */
+/* 铺满：对话列收起但保留挂载，不丢草稿与滚动位置 */
 .conversation-page.tools-maximized {
   grid-template-columns: 0 0 minmax(0, 1fr);
 }
 
-.conversation-page.tools-maximized .conversation-page-frame,
+.conversation-page.tools-maximized .conversation-page-chat,
 .conversation-page.tools-maximized .conversation-tools-splitter {
   visibility: hidden;
 }
@@ -62,6 +61,28 @@
   inset-block: 0;
   inset-inline: -7px;
   content: "";
+}
+
+.conversation-tools-splitter::after {
+  position: absolute;
+  inset-block-start: 50%;
+  inset-inline-start: 50%;
+  width: 3px;
+  height: 28px;
+  translate: -50% -50%;
+  border-radius: 1.5px;
+  background: var(--ak-rule-focus);
+  opacity: 0;
+  scale: 1 0.45;
+  content: "";
+  transition:
+    opacity var(--ak-sys-duration-short) var(--ak-sys-motion-standard),
+    scale var(--ak-sys-duration-short) var(--ak-sys-motion-emphasized);
+}
+
+.conversation-tools-splitter[data-snapped]::after {
+  opacity: 1;
+  scale: 1 1;
 }
 
 .conversation-tools-splitter:hover,
@@ -87,7 +108,9 @@
 .conversation-tools-group {
   display: grid;
   flex: 1 1 0;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
   min-height: 0;
 }
 
@@ -141,18 +164,18 @@
 
 .conversation-tools-button[aria-pressed="true"] {
   color: var(--ak-ink-primary);
-  background: color-mix(in oklch, var(--ak-ink-primary) 8%, transparent);
+  background: color-mix(in oklab, var(--ak-ink-primary) 8%, transparent);
 }
 
-/* 标签条：浏览器式圆角标签，均分宽度，最窄 90px，再多就横向滚动；“+”紧跟最后一个标签，铺满与收起在最右。 */
+/* 标签条：与左侧聊天标题共享同一条 53px（52px 内高 + 1px 底边）水平顶栏。 */
 .conversation-tools-bar {
   position: relative;
   display: flex;
-  height: 42px;
+  height: 53px;
   min-width: 0;
   align-items: center;
-  gap: 4px;
-  padding-inline: 6px;
+  gap: 6px;
+  padding-inline: 10px 8px;
   border-block-end: 1px solid var(--ak-rule-subtle);
   background: var(--ak-paper-canvas);
 }
@@ -178,10 +201,10 @@
   flex: 0 1 auto;
   width: 172px;
   min-width: 90px;
-  height: 30px;
+  height: 32px;
   align-items: center;
   border: 1px solid transparent;
-  border-radius: 8px;
+  border-radius: var(--ak-radius-sm);
   container-type: inline-size;
 }
 
@@ -203,13 +226,137 @@
 .conversation-tools-tab-item.is-active {
   border-color: var(--ak-rule-subtle);
   background: var(--ak-paper-sheet);
-  box-shadow: 0 0 8px rgb(0 0 0 / 5%);
+  box-shadow: var(--ak-elevation-raised);
+}
+
+.conversation-tools-tab-item.is-selected {
+  border-color: var(--ak-color-action-primary);
+  background: color-mix(in oklab, var(--ak-color-action-primary) 10%, var(--ak-paper-sheet));
+}
+
+.conversation-tools-tab-item.is-clustered:not(.is-active):not(.is-selected) {
+  background: color-mix(in oklab, var(--ak-color-action-primary) 4%, transparent);
+}
+
+/* 标签分组胶囊：与标签项同高（桌面 32px / 触控 44px），在 53px 顶栏内居中对齐不溢格。 */
+.conversation-tools-cluster {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  height: 32px;
+  align-items: center;
+  margin-inline-end: 2px;
+  border: 1px solid color-mix(in oklab, var(--ak-color-action-primary) 28%, var(--ak-rule-default));
+  border-radius: var(--ak-radius-sm);
+  background: color-mix(in oklab, var(--ak-color-action-primary) 8%, var(--ak-paper-sheet));
+}
+
+.conversation-tools-cluster.is-collapsed.has-active {
+  border-color: var(--ak-color-action-primary);
+  box-shadow: var(--ak-elevation-raised);
+}
+
+.conversation-tools-cluster-pill {
+  display: inline-flex;
+  height: 100%;
+  align-items: center;
+  gap: 5px;
+  padding-inline: 8px 6px;
+  border: 0;
+  border-radius: calc(var(--ak-radius-sm) - 1px);
+  color: var(--ak-ink-primary);
+  background: transparent;
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.conversation-tools-cluster-chevron {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  color: var(--ak-color-action-primary);
+}
+
+.conversation-tools-cluster-chevron > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.conversation-tools-cluster-label {
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-tools-cluster-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding-inline: 4px;
+  border-radius: var(--ak-radius-full);
+  background: color-mix(in oklab, var(--ak-color-action-primary) 14%, transparent);
+  color: var(--ak-color-action-primary);
+  font-family: var(--ak-type-technical);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.conversation-tools-cluster.is-collapsed.has-attention .conversation-tools-tab-dot,
+.conversation-tools-cluster.is-collapsed.is-busy .conversation-tools-tab-dot {
+  display: block;
+}
+
+.conversation-tools-cluster.is-collapsed.is-busy .conversation-tools-tab-dot {
+  background: var(--ak-color-status-warning);
+}
+
+.conversation-tools-cluster-ungroup {
+  width: 22px;
+  height: 22px;
+  margin-inline-end: 4px;
+  border-radius: var(--ak-radius-xs);
+}
+
+.conversation-tools-cluster-ungroup svg {
+  width: 14px;
+  height: 14px;
+}
+
+.conversation-tools-cluster-action {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  height: 32px;
+  align-items: center;
+  margin-inline-start: 4px;
+  padding-inline: 10px;
+  border: 1px solid var(--ak-color-action-primary);
+  border-radius: var(--ak-radius-sm);
+  background: var(--ak-color-action-primary);
+  color: var(--ak-paper-canvas);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.conversation-tools-cluster-pill:focus-visible,
+.conversation-tools-cluster-action:focus-visible {
+  outline: 2px solid var(--ak-rule-focus);
+  outline-offset: -2px;
 }
 
 .conversation-tools-tab,
 .conversation-tools-button,
-.conversation-tools-launch-tool,
-.conversation-tools-toggle {
+.conversation-tools-launch-tool {
   border: 0;
   color: var(--ak-ink-secondary);
   background: transparent;
@@ -225,7 +372,7 @@
   align-items: center;
   gap: 7px;
   padding-inline: 9px 8px;
-  border-radius: 7px;
+  border-radius: calc(var(--ak-radius-sm) - 1px);
   font-size: 0.8125rem;
   text-align: start;
 }
@@ -236,11 +383,14 @@
 
 .conversation-tools-tab > svg {
   flex: none;
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
+}
+
+.conversation-tools-tab > svg:not([data-icon="fill"]) {
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.8;
+  stroke-width: 1.65;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -279,7 +429,7 @@
   width: 22px;
   height: 22px;
   margin-inline-end: 3px;
-  border-radius: 5px;
+  border-radius: var(--ak-radius-xs);
 }
 
 .conversation-tools-tab-item.is-active .conversation-tools-tab-close,
@@ -309,21 +459,24 @@
 .conversation-tools-button {
   display: inline-grid;
   flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
   place-items: center;
   padding: 0;
-  border-radius: 6px;
+  border-radius: var(--ak-radius-sm);
 }
 
 .conversation-tools-button svg,
-.conversation-tools-toggle svg,
 .conversation-tools-launch-tool > svg {
   width: 16px;
   height: 16px;
+}
+
+.conversation-tools-button svg:not([data-icon="fill"]),
+.conversation-tools-launch-tool > svg:not([data-icon="fill"]) {
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.8;
+  stroke-width: 1.65;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -360,7 +513,7 @@
   align-items: center;
   gap: 10px;
   padding-inline: 10px;
-  border-radius: 8px;
+  border-radius: var(--ak-radius-sm);
   color: var(--ak-ink-primary);
   font-size: 0.875rem;
   text-align: start;
@@ -381,39 +534,13 @@
   cursor: default;
 }
 
-/* 工作台开关：与标题栏图标按钮同一形态，名称在提示里；有活动时右上角一个点 */
-.conversation-tools-toggle {
-  position: absolute;
-  z-index: 5;
-  inset-block-start: 10px;
-  inset-inline-end: 12px;
-  display: inline-grid;
-  width: 34px;
-  height: 34px;
-  place-items: center;
-  padding: 0;
-  border-radius: 7px;
-}
-
-.conversation-tools-toggle span {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
-
-.conversation-tools-toggle svg {
-  width: 18px;
-  height: 18px;
-}
-
 .conversation-tools-content {
+  min-width: 0;
   min-height: 0;
 }
 
 .conversation-tool-panel {
+  min-width: 0;
   height: 100%;
   overflow: hidden;
 }
@@ -422,7 +549,6 @@
 .conversation-tools-group[hidden],
 .conversation-tools-divider[hidden],
 .conversation-tools-splitter[hidden],
-.conversation-tools-toggle[hidden],
 .conversation-tool-panel[hidden] {
   display: none;
 }
@@ -430,39 +556,33 @@
 @media (hover: hover) {
   .conversation-tools-tab-item:not(.is-active):hover,
   .conversation-tools-button:hover,
-  .conversation-tools-launch-tool:not([aria-disabled="true"]):hover,
-  .conversation-tools-toggle:hover {
+  .conversation-tools-launch-tool:not([aria-disabled="true"]):hover {
     color: var(--ak-ink-primary);
-    background: color-mix(in oklch, var(--ak-ink-primary) 6%, transparent);
+    background: color-mix(in oklab, var(--ak-ink-primary) 6%, transparent);
   }
 }
 
 .conversation-tools-tab:focus-visible,
 .conversation-tools-button:focus-visible,
-.conversation-tools-launch-tool:focus-visible,
-.conversation-tools-toggle:focus-visible {
+.conversation-tools-launch-tool:focus-visible {
   outline: 2px solid var(--ak-rule-focus);
   outline-offset: -2px;
 }
 
-.conversation-tools-toggle[aria-expanded="true"] {
-  color: var(--ak-ink-primary);
-}
-
-.conversation-tools-toggle.has-attention::after {
-  position: absolute;
-  inset-block-start: 6px;
-  inset-inline-end: 6px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--ak-color-status-warning);
-  content: "";
+/* 聊天的模态对话框打开时（宽屏打开后再缩窄或铺满），聊天先不隐藏，对话框才看得见、关得掉。
+   只认聊天自己声明的 data-chat-modal（ADR 0126）；模型面板等非模态弹层不豁免。 */
+.conversation-page.tools-open > .conversation-page-chat:has([data-chat-modal]) {
+  visibility: visible;
 }
 
 @media (max-width: 68rem) {
   .conversation-page.tools-open {
     display: block;
+  }
+
+  /* 工作台整块盖住聊天：与铺满一样隐藏聊天，保留挂载与草稿，聊天也不再接 body 上的快捷键。 */
+  .conversation-page.tools-open .conversation-page-chat {
+    visibility: hidden;
   }
 
   .conversation-tools {
@@ -481,15 +601,30 @@
 /* 触控输入下开关、关闭与标签的可点区域不小于 44px；指针输入保持紧凑尺寸。 */
 @media (pointer: coarse) {
   .conversation-tools-bar {
-    height: 52px;
+    height: 53px;
+  }
+
+  .conversation-tools-tab-item,
+  .conversation-tools-cluster,
+  .conversation-tools-cluster-action {
+    height: 44px;
   }
 
   .conversation-tools-tab-item {
-    height: 44px;
     min-width: 112px;
   }
 
-  .conversation-tools-toggle,
+  .conversation-tools-cluster-pill {
+    min-width: 44px;
+    height: 100%;
+  }
+
+  .conversation-tools-cluster-ungroup {
+    width: 42px;
+    height: 42px;
+    margin-inline-end: 0;
+  }
+
   .conversation-tools-button {
     width: 44px;
     height: 44px;

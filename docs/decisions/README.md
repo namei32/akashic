@@ -6,7 +6,44 @@
 
 | ID | 状态 | 主题 | 关联条款 |
 |---|---|---|---|
-| [0130](0130-drift-recalls-memory-in-source-scope.md) | accepted / implementing | Drift 按来源会话范围召回记忆并保护主动效果 | PRO、MEM、SES、STA |
+| [0167](0167-plugins-ship-from-extra.md) | accepted / implemented for review | 非核心插件由官方 extra 仓库提供，Core 用 pkg 管理；取代 0148 | PLG-001 |
+| [0151](0151-watch-closes-every-loop.md) | proposed / implemented for review | 值班：每件事要有着落，来源可以是一个脚本 | PRO-004～PRO-006 |
+| [0152](0152-watch-speaks-at-the-right-moment.md) | proposed / implemented for review | 值班：话留到合适的时刻说，聊天里先回应 | PRO-004～PRO-006 |
+| [0153](0153-watch-panel.md) | proposed / implemented for review | 值班面板：从已有记录现读，只认识来源和事件 | PRO-005 |
+| [0158](0158-watch-prompts-state-agnostic.md) | proposed / implemented for review | 值班：提示词不认识具体状态，叫醒之后有自己的时间，开口规矩自己定 | PRO-004～PRO-006 |
+| [0159](0159-watch-act-without-asking.md) | proposed / implemented for review | 值班：后台回合动手不设限，办成或卡住先交代 | PRO-004～PRO-006 |
+| [0161](0161-watch-trail.md) | proposed / implemented for review | 值班：后台回合的足迹自动带进下一轮，看不明白可以问 | PRO-005 |
+| [0162](0162-watch-places-to-sources.md) | proposed / implemented for review | 值班：反复去的地方接成来源，搁久的猜测当天了结 | PRO-005 |
+| [0164](0164-watch-timeline.md) | proposed / implemented for review | 值班：一条不删的时间线，反复开口的事写成嘱托 | PRO-005 |
+| [0166](0166-motion-runs-on-the-compositor.md) | accepted / implemented for review | 动画只落在合成线程：白名单静态检查，运行时探针补漏 | WEBUI-007 |
+| [0165](0165-watch-dream.md) | proposed / implemented for review | 值班：见闻和记忆分开，每天单独一轮整理记忆 | PRO-005 |
+| [0160](0160-watch-panel-ledger.md) | proposed / implemented for review | 值班面板：一天是一张流水，嘱托和便签按结构排版 | PRO-005 |
+| [0157](0157-background-idle-compaction.md) | accepted | 空闲摘要提前后台生成，摘要与聊天边界同事务发布 | CTX-001、CTX-007、STA-002、PLG-017 |
+| [0156](0156-watch-observations-carry-over.md) | proposed / implemented for review | 值班：看到的和走过的路留进记忆专题，收尾并进已有回合 | PRO-004～PRO-006 |
+| [0155](0155-composition-kernel-keeps-used-dispatch-only.md) | accepted / implemented for review | 组合内核只保留有消费者的派发方式；删除 parallel/transform/observe 与 ExecutorService | PLG |
+| [0154](0154-watch-reshapes-its-own-sources.md) | proposed / implemented for review | 值班：自己去看、自己接着看、到头就拆；猜的先放便签 | PRO-004～PRO-006 |
+| [0150](0150-sources-have-one-event-entry.md) | proposed / implemented for review | 来源只有一个事件入口，删除 EventMail | PRO-004 |
+| [0149](0149-watch-replaces-wake.md) | proposed / implemented for review | 值班（watch）取代 Wake：便宜模型看流，主 Agent 自己决定做什么 | PRO-003、PRO-005、PRO-006、SEC-011 |
+| [0148](0148-plugins-stay-in-core.md) | superseded by 0167 | 内置插件留在 Core 仓库：撤回 #1973 拆仓与热更新，正交性靠仓库内边界（前端归属、R13） | PLG-001 |
+| [0147](0147-appearance-dependencies-are-machine-checked.md) | accepted / implemented for review | 外观依赖由静态检查守护：圆角与投影取 token，变量只能解析到自己或宿主 | WEBUI-007、PLG-001 |
+| [0146](0146-drift-is-retired.md) | accepted / implemented for review | 移除漫游（Drift）；主动消息口径由来源插件自己声明 | PRO-002、PLG-006、TST-001 |
+| [0145](0145-message-provenance-is-decided-once.md) | accepted / implemented for review | 消息出处只在写入器绑定时判定一次，读取方共用一处解释；自动来源共用中心循环 | RUN-001～RUN-003、PLG-003、MEM-009、TST-001 |
+| [0144](0144-paper-uses-the-corrected-palette.md) | accepted | 纸感使用校正后的配色，合并原纸感与校正版选项 | WEBUI-001～WEBUI-007 |
+| [0143](0143-radius-joins-the-brand-contract.md) | accepted / implemented for review | 圆角进入品牌合同：五级刻度与同心规则 | WEBUI-007 |
+| [0142](0142-theme-families-and-palette-rules.md) | accepted / implemented for review | 主题按「配色 × 明暗」选择，内置配色遵守同一组感知规则 | WEBUI-001～WEBUI-007 |
+| [0141](0141-akasha-recall-injects-an-index.md) | accepted / implemented for review | Akasha 自动召回只注入索引，原文用 fetch_messages 按需读取 | MEM-009、MEM-013 |
+| [0140](0140-design-workbench-replaces-sites.md) | accepted / implemented for review | 设计工作台：Agent 和用户在同一块 open-pencil 画布上做设计，取代“网站” | WEBUI-008 |
+| [0139](0139-deploy-falls-back-instead-of-staying-down.md) | accepted / implemented for review | 部署失败回到原版本，外置插件坏掉不拖垮 Core | RUN-004、MIG-001、PLG-013 |
+| [0138](0138-akasha-dense-is-single-threaded.md) | accepted / implemented for review | Akasha 的 dense 打分固定单线程 BLAS，学习检索不算模式补全 | MEM-009、MEM-013、ERR-001 |
+| [0137](0137-akasha-publishes-in-place-increments.md) | accepted / implemented for review | Akasha 检查点原地增量发布，随时钟变化的派生列不入库 | MEM-009、MEM-013、ERR-001 |
+| [0134](0134-compaction-covers-message-identities.md) | accepted / implemented for review | 摘要按消息身份覆盖，开放来源不阻挡后续批次 | CTX-007、MEM-011、SES-005 |
+| [0133](0133-agent-runs-as-the-host-user.md) | proposed / implemented for review | Agent 的执行与网络等同宿主用户本人 | SEC、PLG |
+| [0132](0132-computer-human-input-wins.md) | proposed / implemented for review | Computer 不再接管：谁在动谁用 | PLG-017、WEBUI-008 |
+| [0131](0131-context-composition.md) | proposed / implemented for review | 上下文构成按装配来源记账 | WEBUI-008 |
+| [0130](0130-declarative-plugin-settings.md) | proposed / implemented for review | 插件声明设置字段，宿主统一渲染 | PLG-014 |
+| [0129](0129-plugins-choose-their-models.md) | proposed / implemented for review | 模型只留全局默认，插件在自己的设置里选模型 | RUN-010 |
+| [0128](0128-cache-usage-checkpoint.md) | accepted / implemented for review | 缓存效率用量落可重建检查点，重启后只扫新增 Turn | STA、WEBUI-008 |
+| [0127](0127-web-modules-own-their-data.md) | accepted / implemented for review | Web 模块拥有自己的数据，页面挂载只读不取 | WEBUI-008 |
 | [0121](0121-conversation-workbench-tabs.md) | proposed | 对话工具区升级为按会话组织的工作台：会话上下文、意图路由、正交标签 | WEBUI-008、PLG-014、PLG-016、SES-009 |
 | [0118](0118-akasha-publishes-trajectory-checkpoints.md) | proposed / implemented for review | Akasha 按批发布轨迹检查点，可重建性由重放等价守护 | MEM-009、MEM-013、ERR-001 |
 | [0115](0115-computer-manual-restart-from-failed.md) | proposed / implemented for review | Computer 出错后由用户重启电脑，整组结束旧运行时再唤醒 | PLG-017、ERR-001、STA-003 |
@@ -19,7 +56,7 @@
 | [0105](0105-ledger-owns-business-storage.md) | proposed / implemented for review | Ledger 插件拥有业务持久化与入站交接 | PLG、STA、SES、MIG |
 | [0092](0092-model-generation-recovers-until-output.md) | accepted | 模型生成恢复（2026-10-17 起默认最多重试 10 次），工具效果按原回执处理 | OBJ-005、ERR-001、RUN-012 |
 | [0091](0091-skill-sources-are-layered-providers.md) | proposed | Skill 来源是分层 Provider，本地目录不必打包成插件 | PLG-009、PLG-014、PLG-016、CTX-004 |
-| [0092](0092-computer-viewing-and-control.md) | proposed；多观看者部分由 0123 替代 | Computer 多目标观看与人工接管分开 | PLG-017、WEBUI-008 |
+| [0092](0092-computer-viewing-and-control.md) | proposed；多观看者部分由 0123 替代，接管由 0132 替代 | Computer 多目标观看与人工接管分开 | PLG-017、WEBUI-008 |
 | [0088](0088-computer-streams-h264-over-dashboard-websocket.md) | proposed | Computer 经现有 Dashboard WebSocket 传输 H.264 | PLG-017、RUN-016、WEBUI-008 |
 | [0086](0086-session-soft-delete-and-akasha-replay.md) | accepted | 会话软删除：逻辑失效可恢复，Akasha 学习与重放继续参与 | SES-003、SES-005、STA-003、MEM-009、WEBUI-009 |
 | [0087](0087-session-title-override.md) | proposed | 会话标题覆盖：显式管理状态，空值回到推导标题 | SES-003、WEBUI-009 |
@@ -64,15 +101,15 @@
 | [0037](0037-plugin-runtime-is-pure-v3.md) | accepted / implemented | 插件运行时收敛为 pure v3 | PLG-001～PLG-014、WSP-001～WSP-005、ERR-001、TST-001～TST-008 |
 | [0038](0038-operator-trust-can-publish-offline-plugin-batches.md) | accepted / 旧提交协议部分按 0072 调整 | Operator 信任可以离线发布 exact 插件批次 | PLG-013、RUN-015、ERR-001 |
 | [0039](0039-react-core-atoms-keep-sources-unprivileged.md) | accepted | React 原子能力留在 Core，来源保持非特权 | RUN-001～RUN-003、RUN-007～RUN-009、OUT-001～OUT-004、PLG-014、SCH-001～SCH-003、PRO-001、SEC-005、SEC-007 |
-| [0040](0040-wake-duty-gate-lives-in-scoped-react.md) | accepted | Wake duty gate 属于 Wake scoped react | RUN-003、RUN-007～RUN-009、OUT-001～OUT-003、PLG-014、PRO-001～PRO-002 |
+| [0040](0040-wake-duty-gate-lives-in-scoped-react.md) | superseded by 0149 | Wake duty gate 属于 Wake scoped react | RUN-003、RUN-007～RUN-009、OUT-001～OUT-003、PLG-014、PRO-001～PRO-002 |
 | [0041](0041-turn-effects-and-memory-plugins-are-orthogonal.md) | accepted / implementing | Turn 副作用与 Memory 插件保持正交 | SES-001、SES-007～SES-008、MEM-002、MEM-009～MEM-011、PLG-001～PLG-014、RUN-003、RUN-007～RUN-009 |
 | [0042](0042-plugin-diagnostics-preserve-domain-owners.md) | accepted / implementing | 插件诊断保留领域 owner | OBJ-002、PLG-003、PLG-006、PLG-014～PLG-015、ERR-001 |
 | [0043](0043-paper-brand-tokens-replace-material-visual-semantics.md) | accepted | 纸张品牌 Token 取代 Material 视觉语义 | WEBUI-001～WEBUI-007 |
 | [0045](0045-akashic-direct-messages-commit-before-notify.md) | accepted | Akashic 主动消息先提交 Session 再通知客户端 | AKC-001～AKC-002、OUT-001、OUT-003～OUT-004 |
 | [0046](0046-plugin-candidate-validation-is-incremental.md) | accepted / implemented | 插件候选只重建依赖闭包 | PLG-001～PLG-004、PLG-008～PLG-010、PLG-014 |
 | [0047](0047-provides-may-bind-one-tool.md) | partially superseded | 一个 provide 可以绑定一个 Tool | PLG-001～PLG-014、PRO-001～PRO-002 |
-| [0048](0048-eventmail-keeps-three-mail-lifecycles.md) | accepted / implemented | EventMail 统一信封并保持三类生命周期 | PLG-014～PLG-016、PRO-001～PRO-005 |
-| [0049](0049-wake-content-is-a-decaying-eventmail-pool.md) | accepted / implemented | Wake Content 是 EventMail 中的衰减池 | PRO-004～PRO-006、PLG-014～PLG-016 |
+| [0048](0048-eventmail-keeps-three-mail-lifecycles.md) | superseded by 0150 | EventMail 统一信封并保持三类生命周期 | PLG-014～PLG-016、PRO-001～PRO-005 |
+| [0049](0049-wake-content-is-a-decaying-eventmail-pool.md) | superseded by 0149 | Wake Content 是 EventMail 中的衰减池 | PRO-004～PRO-006、PLG-014～PLG-016 |
 | [0050](0050-model-revision-lives-in-ordinary-plugin.md) | accepted | 模型 revision 由普通插件拥有 | RUN-005～RUN-012、ONB-001、PLG-003、PLG-014、PLG-016、WSP-001 |
 | [0051](0051-web-ui-composes-ordinary-plugin-modules.md) | accepted / implementing | WebUI 由普通插件递归组合 | WEBUI-001～WEBUI-007、PLG-001～PLG-016、ONB-001、MOB-001 |
 | [0052](0052-compaction-and-markdown-memory-are-ordinary-plugins.md) | accepted / implementing | Compaction 与 Markdown 记忆是普通插件 | CTX-007、MEM-001～MEM-011、PLG-001～PLG-014、SES-003～SES-005 |
@@ -138,7 +175,6 @@
 - [0057 · Subagent 与 Wake 保留完整内部消息](0057-internal-source-messages.md)：独立内部 Session 的保存、展示、投递和学习边界。
 
 | [0091](0091-shell-self-deployment.md) | accepted | Shell 提交宿主部署，正常回合与排空之后更新 Docker | RUN-004、SH-001、OUT-001、MIG-001 |
-| [0145](0145-wsl-rolls-back-proven-startup-failures.md) | accepted | 原生 WSL 在证据完整时回退候选启动失败 | RUN-004、MIG-001、STA-001 |
 
 | [0094](0094-plugin-runtime-uses-installed-files.md) | accepted | 插件使用安装文件与当前配置，取消强快照归档 | PLG-002、PLG-003、PLG-010、PLG-013、STA-003 |
 | [0093](0093-computer-reuses-anonymous-browsers.md) | proposed；独立进程部分由 0123 替代 | 匿名实例稳定 ID、错误保留进度与闲置回收 | PLG-017 |
@@ -158,27 +194,8 @@
 | [0119](0119-local-runtime-diagnostics.md) | accepted；前端由 0120 替代 | 运行诊断本地可用，外部接入独立消费 | PLG-015、PLG-016、ERR-001 |
 | [0120](0120-runtime-diagnostics-is-operations-only.md) | accepted | 运行诊断只面向运维，不提供前端 | PLG-015、PLG-016 |
 | [0125](0125-scheduler-runs-in-its-session.md) | proposed / implemented for review | 定时任务在创建它的会话里执行，历史范围按任务选择 | SCH-003、MEM-001～MEM-002 |
-| [0126](0126-task-destination-sessions.md) | accepted | 周期任务绑定当前、新建专用或已有可见会话，恢复沿用固定目标 | SCH-003、SES-005、MEM-001 |
-| [0127](0127-lol-reports-own-destination.md) | accepted | LoL 新日报直接进入固定会话，旧 Alert 继续按原回执恢复 | PRO、STA、SES |
+| [0126](0126-chat-joins-shell-document.md) | accepted / implementing | 聊天页并入外壳文档，拆除 iframe | WEBUI-008 |
 | [0123](0123-computer-is-one-browser.md) | proposed / implemented for review | Computer 只剩一个浏览器，Agent 按标签操作，画面跟随面板 | PLG-017、WEBUI-008 |
 | [0122](0122-web-ingress-guard-plugin.md) | proposed / implemented for review | Web 入口守卫是可选插件，本机进程可信；修订 0017 的认证 non-goal | SEC、PLG、WEBUI |
 | [0122](0122-interactive-terminal.md) | proposed / implemented for review | 工作台终端是用户自己的交互 shell，PTY 归执行主机 | WEBUI、PLG |
 | [0121](0121-plugin-install-settles-from-disk.md) | proposed / implemented for review | 中断的插件安装按指针结算，启动以磁盘修正外置输入 | PLG-013、STA |
-
-- [0128 · Codex 回合通知经本机 Gateway 写入独立会话](0128-codex-notifications-use-local-gateway.md)
-
-- [0129 · 回复循环耗尽后由新输入续额](0129-exhausted-react-budget-renews-on-new-input.md)：accepted；只续循环额度，保留 Turn、旧消息和工具结果；SES-013。
-
-- [0131 · Codex 指挥使用 Windows 原生 CLI 后端](0131-codex-control-uses-shared-desktop-backend.md)：proposed；明确目标、原始图片、外部回执与独立 CLI 的运行边界。
-
-- [0132 · 长任务步数上限由显式配置决定](0132-step-limits-are-explicit.md)：accepted；回复、调度与子任务默认不限步数，保留正数上限与续额协议；SES-013。
-
-- [0137 · Akasha 原地增量发布](0137-akasha-publishes-in-place-increments.md)：上游 accepted / implemented for review；同步移植，图与消费进度仍在同一事务发布。
-
-- [0138 · Akasha 单线程 dense](0138-akasha-dense-is-single-threaded.md)：上游 accepted / implemented for review；固定数值环境并登记有恢复点的历史重放。
-
-- [0141 · Akasha 索引召回](0141-akasha-recall-injects-an-index.md)：上游 accepted / implemented for review；按窗口去重，原文通过受范围约束的 fetch_messages 读取。
-
-- [0142 · Wake 固定主动记忆提供者](0142-wake-freezes-initiative-memory-provider.md)：implemented for review；Akasha 的范围快照和短保护延续 Drift 的目标授权及送达协议。
-- [0143 · 已提交的模型输出携带续聊所需事实](0143-model-output-carries-replay-facts.md) 规定模型历史回放、旧回执缺失恢复和消息保全。
-- [0144 · Watch 接管主动联系](0144-watch-scoped-contact.md)：替换触发器与判读器，不采用上游的后台通用执行权。

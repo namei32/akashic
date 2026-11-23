@@ -1,16 +1,17 @@
-import { cacheUsageSection } from "./cache-usage.js";
+import { usageSection } from "./usage-page.js";
+import { mountModelPicker } from "./picker-mount";
 
 const SEARCH_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-search" aria-hidden="true"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path></svg>`;
 const CHEVRON_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-chevron-right" aria-hidden="true"><path d="m9 18 6-6-6-6"></path></svg>`;
-const KEY_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"></path><circle cx="16.5" cy="7.5" r=".5" fill="currentColor"></circle></svg>`;
+const TRASH_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path></svg>`;
+const REFRESH_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></svg>`;
+const SERVER_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="20" height="8" x="2" y="2" rx="2"></rect><rect width="20" height="8" x="2" y="14" rx="2"></rect><path d="M6 6h.01"></path><path d="M6 18h.01"></path></svg>`;
 const CLOSE_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>`;
 const SPINNER_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="is-spinning" aria-hidden="true"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>`;
 
+// 聊天只保留全局默认；压缩、看图、标题等各自在插件设置里选模型，留空跟随这里。
 const ROLE_LABELS = [
-  ["default", "全局默认模型", "用于普通对话交互与未单独指定场景"],
-  ["agent", "智能体主模型", "用于复杂工具调用、代码编写与多步规划"],
-  ["fast", "轻量快速模型", "用于总结提炼、分类打标与后台小任务"],
-  ["vision", "多模态视觉模型", "用于图像理解与带图对话"],
+  ["default", "对话", "对话默认用它"],
 ];
 
 export async function readJsonResponse(response) {
@@ -34,14 +35,18 @@ export async function readJsonResponse(response) {
 }
 
 export function activate(ctx) {
+  // 目录归模块所有：宿主空闲时预热，设置页挂载先画上次的目录，再在后台核对。
+  const catalog = ctx.data.resource("catalog", async (signal) =>
+    readJsonResponse(await ctx.http.request("/api/dashboard/models/catalog", {signal})), {warm: true});
+  const usage = usageSection(ctx, catalog);
   return ctx.ui.inject("shell.settings.v1", (mount) => {
-    const releaseUsage = mount.register(cacheUsageSection(ctx));
-    const releaseModels = registerModels(ctx, mount);
+    const releaseUsage = mount.register(usage);
+    const releaseModels = registerModels(ctx, mount, catalog);
     return () => { releaseModels(); releaseUsage(); };
   });
 }
 
-function registerModels(ctx, mount) {
+function registerModels(ctx, mount, catalogResource) {
   return mount.register({
     id: "models",
     label: "模型",
@@ -59,21 +64,29 @@ function registerModels(ctx, mount) {
       page.className = `settings-page ${props.embedded ? "settings-page--embedded" : ""}`;
       page.innerHTML = `<div class="settings-shell">
         <header class="settings-header">
-          <div><h1 data-title>模型连接</h1><p data-description>管理各模型服务商连接与密钥；未探测到的能力不会被默认开启。</p></div>
+          <div><h1 data-title>模型</h1><p data-description hidden></p></div>
           <div class="settings-header-actions"></div>
         </header>
-        <label class="settings-search" data-search>${SEARCH_ICON}<span class="sr-only">搜索模型连接</span><input placeholder="搜索服务商连接或模型名称"></label>
         <p class="settings-inline-error" data-error role="alert" hidden></p>
+        <div class="settings-section-bar" data-list-bar>
+          <h2 class="settings-section-label">服务商</h2>
+          <label class="settings-find" data-search>${SEARCH_ICON}<span class="sr-only">查找服务商或模型</span><input placeholder="查找服务商或模型"></label>
+          <button type="button" class="settings-primary-button settings-add-button" data-add-toggle aria-expanded="false" disabled>添加服务商</button>
+        </div>
         <ul class="settings-provider-list" data-connections></ul>
         <div class="settings-add-provider">
-          <button type="button" class="settings-add-button" data-add-toggle aria-expanded="false" disabled></button>
-          <div class="settings-add-panel" data-add-panel hidden>
+          <section class="settings-add-panel" data-add-panel hidden>
+            <div class="settings-section-bar">
+              <h2 class="settings-section-label" data-add-title>添加服务商</h2>
+              <label class="settings-find">${SEARCH_ICON}<span class="sr-only">查找服务商</span><input data-template-search placeholder="查找服务商…"></label>
+              <button type="button" class="settings-secondary-button" data-add-close>返回</button>
+            </div>
             <div class="settings-add-list" data-add-list></div>
             <div class="settings-provider-editor" data-add-editor hidden></div>
-          </div>
+          </section>
         </div>
         <section class="settings-section settings-roles" data-roles>
-          <header><div><h2>各场景指定模型</h2><p>切换立即生效；若某一场景未单独配置，自动使用全局默认模型。</p></div></header>
+          <div class="settings-section-bar"><h2 class="settings-section-label">默认</h2><span class="settings-section-hint">插件没单独指定时用这里</span></div>
           <div class="settings-role-grid" data-bindings></div>
         </section>
       </div>
@@ -90,13 +103,24 @@ function registerModels(ctx, mount) {
       const addPanel = page.querySelector("[data-add-panel]");
       const addList = page.querySelector("[data-add-list]");
       const addEditor = page.querySelector("[data-add-editor]");
+      const addTitle = page.querySelector("[data-add-title]");
+      const addClose = page.querySelector("[data-add-close]");
+      const templateSearch = page.querySelector("[data-template-search]");
+      const listBar = page.querySelector("[data-list-bar]");
       const roles = page.querySelector("[data-roles]");
       const bindings = page.querySelector("[data-bindings]");
       const toastRegion = page.querySelector("[data-toast-region]");
       let catalog = null;
       let query = "";
+      // 停用的连接默认收进列表末尾的一行；用户点开后在本页保持展开。
+      let disabledOpen = false;
+      let quotas = new Map();
+      let quotaKey = "";
+      let quotaAt = 0;
       // 编辑器就地展开在连接卡片（编辑）或添加面板（新建）内，同一时刻只开一个。
       let activeEditor = null;
+      // 新建成功后要展开的连接；目录读到它之前先记着。
+      let openAfterCreate = "";
       const closeActiveEditor = (force = false) => {
         const editor = activeEditor;
         if (!editor) return true;
@@ -118,10 +142,13 @@ function registerModels(ctx, mount) {
         const response = await ctx.http.request(path, init);
         return readJsonResponse(response);
       };
+      // 普通核对并入模块资源里进行中的读取；写入之后的核对另起一次，不读到写入前的目录。
       const reads = createLatestCatalogRead(
-        (signal) => request("/api/dashboard/models/catalog", {signal}),
+        (_signal, fresh) => catalogResource.refresh({fresh}),
         (nextCatalog) => {
           if (bindingSave?.saving) return;
+          // 核对结果与正在显示的是同一份目录：不重绘，避免打断阅读与展开状态。
+          if (nextCatalog === catalog && !bindingSave && errorMessage.hidden) return;
           const settledBinding = bindingSave;
           bindingSave = null;
           catalog = nextCatalog;
@@ -134,7 +161,7 @@ function registerModels(ctx, mount) {
           props.changed?.();
         },
       );
-      const load = () => reads.run();
+      const load = () => reads.run(undefined, true);
       // 返回设置只读核对目录；弹窗开启后，迟到的后台结果不能替换其依据。
       const canRefresh = () => !bindingSave?.saving && !page.querySelector("dialog[open]");
       const refreshVisible = () => {
@@ -196,23 +223,128 @@ function registerModels(ctx, mount) {
         const chatConnections = catalog.connections;
         const hasConnections = chatConnections.length > 0;
 
-        title.textContent = "模型服务";
-        description.textContent = hasConnections
-          ? "已配置的服务商连接如下；点击展开卡片可管理可用模型。"
-          : "请先添加模型连接，支持 ChatGPT 订阅、DeepSeek、Gemini 及兼容 API。";
-        search.hidden = !hasConnections;
+        title.textContent = "模型";
         roles.hidden = false;
         addToggle.disabled = false;
-        addToggle.textContent = hasConnections ? "+ 添加新服务商连接" : "选择服务商开始连接";
-        // 首次配置没有连接时直接展开连接方式列表；编辑器打开期间不抢面板状态。
+        // 首次配置没有连接时直接进入添加目录且不能关闭；编辑器打开期间不抢面板状态。
+        addTitle.textContent = hasConnections ? "添加服务商" : "添加第一个服务商";
+        addClose.hidden = !hasConnections;
         if (!hasConnections && !activeEditor) setAddPanel(true);
+        else if (!addPanel.hidden) listBar.hidden = connections.hidden = true;
         renderConnections(chatConnections);
         renderBindings(chatModels);
+        loadQuotas().catch(() => {});
+        openCreated();
       }
 
+      // 仿 magpie：连接建好即打开它的详情，账号额度、模型勾选与参数都在那里完成。
+      function openCreated() {
+        if (!openAfterCreate || activeEditor) return;
+        const created = catalog.connections.find((connection) => connection.id === openAfterCreate);
+        if (!created) return;
+        openAfterCreate = "";
+        openExisting(created);
+      }
+
+      // 添加是页面的另一种状态：打开时连接列表让位给服务商目录，关闭后回到列表。
       function setAddPanel(open) {
         addPanel.hidden = !open;
+        listBar.hidden = open;
+        connections.hidden = open;
+        addToggle.hidden = open;
         addToggle.setAttribute("aria-expanded", String(open));
+        if (!open) return;
+        templateSearch.value = "";
+        renderTemplates();
+        queueMicrotask(() => templateSearch.focus());
+      }
+
+      // 添加面板按接入方式分组：订阅登录、厂商 API、自定义；每组一格一种方式，已添加的单实例方式标出并直接打开它。
+      function renderTemplates() {
+        // 正在新建的编辑器挂在某一组下面，重绘目录前先收回来，避免随旧节点一起丢掉。
+        addPanel.appendChild(addEditor);
+        addList.replaceChildren();
+        const needle = templateSearch.value.trim().toLocaleLowerCase();
+        const matches = (template) => !needle || `${template.label} ${template.detail ?? ""}`.toLocaleLowerCase().includes(needle);
+        for (const [group, label, hint] of TEMPLATE_GROUPS) {
+          const items = providerTemplates.filter((template) => templateGroup(template) === group && matches(template));
+          if (!items.length) continue;
+          const section = document.createElement("section");
+          section.className = "settings-template-group";
+          section.innerHTML = "<h3><span></span><small></small></h3><div class=\"settings-template-grid\"></div>";
+          section.querySelector("h3 span").textContent = label;
+          section.querySelector("h3 small").textContent = hint;
+          const grid = section.querySelector(".settings-template-grid");
+          for (const template of items) grid.appendChild(templateTile(template));
+          addList.appendChild(section);
+        }
+        if (!providerTemplates.length) addList.textContent = "没有 Provider 插件提供连接方式。";
+        else if (!addList.childElementCount) addList.appendChild(noTemplateMatch(templateSearch.value.trim()));
+      }
+
+      // 查找无结果时给出去路：按自定义兼容地址添加。
+      function noTemplateMatch(name) {
+        const empty = document.createElement("p");
+        empty.className = "settings-template-empty";
+        empty.append(`没有叫“${name}”的服务商。`);
+        const custom = providerTemplates.find((template) => templateGroup(template) === "custom");
+        if (custom) {
+          const link = document.createElement("button");
+          link.type = "button";
+          link.className = "settings-text-button";
+          link.textContent = "用自定义 API 添加";
+          link.addEventListener("click", () => {
+            templateSearch.value = "";
+            renderTemplates();
+            addList.querySelector(`[data-template-id="${CSS.escape(custom.id)}"]`)?.click();
+          });
+          empty.append(link);
+        }
+        return empty;
+      }
+
+      function templateTile(template) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "settings-template-tile";
+        button.dataset.templateId = template.id;
+        button.appendChild(providerMark(template));
+        // 格子只写名称；一句说明放进提示，组标题已经说明了接入方式。
+        const title = document.createElement("span");
+        title.className = "settings-template-name";
+        title.textContent = template.label;
+        if (template.detail) button.title = template.detail;
+        button.append(title);
+        if (template.tag) {
+          const tag = document.createElement("small");
+          tag.className = "settings-template-tag";
+          tag.textContent = template.tag;
+          button.append(tag);
+        }
+        // 只有一种模板的接入方式（Codex、OpenCode Go）一个账号一条连接：已连接时标出，再点打开它而不是新建。
+        const existing = (template.owner.templates?.length ?? 0) < 2 && catalog
+          ? catalog.connections.find((connection) => connection.driverId === template.owner.id)
+          : null;
+        if (existing) {
+          button.querySelector(".settings-template-tag")?.remove();
+          const mark = document.createElement("small");
+          mark.className = "settings-template-added";
+          mark.textContent = "已添加";
+          button.append(mark);
+          button.setAttribute("aria-label", `${template.label}，已连接，打开 ${existing.name}`);
+          button.addEventListener("click", () => openExisting(existing));
+        } else {
+          button.addEventListener("click", () => startCreate(template, button));
+        }
+        return button;
+      }
+
+      function openExisting(connection) {
+        const head = connections.querySelector(`[data-connection-id="${CSS.escape(connection.id)}"] .settings-provider-head`);
+        if (!head || head.disabled) { showNotice(`${connection.name} 已停用，请先在连接列表里启用。`); return; }
+        setAddPanel(false);
+        if (head.getAttribute("aria-expanded") !== "true") head.click();
+        head.scrollIntoView({block: "start", behavior: "smooth"});
       }
 
       function renderConnections(allConnections) {
@@ -236,8 +368,13 @@ function registerModels(ctx, mount) {
         for (const child of [...connections.children]) {
           if (child !== editingCard) child.remove();
         }
+        // 停用的排在后面并默认收起；搜索时全部列出，正在编辑的卡片留在原组。
+        const parked = normalizedQuery ? [] : filtered.filter((connection) =>
+          connection.availability === "disabled" && connection.id !== editing?.connectionId);
+        const shown = filtered.filter((connection) => !parked.includes(connection));
+        if (parked.length && disabledOpen) shown.push(...parked);
         let next = connections.firstChild;
-        for (const connection of filtered) {
+        for (const connection of shown) {
           let element;
           if (editing && connection.id === editing.connectionId) {
             fillProviderHead(editing.head, providerEntries.find((candidate) => candidate.id === connection.driverId), connection);
@@ -253,12 +390,34 @@ function registerModels(ctx, mount) {
           }
           connections.insertBefore(element, next);
         }
+        if (parked.length) connections.insertBefore(parkedRow(parked.length), disabledOpen ? connections.children[shown.length - parked.length] ?? null : null);
+      }
+
+      // 停用连接的折叠行：常态（启用）常驻，停用的是低频信息，一行计数即可。
+      function parkedRow(count) {
+        const row = document.createElement("li");
+        row.className = "settings-provider-parked";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute("aria-expanded", String(disabledOpen));
+        button.innerHTML = `<span>已停用 ${count} 个</span>${CHEVRON_ICON}`;
+        button.addEventListener("click", () => {
+          disabledOpen = !disabledOpen;
+          renderConnections(catalog.connections);
+          connections.querySelector(".settings-provider-parked button")?.focus();
+        });
+        row.append(button);
+        return row;
       }
 
       function providerCard(connection) {
         const entry = providerEntries.find((candidate) => candidate.id === connection.driverId);
         const card = document.createElement("li");
         card.className = "settings-provider-card";
+        card.dataset.connectionId = connection.id;
+        // 行内两个独立控件：展开按钮铺满整行，启用开关浮在其上；箭头只是装饰。
+        const row = document.createElement("div");
+        row.className = "settings-provider-row";
         const head = document.createElement("button");
         head.type = "button";
         head.className = "settings-provider-head";
@@ -266,12 +425,23 @@ function registerModels(ctx, mount) {
         const copy = document.createElement("span");
         copy.className = "settings-card-copy";
         copy.innerHTML = "<strong data-name></strong><small data-detail></small>";
+        const quota = document.createElement("span");
+        quota.className = "settings-provider-quota";
+        quota.dataset.quota = "";
         const status = document.createElement("span");
         status.className = "settings-provider-status";
         status.dataset.status = "";
         status.innerHTML = "<i aria-hidden=\"true\"></i><span></span>";
-        head.append(connectionMark(entry, connection.name), copy, status);
-        head.insertAdjacentHTML("beforeend", CHEVRON_ICON);
+        head.append(connectionMark(entry, connection), copy, quota, status);
+        const toggle = document.createElement("label");
+        toggle.className = "settings-provider-switch";
+        toggle.innerHTML = "<input type=\"checkbox\" role=\"switch\">";
+        const enabled = toggle.querySelector("input");
+        enabled.checked = connection.availability !== "disabled";
+        enabled.setAttribute("aria-label", `启用 ${connection.name}`);
+        enabled.addEventListener("change", () => report(setConnectionEnabled(connection, enabled, card)));
+        row.append(head, toggle);
+        row.insertAdjacentHTML("beforeend", CHEVRON_ICON);
         fillProviderHead(head, entry, connection);
         if (!entry || connection.availability === "disabled") {
           head.disabled = true;
@@ -282,21 +452,177 @@ function registerModels(ctx, mount) {
         const editorRegion = document.createElement("div");
         editorRegion.className = "settings-provider-editor";
         editorRegion.hidden = true;
-        card.append(head, editorRegion);
+        card.append(row, editorRegion);
         return card;
       }
 
       function fillProviderHead(head, entry, connection) {
         const models = catalog.models.filter((model) => model.connectionId === connection.id);
         const openCount = models.filter((model) => model.availability !== "disabled").length;
+        const reading = connection.availability === "available" ? quotas.get(connection.id) : undefined;
         head.querySelector("[data-name]").textContent = connection.name;
-        head.querySelector("[data-detail]").textContent = connection.availability === "disabled"
-          ? `${entry?.label ?? connection.driverId} · ${models.length} 个模型`
-          : `${entry?.label ?? connection.driverId} · ${openCount}/${models.length} 开放`;
+        // 副标题说明连的是哪个账号或地址、有几个模型；订阅连接先写套餐。
+        const who = reading?.account || connection.endpointHost || entry?.label || connection.driverId;
+        const paused = models.length - openCount;
+        const count = connection.catalogMode === "all" ? `全部 ${models.length} 个模型` : `${models.length} 个模型`;
+        head.querySelector("[data-detail]").textContent = connection.availability === "disabled" || !paused
+          ? `${who} · ${count}`
+          : `${who} · ${count}，${paused} 个已停用`;
+        fillQuota(head.querySelector("[data-quota]"), reading);
+        // 正常是常态，不占位；停用由开关表达，只有驱动异常才标出。
         const status = head.querySelector("[data-status]");
+        status.hidden = connection.availability !== "driver_unavailable";
         status.classList.toggle("is-unavailable", connection.availability !== "available");
         const AVAILABILITY_LABELS = { available: "正常可用", disabled: "已停用", driver_unavailable: "驱动异常" };
         status.querySelector("span").textContent = AVAILABILITY_LABELS[connection.availability] ?? connection.availability;
+      }
+
+      // 行尾额度：最多两条最短窗口的已用比例，或余额；读不到时不占位，原因留在提示里。
+      function fillQuota(slot, reading) {
+        slot.replaceChildren();
+        slot.removeAttribute("title");
+        if (!reading) return;
+        const percent = (span) => Math.max(0, Math.min(100, Math.round(span.usedPercent)));
+        const top = reading.windows.reduce((most, span) => (most && percent(most) >= percent(span) ? most : span), null);
+        const high = !!top && percent(top) >= 80;
+        if (reading.plan) {
+          const plan = document.createElement("span");
+          plan.className = "settings-quota-plan";
+          plan.classList.toggle("is-high", high);
+          plan.textContent = reading.plan;
+          slot.append(plan);
+        }
+        slot.title = [...reading.windows.map((span) => `${span.label} 已用 ${percent(span)}%`), reading.error ? `额度读取失败：${reading.error}` : ""].filter(Boolean).join("\n");
+        if (top) {
+          const used = percent(top);
+          const label = document.createElement("span");
+          label.className = "settings-quota-window";
+          label.classList.toggle("is-high", high);
+          label.textContent = top.label;
+          const bar = document.createElement("span");
+          bar.className = "settings-quota-bar";
+          bar.innerHTML = "<i></i>";
+          bar.firstElementChild.style.inlineSize = `${used}%`;
+          bar.classList.toggle("is-high", high);
+          const value = document.createElement("span");
+          value.className = "settings-quota-window";
+          value.classList.toggle("is-high", high);
+          value.textContent = `${used}%`;
+          slot.append(label, bar, value);
+        } else if (reading.balance) {
+          slot.textContent = `余额 ${reading.balance}`;
+        } else if (reading.error) {
+          slot.textContent = "额度未读到";
+        }
+        slot.classList.toggle("is-stale", !!reading.error);
+      }
+
+      // 读取额度：连接集合变化或超过一分钟才重读；服务端另有缓存与最短间隔。
+      function loadQuotas(fresh = false) {
+        const ids = catalog.connections.filter((item) => item.availability === "available").map((item) => item.id).sort().join(",");
+        if (!ids || (!fresh && ids === quotaKey && Date.now() - quotaAt < 60_000)) return Promise.resolve();
+        quotaKey = ids;
+        quotaAt = Date.now();
+        return request(`/api/dashboard/models/quotas${fresh ? "?fresh=true" : ""}`).then((body) => {
+          if (closed) return;
+          quotas = new Map(body.quotas.map((item) => [item.connectionId, item]));
+          for (const card of connections.children) {
+            const connection = catalog.connections.find((item) => item.id === card.dataset.connectionId);
+            const head = card.querySelector(".settings-provider-head");
+            if (connection && head) fillProviderHead(head, providerEntries.find((item) => item.id === connection.driverId), connection);
+          }
+          activeEditor?.refresh?.();
+        }).catch((reason) => { quotaAt = 0; throw reason; });
+      }
+
+      let inlineConfirmSeq = 0;
+
+      function clearInlineConfirm(host, restoreFocus = false) {
+        const bar = host?.querySelector?.(":scope > .settings-inline-confirm");
+        if (!bar) return;
+        const opener = restoreFocus ? bar.__inlineConfirmOpener : null;
+        bar.remove();
+        if (opener?.isConnected && typeof opener.focus === "function") opener.focus();
+      }
+
+      // 两步内联确认替代系统 window.confirm：留在原卡片/底栏内完成决定。
+      function promptInlineConfirm(host, message, confirmLabel, onConfirm, beforeNode = null, opener = null) {
+        clearInlineConfirm(host);
+        inlineConfirmSeq += 1;
+        const textId = `settings-inline-confirm-${inlineConfirmSeq}`;
+        const bar = document.createElement("div");
+        bar.className = "settings-inline-confirm";
+        bar.setAttribute("role", "alertdialog");
+        bar.setAttribute("aria-labelledby", textId);
+        bar.__inlineConfirmOpener = opener ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+        const text = document.createElement("span");
+        text.id = textId;
+        text.className = "settings-inline-confirm__text";
+        text.textContent = message;
+        const actions = document.createElement("div");
+        actions.className = "settings-inline-confirm__actions";
+        const cancel = document.createElement("button");
+        cancel.type = "button";
+        cancel.className = "settings-inline-confirm__cancel";
+        cancel.textContent = "取消";
+        const confirm = document.createElement("button");
+        confirm.type = "button";
+        confirm.className = "settings-inline-confirm__danger";
+        confirm.textContent = confirmLabel;
+        cancel.addEventListener("click", () => clearInlineConfirm(host, true));
+        confirm.addEventListener("click", () => { bar.remove(); onConfirm(); });
+        bar.addEventListener("keydown", (event) => {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          event.stopPropagation();
+          clearInlineConfirm(host, true);
+        });
+        actions.append(cancel, confirm);
+        bar.append(text, actions);
+        if (beforeNode && beforeNode.parentElement === host) host.insertBefore(bar, beforeNode);
+        else host.append(bar);
+        cancel.focus();
+      }
+
+      // 开关直接生效；停用承担默认模型的连接改为行内两步确认，失败时回到实际状态。
+      async function setConnectionEnabled(connection, input, card = null, skipDefaultCheck = false) {
+        const enable = input.checked;
+        if (enable && card) clearInlineConfirm(card);
+        const roles = Object.values(catalog.roleBindings ?? {});
+        const hostsDefault = catalog.models.some((model) => model.connectionId === connection.id
+          && (roles.includes(model.id) || model.id === catalog.defaultEmbeddingModelId));
+        if (!enable && hostsDefault && !skipDefaultCheck) {
+          input.checked = true;
+          if (card) {
+            promptInlineConfirm(
+              card,
+              `默认模型在 ${connection.name} 上，停用后用到它的对话需另选默认模型。`,
+              "确认停用",
+              () => {
+                input.checked = false;
+                void report(setConnectionEnabled(connection, input, card, true));
+              },
+              card.querySelector(".settings-provider-editor"),
+              input,
+            );
+          }
+          return;
+        }
+        if (activeEditor?.connectionId === connection.id && !closeActiveEditor()) {
+          input.checked = !enable;
+          return;
+        }
+        input.disabled = true;
+        try {
+          await command({type: enable ? "enable_connection" : "disable_connection",
+            expected_revision: catalog.revision, connection_id: connection.id});
+          showNotice(enable ? `${connection.name} 已启用。` : `${connection.name} 已停用，模型配置与历史保留。`);
+        } catch (error) {
+          input.checked = !enable;
+          throw error;
+        } finally {
+          input.disabled = false;
+        }
       }
 
       function toggleProviderEditor(entry, card, head, connection) {
@@ -312,10 +638,10 @@ function registerModels(ctx, mount) {
       function startCreate(template, trigger) {
         if (bindingSave) { showNotice("请先等待模型选择保存或核对完成，再添加连接。"); return; }
         if (!closeActiveEditor()) return;
-        addList.hidden = true;
-        addEditor.hidden = false;
+        // 新建表单展开在所选格子那一组的下方，目录其余部分保持原位。
+        trigger.closest(".settings-template-group")?.appendChild(addEditor);
         openProvider(template.owner, trigger, null, template, {
-          kind: "create", card: addPanel, head: addToggle, host: addEditor,
+          kind: "create", card: addPanel, head: trigger, host: addEditor,
         });
       }
 
@@ -325,11 +651,14 @@ function registerModels(ctx, mount) {
         bindings.replaceChildren();
         for (const [role, label, detail] of ROLE_LABELS) {
           const bound = catalog.roleBindings[role] ?? "";
-          const availableModels = modelsForRole(chatModels, role)
+          const availableModels = chatModels
             .filter((model) => model.availability === "available" || model.id === bound);
+          const current = chatModels.find((model) => model.id === bound);
+          // 默认模型看不了图时直接说去哪里补，不让用户等到发图失败才发现。
+          const blind = current && !current.capabilities.inputModalities.includes("image");
           bindings.appendChild(bindingRow({
             label,
-            detail,
+            detail: blind ? "它不能看图；要发图，请在「插件 · 看图」选一个能看图的模型" : detail,
             models: availableModels,
             value: bound,
             change(modelId) {
@@ -341,8 +670,8 @@ function registerModels(ctx, mount) {
         const embeddingModels = catalog.models.filter((model) =>
           model.kind === "embedding" && (model.availability === "available" || model.id === embeddingBound));
         bindings.appendChild(bindingRow({
-          label: "知识库嵌入向量模型",
-          detail: "用于情景记忆检索与文本向量化",
+          label: "知识库向量",
+          detail: "记忆检索与文本向量化用它",
           models: embeddingModels,
           value: embeddingBound,
           change(modelId) {
@@ -369,8 +698,8 @@ function registerModels(ctx, mount) {
           <div class="settings-dialog-body"><div class="settings-form-grid">
           <label class="is-wide"><span>所属服务连接</span><select name="connection" aria-label="所属服务连接" required></select></label>
           <div class="is-wide settings-form-grid" data-new-connection>
-            <label class="is-wide"><span>连接名称</span><input name="name" aria-label="向量连接名称" value="向量服务" maxlength="128"></label>
-            <label class="is-wide"><span>Base URL</span><input name="endpoint" aria-label="向量 Base URL" type="url" placeholder="https://api.example.com/v1"></label>
+            <label class="is-wide"><span>连接名称</span><input name="name" aria-label="向量连接名称" value="向量服务" maxlength="128" autocomplete="organization"></label>
+            <label class="is-wide"><span>Base URL</span><input name="endpoint" aria-label="向量 Base URL" type="url" autocomplete="url" placeholder="https://api.example.com/v1"></label>
             <label class="is-wide"><span>API Key</span><input name="key" aria-label="向量 API Key" type="password" autocomplete="off"></label>
           </div>
           <button type="button" class="settings-secondary-button is-wide" data-directory>探测模型列表</button>
@@ -559,29 +888,34 @@ function registerModels(ctx, mount) {
         })();
       }
 
+      // 场景选择与聊天胶囊共用选择器：搜索、来源栏、收藏与键盘操作一致。
       function modelPickSheet({title, models, currentId}) {
-        const groups = [];
-        for (const connection of catalog.connections) {
-          const rows = models
-            .filter((model) => model.connectionId === connection.id)
-            .map((model) => ({
-              data: model.id,
-              primary: model.model,
-              badges: capabilityBadges(model.capabilities),
-              current: model.id === currentId,
-            }));
-          if (rows.length) groups.push({label: connection.name, rows});
-        }
-        const orphans = models
-          .filter((model) => !catalog.connections.some((item) => item.id === model.connectionId))
-          .map((model) => ({data: model.id, primary: model.model, badges: capabilityBadges(model.capabilities), current: model.id === currentId}));
-        if (orphans.length) groups.push({label: "其他", rows: orphans});
-        return modelSheet({title, multiple: false, groups});
+        const order = new Map(catalog.connections.map((connection, index) => [connection.id, index]));
+        const runtimes = [...models]
+          .sort((a, b) => (order.get(a.connectionId) ?? Infinity) - (order.get(b.connectionId) ?? Infinity))
+          .map((model) => {
+            const connection = catalog.connections.find((item) => item.id === model.connectionId);
+            const entry = providerEntries.find((candidate) => candidate.id === connection?.driverId);
+            const caps = model.capabilities ?? {};
+            const brand = connectionIcon(entry, connection);
+            const icon = typeof brand === "string" && brand.startsWith("data:image/svg+xml,") ? brand : "";
+            return {
+              id: model.id, provider: connection?.driverId ?? "", model: model.model,
+              sourceId: model.connectionId, sourceName: connection?.name ?? "其他", icon,
+              reasoningEffort: "", supportedReasoningEfforts: caps.supportedReasoningEfforts ?? [], roles: [],
+              contextWindow: caps.contextWindow ?? 0, inputModalities: caps.inputModalities ?? [],
+            };
+          });
+        return modelSheet({
+          title, groups: [],
+          mount: (host, settle) => mountModelPicker(host, {runtimes, selectedId: currentId, follow: null, onChoose: settle}),
+        });
       }
 
       // 统一的小型浮层：multiple=true 是候选勾选（复选 + 底部确认），false 是单选列表（点击即选）。
       // 解析单选行 data、复选行 data 数组；取消一律解析 null。
-      function modelSheet({title, hint, multiple = false, confirmLabel = "确定", groups}) {
+      // mount 给出时由它渲染列表区（返回卸载函数），用于单选的模型选择器。
+      function modelSheet({title, hint, multiple = false, confirmLabel = "确定", groups, mount = null}) {
         return new Promise((resolve) => {
           const scrim = document.createElement("dialog");
           scrim.className = "settings-scrim settings-sheet-scrim";
@@ -671,6 +1005,11 @@ function registerModels(ctx, mount) {
             }
           }
           sheet.append(list);
+          let unmount = null;
+          if (mount) {
+            sheet.classList.add("settings-sheet--picker");
+            list.className = "settings-sheet-picker";
+          }
           let okButton = null;
           if (multiple) {
             const foot = document.createElement("footer");
@@ -697,6 +1036,7 @@ function registerModels(ctx, mount) {
           let settled = false;
           const release = () => settle(null);
           const close = () => {
+            unmount?.();
             openOverlays.delete(release);
             scrim.removeEventListener("cancel", onCancel);
             window.removeEventListener("akashic:before-navigate", onNavigate);
@@ -722,6 +1062,7 @@ function registerModels(ctx, mount) {
           openOverlays.add(release);
           page.appendChild(scrim);
           scrim.showModal();
+          if (mount) unmount = mount(list, settle);
         });
       }
 
@@ -747,325 +1088,354 @@ function registerModels(ctx, mount) {
         const map = new Map();
         for (const [role, label] of ROLE_LABELS) {
           const bound = catalog.roleBindings?.[role];
-          if (bound) map.set(bound, label.replace("模型", "").trim());
+          if (bound) map.set(bound, [map.get(bound), label.replace("模型", "").trim()].filter(Boolean).join("、"));
         }
         if (catalog.defaultEmbeddingModelId) map.set(catalog.defaultEmbeddingModelId, "默认向量");
         return map;
       }
 
-      // 配置行表示已选择；目录候选只在用户确认后保存。
-      function buildModelManager({connection, entry, actions, dialogClosed, dirty, finishDisable}) {
+      // 详情里的模型区：目录候选与已保存模型合成一组可勾选的标签，勾选、手填与参数都先暂存，保存时一并提交。
+      function buildModelManager({connection, actions, readCatalog, dialogClosed, dirty}) {
         const section = document.createElement("section");
         section.className = "settings-model-manage";
-        section.innerHTML = `<header class="settings-model-manage-head"><div><h3>模型</h3><p data-manage-status role="status"></p></div>
-          <div class="settings-model-manage-actions">
-            <button type="button" class="settings-secondary-button" data-probe>探测目录</button>
-            ${entry.catalogSync ? '<button type="button" class="settings-secondary-button" data-sync>刷新已选能力</button>' : ""}
-            <button type="button" class="settings-text-button" data-manual-toggle>手动添加</button>
-          </div></header>
-          <div class="settings-model-manual" data-manual hidden><input aria-label="模型型号" maxlength="256" placeholder="型号，例如 gpt-5"><button type="button" class="settings-primary-button" data-manual-add>验证并添加</button></div>
-          <div class="settings-model-rows" data-rows></div>
-          <p class="settings-inline-error" data-manage-error role="alert" hidden></p>
-          <button type="button" class="settings-text-button" data-disable-conn>停用此连接（保留数据）</button>
-          <p class="settings-inline-error" data-disable-error role="alert" hidden></p>`;
-        const status = section.querySelector("[data-manage-status]");
-        const error = section.querySelector("[data-manage-error]");
-        const rowsElement = section.querySelector("[data-rows]");
-        const manual = section.querySelector("[data-manual]");
+        section.innerHTML = `<div class="settings-detail-row settings-account" data-account hidden></div>
+          <div class="settings-detail-row"><span class="settings-detail-key">模型 <small data-manage-count></small></span><div class="settings-detail-value">
+            <div class="settings-chip-toolbar">
+              <label class="settings-model-filter">${SEARCH_ICON}<input aria-label="筛选模型" placeholder="筛选模型"></label>
+              <button type="button" class="settings-text-button" data-manual-toggle>添加模型 ID</button>
+              <button type="button" class="settings-icon-button" data-reload aria-label="重新读取服务目录" title="重新读取服务目录">${REFRESH_ICON}</button>
+            </div>
+            <div class="settings-model-manual" data-manual hidden><input aria-label="模型 ID" maxlength="256" placeholder="型号，例如 gpt-5"><button type="button" class="settings-secondary-button" data-manual-add>加入</button></div>
+            <div class="settings-model-table" data-rows></div>
+            <p class="settings-model-hint">识图打开后，图片直接发给这个模型；「未知」是目录没写，按不能识图处理，确认能看再打开。</p>
+            <p class="settings-model-hint" data-manage-status role="status"></p>
+            <p class="settings-inline-error" data-manage-error role="alert" hidden></p>
+          </div></div>`;
+        const $ = (selector) => section.querySelector(selector);
+        const account = $("[data-account]");
+        const count = $("[data-manage-count]");
+        const filterInput = $(".settings-model-filter input");
+        const rows = $("[data-rows]");
+        const status = $("[data-manage-status]");
+        const error = $("[data-manage-error]");
+        const manual = $("[data-manual]");
         const manualInput = manual.querySelector("input");
-        const manualAdd = section.querySelector("[data-manual-add]");
-        const manualToggle = section.querySelector("[data-manual-toggle]");
-        const probe = section.querySelector("[data-probe]");
-        const sync = section.querySelector("[data-sync]");
-        const disableConnection = section.querySelector("[data-disable-conn]");
-        const disableError = section.querySelector("[data-disable-error]");
-        const showManageError = (reason) => {
-          error.textContent = reason instanceof Error ? reason.message : String(reason);
-          error.hidden = false;
+        const showError = (reason) => { error.textContent = reason instanceof Error ? reason.message : String(reason); error.hidden = false; };
+        const key = (kind, name) => kind === "embedding" ? `embedding:${name}` : name;
+        const savedModels = () => catalog.models.filter((model) => model.connectionId === connection.id);
+        // 目录候选与手填 ID 按 key 合并；picked 是暂存的勾选，参数草稿按模型 ID 存放。
+        const candidates = new Map();
+        let picked = new Set(savedModels().map((model) => key(model.kind, model.model)));
+        const drafts = new Map();
+        const expanded = new Set();
+        // mode 是暂存的模型范围：all 跟随服务商目录（以后新上的也收），picked 只用勾选的。
+        const savedMode = () => catalog.connections.find((item) => item.id === connection.id)?.catalogMode ?? "picked";
+        let mode = savedMode();
+        let loading = true;
+
+        const isDirty = () => {
+          const saved = new Set(savedModels().map((model) => key(model.kind, model.model)));
+          return saved.size !== picked.size || [...picked].some((item) => !saved.has(item)) || drafts.size > 0 || mode !== savedMode();
         };
-        const clearManageError = () => { error.hidden = true; error.textContent = ""; };
-        const connectionModels = () => catalog.models.filter((model) => model.connectionId === connection.id);
+        const reportDirty = () => dirty(isDirty() || !!manualInput.value);
+        for (const type of ["input", "change"]) section.addEventListener(type, (event) => { event.stopPropagation(); reportDirty(); });
 
-        const rows = new Map();
-        const reportDirty = () => dirty(!!manualInput.value || [...rows.values()].some((row) => row.isDirty()));
-        // 宿主字段不冒充 provider 表单草稿；两者通过 dirty 回调独立汇总。
-        for (const type of ["input", "change"]) section.addEventListener(type, (event) => {
-          event.stopPropagation();
-          reportDirty();
-        });
-
-        // 保留现有行和编辑节点；目录刷新只更新已保存事实。
-        const refreshRows = () => {
-          if (dialogClosed()) return;
+        // 一行一个可选模型：勾选决定用不用，已保存的对话模型可直接切识图，「···」展开其余参数。
+        function renderRows() {
           const used = usedByMap();
-          const models = connectionModels();
-          const open = models.filter((model) => model.availability !== "disabled").length;
-          status.textContent = `${models.length} 个已选，${open} 个可用`;
-          const selected = new Set(models.map((model) => model.id));
-          for (const [id, row] of rows) {
-            if (selected.has(id)) continue;
-            row.element.remove();
-            rows.delete(id);
+          const saved = new Map(savedModels().map((model) => [key(model.kind, model.model), model]));
+          const all = new Map([...candidates, ...saved]);
+          const needle = filterInput.value.trim().toLowerCase();
+          rows.replaceChildren(tableHead(all));
+          for (const [id, item] of [...all].sort(([left], [right]) => left.localeCompare(right))) {
+            if (needle && !item.model.toLowerCase().includes(needle)) continue;
+            rows.append(modelRow(id, item, saved.get(id), used));
+            const model = saved.get(id);
+            if (model && expanded.has(model.id)) rows.append(extraRow(model));
           }
-          let next = rowsElement.firstChild;
-          for (const model of models) {
-            if (!rows.has(model.id)) rows.set(model.id, modelRow(model));
-            const row = rows.get(model.id);
-            row.update(model, used.get(model.id) ?? "");
-            if (row.element !== next) rowsElement.insertBefore(row.element, next);
-            next = row.element.nextSibling;
-          }
+          if (!all.size) rows.append(Object.assign(document.createElement("p"), {className: "settings-model-hint", textContent: loading ? "正在读取服务目录…" : "目录里没有模型；可以手动添加模型 ID。"}));
+          else if (!loading && !savedModels().length && !status.textContent) status.textContent = "这个连接还没有启用的模型：勾选要用的，再点保存。";
           reportDirty();
-        };
+        }
 
-        function modelRow(model) {
+        // 表头勾选是「全部」：勾上跟随目录，取消清空；部分勾选时显示半选。
+        function tableHead(all) {
+          const head = document.createElement("div");
+          head.className = "settings-model-row is-head";
+          head.innerHTML = `<span><input type="checkbox" aria-label="全部模型，以后新上的也收进来"></span><span>全部 <small></small></span><span>上下文</span><span>识图</span><span></span>`;
+          const box = head.querySelector("input");
+          box.checked = mode === "all";
+          box.indeterminate = mode !== "all" && picked.size > 0;
+          head.querySelector("small").textContent = mode === "all" ? `${all.size} 个，以后新上的也会收进来` : `已选 ${picked.size} / ${all.size}`;
+          box.addEventListener("change", () => {
+            mode = box.checked ? "all" : "picked";
+            picked = box.checked ? new Set(all.keys()) : new Set();
+            renderRows();
+          });
+          return head;
+        }
+
+        function modelRow(id, item, model, used) {
           const row = document.createElement("div");
           row.className = "settings-model-row";
-          const toggleTarget = document.createElement("label");
-          toggleTarget.className = "settings-model-toggle";
-          const toggle = document.createElement("input");
-          toggle.type = "checkbox";
-          toggle.checked = true;
-          toggle.setAttribute("aria-label", `选择 ${model.model}`);
-          toggle.addEventListener("change", () => {
-            if (editor?.isDirty() && !window.confirm(`移除 ${model.model} 并放弃该行尚未保存的参数？`)) {
-              toggle.checked = true;
-              return;
-            }
-            toggle.disabled = true;
-            clearManageError();
-            actions.removeModel(model.id).then(() => {
-              if (dialogClosed()) return;
-              refreshRows();
-              status.textContent = model.kind === "embedding"
-                ? `${model.model} 已移除；使用此向量空间的任务需要重新配置。`
-                : `${model.model} 已移除；聊天引用将跟随默认模型，历史记录保留。`;
-            }).catch((reason) => {
-              if (dialogClosed()) return;
-              showManageError(reason);
-              refreshRows();
-            });
+          row.innerHTML = `<span><input type="checkbox"></span><span class="settings-model-name"><strong></strong><em></em></span><span></span><span class="settings-model-vision"></span><span></span>`;
+          const [cell, name, context, vision, more] = row.children;
+          const pick = cell.firstElementChild;
+          pick.checked = picked.has(id);
+          pick.setAttribute("aria-label", `使用 ${item.model}`);
+          // 在「全部」下取消一个就转成仅所选，Models 不维护排除名单。
+          pick.addEventListener("change", () => {
+            if (pick.checked) picked.add(id); else { picked.delete(id); mode = "picked"; }
+            renderRows();
           });
-          const main = document.createElement("span");
-          main.className = "settings-model-main";
-          const modelId = document.createElement("strong");
-          modelId.textContent = model.model;
-          const flags = document.createElement("span");
-          flags.className = "settings-sheet-flags";
-          main.append(modelId, flags);
-          const use = document.createElement("span");
-          use.className = "settings-model-use";
-          toggleTarget.append(toggle);
-          row.append(toggleTarget, main, use);
-          const verify = document.createElement("button");
-          verify.type = "button";
-          verify.className = "settings-text-button";
-          verify.textContent = "验证";
+          name.querySelector("strong").textContent = item.model;
+          name.querySelector("em").textContent = (model ? used.get(model.id) : "新") || "";
+          const caps = model?.capabilities ?? item.capabilities ?? {};
+          context.textContent = shortTokens(caps.contextWindow);
+          if (model?.kind === "chat") {
+            vision.append(visionSwitch(model));
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "settings-text-button settings-model-more";
+            button.textContent = "···";
+            button.setAttribute("aria-label", `${model.model} 的更多参数`);
+            button.setAttribute("aria-expanded", String(expanded.has(model.id)));
+            button.addEventListener("click", () => { if (!expanded.delete(model.id)) expanded.add(model.id); renderRows(); });
+            more.append(button);
+          } else {
+            const sees = (caps.inputModalities ?? []).includes("image");
+            vision.textContent = item.kind === "embedding" ? "向量" : sees ? "能" : "未知";
+          }
+          return row;
+        }
+
+        // 识图开关改的是草稿；用户改过的标「手动」，目录没写的标「未知」。
+        function visionSwitch(model) {
+          const base = draftBase(model);
+          const label = document.createElement("label");
+          label.className = "settings-vision-switch";
+          label.innerHTML = `<input type="checkbox" role="switch"><small></small>`;
+          const input = label.querySelector("input");
+          input.checked = (drafts.get(model.id) ?? base)[2];
+          input.setAttribute("aria-label", `${model.model} 识图`);
+          const source = model.capabilitySources?.inputModalities;
+          label.querySelector("small").textContent = source === "user" ? "手动" : source === "unknown" ? "未知" : "";
+          input.addEventListener("change", () => setDraft(model, 2, input.checked));
+          return label;
+        }
+
+        function extraRow(model) {
+          const row = document.createElement("div");
+          row.className = "settings-model-extra";
+          row.innerHTML = `<label><span>上下文</span><input data-field="context" placeholder="未知" autocomplete="off"></label>
+            <label><span>最大输出</span><input data-field="output" placeholder="未知" autocomplete="off"></label>
+            <button type="button" class="settings-text-button" data-verify>发一条消息验证</button>
+            <small>留空表示未知；K = 1,000，M = 1,000,000。</small>`;
+          const [context, output] = row.querySelectorAll("input");
+          [context.value, output.value] = drafts.get(model.id) ?? draftBase(model);
+          context.addEventListener("input", () => { context.removeAttribute("aria-invalid"); setDraft(model, 0, context.value); });
+          output.addEventListener("input", () => { output.removeAttribute("aria-invalid"); setDraft(model, 1, output.value); });
+          const verify = row.querySelector("[data-verify]");
           verify.addEventListener("click", () => {
             verify.disabled = true;
-            clearManageError();
-            actions.verifyModel(model.id).then(() => {
-              if (!dialogClosed()) status.textContent = `${model.model} 验证通过`;
-            }).catch((reason) => {
-              if (!dialogClosed()) showManageError(reason);
-            }).finally(() => { verify.disabled = false; });
+            actions.verifyModel(model.id).then(() => { status.textContent = `${model.model} 验证通过`; })
+              .catch(showError).finally(() => { verify.disabled = false; });
           });
-          row.append(verify);
-          const editor = model.kind === "chat" ? buildModelDetail(model) : null;
-          let element = row;
-          if (editor) {
-            element = document.createElement("div");
-            element.className = "settings-model-entry";
-            const expand = document.createElement("button");
-            expand.type = "button";
-            expand.className = "settings-icon-button settings-model-expand";
-            expand.setAttribute("aria-label", `编辑 ${model.model} 参数`);
-            expand.setAttribute("aria-expanded", "false");
-            expand.innerHTML = CHEVRON_ICON;
-            row.append(expand);
-            expand.addEventListener("click", () => {
-              const open = editor.element.hidden;
-              editor.element.hidden = !open;
-              expand.setAttribute("aria-expanded", String(open));
-              expand.classList.toggle("is-open", open);
-            });
-            element.append(row, editor.element);
-          }
-          return {
-            element,
-            isDirty: () => editor?.isDirty() ?? false,
-            update(next, inUse) {
-              model = next;
-              toggle.checked = true;
-              toggle.disabled = false;
-              row.classList.toggle("is-disabled", model.availability === "disabled");
-              verify.hidden = model.availability === "disabled";
-              use.textContent = [inUse ? `在用 · ${inUse}` : "", model.availability !== "available" ? "暂不可用" : ""].filter(Boolean).join(" · ");
-              flags.replaceChildren();
-              for (const badge of [model.kind === "embedding" ? "向量" : "", ...capabilityBadges(model.capabilities)].filter(Boolean)) {
-                const chip = document.createElement("i");
-                chip.textContent = badge;
-                if (badge === "向量") chip.className = "is-mark";
-                flags.append(chip);
-              }
-              editor?.update(model.capabilities ?? {});
-            },
-          };
+          return row;
         }
 
-        // 三个可声明能力：上下文窗口、最大输出、图像输入；空值 = 未知。
-        function buildModelDetail(model) {
-          const detail = document.createElement("div");
-          detail.className = "settings-model-detail";
-          detail.hidden = true;
-          detail.innerHTML = `<div class="settings-form-grid">
-            <label><span>上下文窗口</span><input name="contextWindow" placeholder="未知，例如 200K" autocomplete="off" spellcheck="false"></label>
-            <label><span>最大输出 token</span><input name="maxOutput" placeholder="未知，例如 32K" autocomplete="off" spellcheck="false"></label>
-            <label class="is-wide settings-model-image"><input type="checkbox" name="imageInput"><span>可看图（多模态输入）</span></label>
-          </div>
-          <p class="settings-model-hint">留空表示未知；K = 1,000，M = 1,000,000。保存的参数不会被目录刷新覆盖。</p>
-          <div class="settings-model-detail-actions">
-            <span role="status" data-detail-status></span>
-            <button type="button" class="settings-secondary-button" data-detail-save>保存参数</button>
-          </div>`;
-          const contextInput = detail.querySelector('[name="contextWindow"]');
-          const outputInput = detail.querySelector('[name="maxOutput"]');
-          const imageInput = detail.querySelector('[name="imageInput"]');
-          const detailStatus = detail.querySelector("[data-detail-status]");
-          const save = detail.querySelector("[data-detail-save]");
-          const values = () => [contextInput.value, outputInput.value, imageInput.checked];
-          let saved, saving = false;
-          const isDirty = () => values().some((value, index) => value !== saved[index]);
-          const setSaved = (caps) => {
-            contextInput.value = formatTokenCount(caps.contextWindow);
-            outputInput.value = formatTokenCount(caps.maxOutputTokens);
-            imageInput.checked = (caps.inputModalities ?? []).includes("image");
-            saved = values();
-          };
-          const updateControls = () => {
-            for (const input of [contextInput, outputInput, imageInput]) input.disabled = saving;
-            save.disabled = saving || !isDirty();
-            save.textContent = saving ? "正在保存…" : "保存参数";
-            reportDirty();
-          };
-          setSaved(model.capabilities ?? {});
-          save.disabled = true;
-          detail.addEventListener("input", () => {
-            contextInput.removeAttribute("aria-invalid");
-            outputInput.removeAttribute("aria-invalid");
-            detailStatus.textContent = isDirty() ? "尚未保存" : "";
-            updateControls();
-          });
-          detail.addEventListener("keydown", (event) => {
-            if (event.key !== "Enter" || ![contextInput, outputInput].includes(event.target)) return;
-            event.preventDefault();
-            if (!save.disabled) save.click();
-          });
-          save.addEventListener("click", () => {
-            clearManageError();
-            const contextWindow = parseTokenCount(contextInput.value);
-            const maxOutputTokens = parseTokenCount(outputInput.value);
+        // 表里只读的上下文写成整 K / M，编辑框才用精确值。
+        function shortTokens(value) {
+          if (!value) return "—";
+          return value >= 1_000_000 ? `${+(value / 1_000_000).toFixed(1)}M` : value >= 1000 ? `${Math.round(value / 1000)}K` : String(value);
+        }
+
+        function draftBase(model) {
+          const caps = model.capabilities ?? {};
+          return [formatTokenCount(caps.contextWindow), formatTokenCount(caps.maxOutputTokens), (caps.inputModalities ?? []).includes("image")];
+        }
+
+        function setDraft(model, index, value) {
+          const base = draftBase(model);
+          const next = [...(drafts.get(model.id) ?? base)];
+          next[index] = value;
+          if (next.every((item, at) => item === base[at])) drafts.delete(model.id);
+          else drafts.set(model.id, next);
+          reportDirty();
+        }
+
+        // 1. 先校验全部参数草稿，任何一格不合法都不开始写入。
+        function parsedDrafts() {
+          const patches = [];
+          for (const [modelId, [context, output, image]] of drafts) {
+            const model = savedModels().find((item) => item.id === modelId);
+            if (!model || !picked.has(key(model.kind, model.model))) continue;
+            const contextWindow = parseTokenCount(context);
+            const maxOutputTokens = parseTokenCount(output);
             if (contextWindow === false || maxOutputTokens === false) {
-              const invalid = contextWindow === false ? contextInput : outputInput;
-              invalid.setAttribute("aria-invalid", "true");
-              invalid.focus();
-              detailStatus.textContent = "请输入正整数或带 K/M 后缀的数值；留空表示未知。";
-              return;
+              expanded.add(modelId);
+              renderRows();
+              throw new Error("参数请输入正整数或带 K/M 后缀的数值；留空表示未知。");
             }
-            saving = true;
-            detailStatus.textContent = "正在保存…";
-            updateControls();
-            actions.updateModel(model.id, {
-              context_window: contextWindow,
-              max_output_tokens: maxOutputTokens,
-              image_input: imageInput.checked,
-            }).then(() => {
-              if (dialogClosed()) return;
-              setSaved(catalog.models.find((item) => item.id === model.id).capabilities);
-              refreshRows();
-              detailStatus.textContent = "参数已保存";
-            }).catch((reason) => {
-              if (dialogClosed()) return;
-              detailStatus.textContent = reason instanceof Error ? reason.message : String(reason);
-            }).finally(() => {
-              saving = false;
-              updateControls();
-              // 禁用按钮期间浏览器可能丢失焦点；只在没有转去其他控件时归还。
-              if (!dialogClosed() && (document.activeElement === document.body || document.activeElement === save)) contextInput.focus();
-            });
-          });
-          return {
-            element: detail,
-            isDirty,
-            update(caps) {
-              if (!saving && !isDirty()) setSaved(caps);
-              updateControls();
-            },
-          };
+            patches.push([modelId, {context_window: contextWindow, max_output_tokens: maxOutputTokens, image_input: image}]);
+          }
+          return patches;
         }
 
-        probe.addEventListener("click", () => {
-          probe.disabled = true;
-          clearManageError();
-          status.textContent = "正在读取服务目录…";
-          actions.selectModels().then((selected) => {
-            if (dialogClosed()) return;
-            refreshRows();
-            status.textContent = selected ? "模型选择已保存。" : "未改动模型选择。";
-          }).catch((reason) => {
-            if (dialogClosed()) return;
-            showManageError(reason);
-            status.textContent = "探测未完成。";
-          }).finally(() => { probe.disabled = false; });
-        });
+        // 移除在用模型前要说明后果；保存按钮在开始写入前调用。
+        function removalWarning() {
+          const used = usedByMap();
+          const leaving = savedModels().filter((model) => !picked.has(key(model.kind, model.model)) && used.get(model.id));
+          if (!leaving.length) return "";
+          const names = leaving.map((model) => `${model.model}（${used.get(model.id)}）`).join("、");
+          // 后端只给对话角色挑替补；向量默认会被清空，需要用户重新指定。
+          const leavingIds = new Set(leaving.map((model) => model.id));
+          const spare = catalog.models.some((model) => model.kind === "chat" && model.availability === "available" && !leavingIds.has(model.id)
+            && (model.connectionId !== connection.id || picked.has(key(model.kind, model.model))));
+          const effects = [];
+          if (leaving.some((model) => model.kind === "chat")) effects.push(spare ? "对话场景会改用剩下的可用模型" : "之后没有可用的对话模型，需要重新添加");
+          if (leaving.some((model) => model.id === catalog.defaultEmbeddingModelId)) effects.push("默认向量模型会被清空，需要重新选择");
+          return `将移除正在使用的 ${names}：${effects.join("；")}。继续保存？`;
+        }
 
-        sync?.addEventListener("click", () => {
-          sync.disabled = true;
-          clearManageError();
-          actions.sync().then(() => {
-            if (dialogClosed()) return;
-            status.textContent = "已选模型的能力已刷新。";
-            refreshRows();
-          }).catch((reason) => {
-            if (!dialogClosed()) showManageError(reason);
-          }).finally(() => { sync.disabled = false; });
-        });
+        // 2. 先验证并新增勾选的模型，全部成功才移除取消勾选的，最后写参数；保存期间锁住编辑。
+        async function commit(operations) {
+          const patches = parsedDrafts();
+          section.inert = true;
+          try {
+            const changed = await write(operations, patches);
+            picked = new Set(savedModels().map((model) => key(model.kind, model.model)));
+            mode = savedMode();
+            return changed;
+          } finally { section.inert = false; refresh(); }
+        }
 
-        manualToggle.addEventListener("click", () => {
+        async function write(operations, patches) {
+          const failures = [];
+          const attempt = async (label, work) => {
+            try { await work(); } catch (reason) { failures.push(`${label}：${reason instanceof Error ? reason.message : String(reason)}`); }
+            if (dialogClosed()) throw new Error("窗口已关闭；已提交的修改以实际结果为准。");
+          };
+          // 切到「全部」由 Models 读目录一次收齐；切回「仅所选」只改标记，随后按勾选增删。
+          const modeChanged = mode !== savedMode();
+          if (modeChanged) await attempt("模型范围", () => operations.setCatalogMode(mode));
+          if (failures.length) throw new Error(failures.join("；"));
+          // 「全部」以服务端这次收进来的为准，不拿打开时的旧预览去删；只补手填或目录外的型号。
+          const saved = savedModels();
+          const savedKeys = new Set(saved.map((model) => key(model.kind, model.model)));
+          const adding = [...picked].filter((item) => !savedKeys.has(item));
+          const removing = mode === "all" ? [] : saved.filter((model) => !picked.has(key(model.kind, model.model)));
+          for (const [index, item] of adding.entries()) {
+            const candidate = candidates.get(item);
+            status.textContent = `正在验证 ${candidate.model}（${index + 1}/${adding.length}）…`;
+            await attempt(candidate.model, () => operations.addModel(candidate.manual
+              ? {kind: "chat", model: candidate.model, capabilities: {}, capability_sources: {}, driver_config: {}}
+              : candidateModelInput(candidate)));
+          }
+          status.textContent = "";
+          // 新增有失败时不删旧模型，免得替换不成反而清空可用配置；勾选保持原样可直接重试。
+          if (failures.length) throw new Error(`新增未完成，已勾掉的模型先保留；${failures.join("；")}`);
+          for (const model of removing) await attempt(model.model, () => operations.removeModel(model.id));
+          for (const [modelId, patch] of patches) {
+            const name = catalog.models.find((model) => model.id === modelId)?.model ?? modelId;
+            await attempt(name, async () => { await operations.updateModel(modelId, patch); drafts.delete(modelId); });
+          }
+          if (failures.length) throw new Error(`部分完成；${failures.join("；")}`);
+          return modeChanged || adding.length + removing.length + patches.length > 0;
+        }
+
+        function refresh() {
+          if (dialogClosed()) return;
+          renderAccount(account, connection);
+          // 正在输入参数时不重绘，免得丢焦点。
+          if (!rows.contains(document.activeElement) || document.activeElement?.type === "checkbox") renderRows();
+        }
+
+        filterInput.addEventListener("input", renderRows);
+        $("[data-manual-toggle]").addEventListener("click", () => {
           manual.hidden = !manual.hidden;
           if (!manual.hidden) manualInput.focus();
         });
-        manualAdd.addEventListener("click", () => {
+        const addManual = () => {
           const name = manualInput.value.trim();
           if (!name) { manualInput.focus(); return; }
-          manualAdd.disabled = true;
-          clearManageError();
-          actions.addModel({kind: "chat", model: name, capabilities: {}, capability_sources: {}, driver_config: {}}).then(() => {
-            if (dialogClosed()) return;
-            manualInput.value = "";
-            manual.hidden = true;
-            status.textContent = `${name} 已验证并开放。`;
-            refreshRows();
-          }).catch((reason) => {
-            if (!dialogClosed()) showManageError(reason);
-          }).finally(() => { manualAdd.disabled = false; });
-        });
+          if (!candidates.has(name) && !savedModels().some((model) => model.model === name)) {
+            candidates.set(name, {model: name, kind: "chat", capabilities: {}, manual: true});
+          }
+          picked.add(name);
+          mode = "picked";
+          manualInput.value = "";
+          manual.hidden = true;
+          renderRows();
+        };
+        $("[data-manual-add]").addEventListener("click", addManual);
+        manualInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); addManual(); } });
 
-        disableConnection.addEventListener("click", () => {
-          if (!window.confirm(`停用 ${connection.name} 的全部模型？未保存的修改会放弃，历史对话和记忆保留。`)) return;
-          disableConnection.disabled = true;
-          actions.disableConnection().then(() => {
+        // 打开详情即读一次服务目录；只读不占请求锁，读不到时仍可管理已保存的模型。
+        const discover = () => {
+          const revision = catalog.revision;
+          loading = true;
+          error.hidden = true;
+          status.textContent = "正在读取服务目录…";
+          renderRows();
+          return readCatalog().then((found) => {
             if (dialogClosed()) return;
-            finishDisable();
+            for (const item of found) if (item.kind === null || item.kind === "chat") candidates.set(key("chat", item.model), item);
           }).catch((reason) => {
-            if (dialogClosed()) return;
-            disableError.textContent = `尚未确认停用结果。请关闭窗口后核对最新设置，再决定是否重试。${reason instanceof Error ? reason.message : String(reason)}`;
-            disableError.hidden = false;
-          }).finally(() => { disableConnection.disabled = false; });
-        });
+            // 读取期间设置已被保存改变：按新版本重读一次，不把版本冲突当错误展示。
+            if (catalog.revision !== revision && !dialogClosed()) return discover();
+            showError(reason);
+          }).finally(() => {
+            loading = false;
+            if (status.textContent === "正在读取服务目录…") status.textContent = "";
+            refresh();
+          });
+        };
+        $("[data-reload]").addEventListener("click", () => { void discover(); });
+        void discover();
+        return {element: section, refresh, isDirty, removalWarning, commit, showError,
+          connectionRemovals() {
+            parsedDrafts();
+            return mode === "all" ? [] : savedModels().filter((model) => !picked.has(key(model.kind, model.model))).map((model) => model.id);
+          },
+        };
+      }
 
-        refreshRows();
-        return {element: section, refresh: refreshRows};
+      // 账号区：套餐、账号与各窗口的已用比例和重置时间；只有驱动提供额度的连接才显示。
+      function renderAccount(slot, connection) {
+        const reading = quotas.get(connection.id);
+        slot.hidden = !reading;
+        if (!reading) return;
+        const read = reading.readAt ? `${relativeTime(reading.readAt)}读取` : "尚未读到";
+        slot.innerHTML = `<span class="settings-detail-key">账号</span><div class="settings-detail-value settings-account-box">
+          <div class="settings-account-top"><strong></strong><span class="settings-account-plan"></span><small></small>
+          <button type="button" class="settings-text-button" data-quota-refresh>刷新额度</button></div>
+          <div class="settings-account-meters"></div><p class="settings-model-hint" data-quota-note></p></div>`;
+        slot.querySelector("strong").textContent = reading.account || connection.name;
+        slot.querySelector(".settings-account-plan").textContent = reading.plan;
+        slot.querySelector(".settings-account-plan").hidden = !reading.plan;
+        slot.querySelector(".settings-account-top small").textContent = reading.balance ? `余额 ${reading.balance} · ${read}` : read;
+        const meters = slot.querySelector(".settings-account-meters");
+        for (const span of reading.windows) {
+          const used = Math.max(0, Math.min(100, Math.round(span.usedPercent)));
+          const meter = document.createElement("div");
+          meter.className = "settings-account-meter";
+          meter.innerHTML = `<span></span><span class="settings-quota-bar"><i></i></span><span></span>`;
+          meter.children[0].textContent = span.label;
+          meter.children[1].classList.toggle("is-high", used >= 80);
+          meter.querySelector("i").style.inlineSize = `${used}%`;
+          meter.children[2].textContent = span.resetsAt ? `已用 ${used}% · ${resetTime(span.resetsAt)}重置` : `已用 ${used}%`;
+          meters.append(meter);
+        }
+        slot.querySelector("[data-quota-note]").textContent = [reading.note, reading.error && `最近一次读取失败：${reading.error}`].filter(Boolean).join("；");
+        const refresh = slot.querySelector("[data-quota-refresh]");
+        // 成功时账号区整体重绘；失败要留在原处说明原因，并让按钮可以再点。
+        refresh.addEventListener("click", () => {
+          refresh.disabled = true;
+          loadQuotas(true).catch((reason) => {
+            slot.querySelector("[data-quota-note]").textContent = `刷新失败：${reason instanceof Error ? reason.message : String(reason)}`;
+          }).finally(() => { refresh.disabled = false; });
+        });
       }
 
       function restoreFocus(trigger) {
@@ -1111,6 +1481,15 @@ function registerModels(ctx, mount) {
             body: JSON.stringify({type: "cancel_auth", attempt_id: attemptId}),
           },
         ));
+        // 订阅登录建好的新连接默认跟随服务商目录；目录读不到时保持空，用户可在详情里重新读取。
+        const followCatalog = async () => {
+          try {
+            const receipt = await command({type: "set_catalog_mode", expected_revision: catalog.revision, connection_id: connectionId, mode: "all"});
+            await setDefaultIfMissing(receipt.revision);
+          } catch (reason) {
+            showNotice(`已登录，但没能读取模型目录：${reason instanceof Error ? reason.message : String(reason)}`);
+          }
+        };
         const setDefaultIfMissing = async (revision, preferredModelId = "") => {
           if (auth.closed || catalog.roleBindings.default) return;
           const modelId = preferredModelId || catalog.models.find(
@@ -1158,6 +1537,11 @@ function registerModels(ctx, mount) {
             if ((!connection && !created) || !catalog.models.some((model) => model.id === modelId && model.connectionId === connectionId)) throw new Error("请选择此连接的现有模型");
             await request("/api/dashboard/models/command", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({type:"verify_model", expected_revision:catalog.revision, model_id:modelId})});
           },
+          async setCatalogMode(mode) {
+            if (!connection && !created) throw new Error("请先保存连接");
+            const receipt = await command({type: "set_catalog_mode", expected_revision: catalog.revision, connection_id: connectionId, mode});
+            if (mode === "all") await setDefaultIfMissing(receipt.revision);
+          },
           async removeModel(modelId) {
             if ((!connection && !created) || !catalog.models.some((model) => model.id === modelId && model.connectionId === connectionId)) throw new Error("请选择此连接的现有模型");
             await command({type: "remove_model", expected_revision: catalog.revision, model_id: modelId});
@@ -1172,41 +1556,11 @@ function registerModels(ctx, mount) {
             }
           },
           async selectModels() {
-            const revision = catalog.revision;
-            const discovered = await operations.discoverSaved();
-            if (auth.closed) return false;
-            const candidates = discovered.filter((item) => item.kind === null || item.kind === "chat");
-            if (!candidates.length) throw new Error("目录没有可选择的对话模型。");
-            const saved = catalog.models.filter((model) => model.connectionId === connectionId && model.kind === "chat");
-            const picked = await candidateSheet({
-              title: `选择模型 · ${connection?.name ?? entry.label}`,
-              hint: "只保存勾选的模型；取消勾选会移除配置，聊天引用自动跟随默认模型。",
-              confirmLabel: "保存选择", candidates,
-              checked: new Set(saved.map((model) => model.model)),
-              present: new Set(saved.map((model) => model.model)),
-              locked: new Set(),
-            });
-            if (picked === null || auth.closed) return false;
-            if (catalog.revision !== revision) throw new Error("设置已变化，请重新探测并选择模型。");
-            const chosen = new Set(picked.map((candidate) => candidate.model));
-            const listed = new Set(candidates.map((candidate) => candidate.model));
-            // 先添加再移除，让默认回退可以选择本次新采纳的模型。
-            const failures = [];
-            for (const candidate of picked) {
-              if (!saved.some((model) => model.model === candidate.model)) {
-                try { await operations.addModel(candidateModelInput(candidate)); }
-                catch (reason) { failures.push(`${candidate.model}：${reason instanceof Error ? reason.message : String(reason)}`); }
-              }
-              if (auth.closed) throw new Error("窗口已关闭；已提交的选择以实际结果为准。");
-            }
-            // 本次目录未覆盖的手工配置不在取消选择范围内。
-            for (const model of saved.filter((item) => listed.has(item.model) && !chosen.has(item.model))) {
-              try { await operations.removeModel(model.id); }
-              catch (reason) { failures.push(`${model.model}：${reason instanceof Error ? reason.message : String(reason)}`); }
-              if (auth.closed) throw new Error("窗口已关闭；已提交的选择以实际结果为准。");
-            }
-            if (failures.length) throw new Error(`部分完成；${failures.join("；")}`);
-            return true;
+            // 详情里已有暂存的勾选：插件的「保存并选择模型」即提交它。
+            if (modelManager) return modelManager.commit(operations);
+            // 新建流程不在这里挑模型：创建成功后宿主展开新连接的详情，在模型标签里勾选。
+            if (!created) throw new Error("请先完成连接");
+            return false;
           },
           async addModel(input) {
             if (!connection && !created) throw new Error("请先保存连接");
@@ -1237,6 +1591,26 @@ function registerModels(ctx, mount) {
             created = true;
             if (input.model.kind === "chat") await setDefaultIfMissing(receipt.revision, modelId);
           },
+          // 只填密钥的新建：Models 读目录并把对话模型一起收进来，失败就什么都不写。
+          async createConnection(input) {
+            if (connection || created) throw new Error("已有连接不能重复创建");
+            const receipt = await command({
+              type: "add_connection",
+              expected_revision: catalog.revision,
+              connection_id: connectionId,
+              name: input.name,
+              driver_id: entry.id,
+              endpoint: input.endpoint,
+              auth_identity: `api:${connectionId}`,
+              credential: input.credential,
+              driver_config: input.driverConfig,
+              catalog_mode: input.catalogMode ?? "all",
+              adopt_models: input.adoptModels ?? [],
+            });
+            created = true;
+            const hinted = catalog.models.find((model) => model.connectionId === connectionId && model.model === input.modelHint);
+            await setDefaultIfMissing(receipt.revision, hinted?.id ?? "");
+          },
           async update(input) {
             if (!connection) throw new Error("新连接不能执行更新");
             await command({
@@ -1248,6 +1622,7 @@ function registerModels(ctx, mount) {
               auth_identity: connection.authIdentity,
               credential: input.credential,
               driver_config: input.driverConfig,
+              remove_model_ids: modelManager?.connectionRemovals() ?? [],
             });
           },
           async startAuth(input) {
@@ -1266,7 +1641,10 @@ function registerModels(ctx, mount) {
             const receipt = await command({type: "finish_auth", expected_revision: catalog.revision, attempt_id: attemptId});
             if (receipt.status !== "pending") {
               auth.complete(attemptId);
-              if (receipt.status === "committed") created = true;
+              if (receipt.status === "committed" && !connection && !created) {
+                created = true;
+                await followCatalog();
+              }
             }
             return receipt;
           },
@@ -1297,12 +1675,13 @@ function registerModels(ctx, mount) {
           if (auth.closed) throw new Error("窗口已关闭；已提交请求以实际结果为准。");
           if (busy) throw new Error("请求仍在执行，请等待结果后再操作。");
           busy = true;
+          syncFooter();
           try {
             const result = await action(...args);
             if (auth.closed) throw new Error("窗口已关闭；已提交请求以实际结果为准。");
             return result;
           }
-          finally { busy = false; }
+          finally { busy = false; syncFooter(); }
         }])));
         const dialogHost = document.createElement("section");
         dialogHost.className = "settings-dialog settings-dialog--inline";
@@ -1329,8 +1708,14 @@ function registerModels(ctx, mount) {
           window.removeEventListener("akashic:before-navigate", navigate);
           window.removeEventListener("beforeunload", unload);
         };
-        let disposeEntry, modelManager;
+        let disposeEntry, modelManager, footer;
         let disposed = false;
+        const syncFooter = () => {
+          if (!footer) return;
+          dialogHost.inert = busy;
+          footer.querySelector("[data-save]").disabled = busy;
+          footer.querySelector("[data-save]").textContent = busy ? "正在保存…" : "保存";
+        };
         const editor = {
           kind: session.kind,
           connectionId,
@@ -1338,6 +1723,7 @@ function registerModels(ctx, mount) {
           head: session.head,
           busy: () => busy,
           dirty: () => providerDirty || modelsDirty,
+          refresh: () => modelManager?.refresh(),
           dispose() {
             if (disposed) return;
             disposed = true;
@@ -1351,20 +1737,26 @@ function registerModels(ctx, mount) {
             session.head.setAttribute("aria-expanded", "false");
             session.host.hidden = true;
             session.host.replaceChildren();
-            if (session.kind === "create") {
-              addList.hidden = false;
-              // 新建成功后已有连接，添加面板收回虚线入口；取消则保留方式列表。
-              if (catalog?.connections.length) setAddPanel(false);
-            } else if (catalog) {
+            if (session.kind !== "create" && catalog) {
               renderConnections(catalog.connections);
             }
             // 与旧弹窗 close 触发回读一致：关闭编辑器即核对权威目录，
             // 覆盖「写入已提交但读取失败」后内存旧值的不确定性。
-            if (!closed) report(reads.run(canRefresh));
+            if (!closed) report(reads.run(canRefresh, true));
             restoreFocus(trigger);
           },
         };
         activeEditor = editor;
+        const finish = (message) => {
+          if (message) showNotice(message);
+          closeActiveEditor(true);
+          // 新建成功回到连接列表并展开新连接；取消新建则留在目录里继续挑。
+          if (session.kind !== "create") return;
+          setAddPanel(false);
+          if (!created) return;
+          openAfterCreate = connectionId;
+          openCreated();
+        };
         try {
           disposeEntry = connectionTypes.render(entry.id, dialogHost, {
             get state() {
@@ -1382,8 +1774,12 @@ function registerModels(ctx, mount) {
               if (auth.closed) return;
               providerDirty = false;
               reportDirty();
-              showNotice(message);
-              closeActiveEditor(true);
+              // 插件只保存了连接本身时，宿主接着提交暂存的模型改动再收起。
+              if (modelManager?.isDirty()) {
+                actions.selectModels().then(() => finish(message)).catch((reason) => modelManager.showError(reason));
+                return;
+              }
+              finish(message);
             },
           });
         } catch (error) {
@@ -1392,7 +1788,6 @@ function registerModels(ctx, mount) {
           session.head.setAttribute("aria-expanded", "false");
           session.host.hidden = true;
           session.host.replaceChildren();
-          if (session.kind === "create") addList.hidden = false;
           showError(error);
           return;
         }
@@ -1400,52 +1795,98 @@ function registerModels(ctx, mount) {
           const dialogBody = dialogHost.querySelector(".settings-dialog-body") ?? dialogHost;
           modelManager = buildModelManager({
             connection,
-            entry,
             actions,
+            readCatalog: () => operations.discoverSaved(),
             dialogClosed: () => auth.closed,
             dirty(value) { if (!auth.closed) { modelsDirty = value; reportDirty(); } },
-            finishDisable: () => {
-              providerDirty = false; modelsDirty = false;
-              props.dirty?.(false);
-              showNotice("连接已停用，历史数据保留。请添加正确用途的新连接。");
-              closeActiveEditor(true);
-            },
           });
           dialogBody.appendChild(modelManager.element);
+          const accountRow = modelManager.element.querySelector("[data-account]");
+          dialogBody.prepend(accountRow);
+          modelManager.refresh();
+          // 编辑态由宿主统一底栏：插件自己的标题与底栏隐藏，保存时插件表单有改动才交给插件提交。
+          dialogHost.classList.add("is-edit");
+          footer = document.createElement("footer");
+          footer.className = "settings-detail-footer";
+          footer.innerHTML = `<button type="button" class="settings-secondary-button" data-cancel>取消</button><button type="button" class="settings-primary-button" data-save>保存</button>`;
+          dialogHost.append(footer);
+          syncFooter();
+          const saveButton = footer.querySelector("[data-save]");
+          dialogHost.addEventListener("input", (event) => {
+            if (!(event.target instanceof Element) || event.target.closest(".settings-inline-confirm")) return;
+            clearInlineConfirm(dialogHost);
+          });
+          dialogHost.addEventListener("change", (event) => {
+            if (!(event.target instanceof Element) || event.target.closest(".settings-inline-confirm")) return;
+            clearInlineConfirm(dialogHost);
+          });
+          footer.querySelector("[data-cancel]").addEventListener("click", () => {
+            clearInlineConfirm(dialogHost);
+            closeActiveEditor();
+          });
+          const performSave = () => {
+            const form = dialogHost.querySelector("form");
+            if (providerDirty && form) { form.requestSubmit(); return; }
+            actions.selectModels()
+              // 没有改动时保存就是收起卡片，不再弹一条与下一步无关的提示。
+              .then((saved) => finish(saved ? `${connection.name} 的修改已保存` : ""))
+              .catch((reason) => modelManager.showError(reason));
+          };
+          const snapshotRemovalState = () => JSON.stringify({
+            warning: modelManager.removalWarning() ?? "",
+            revision: catalog?.revision ?? 0,
+            bindings: catalog?.roleBindings ?? null,
+            embedding: catalog?.defaultEmbeddingModelId ?? null,
+          });
+          const requestSave = () => {
+            const warning = modelManager.removalWarning();
+            if (!warning) { performSave(); return; }
+            const snapshot = snapshotRemovalState();
+            promptInlineConfirm(
+              dialogHost,
+              warning,
+              "确认移除并保存",
+              () => {
+                // 若确认期间草稿、默认绑定或目录版本发生变化，拒绝沿用旧提示，要求按最新状态重新确认。
+                if (snapshotRemovalState() !== snapshot) {
+                  requestSave();
+                  return;
+                }
+                performSave();
+              },
+              footer,
+              saveButton,
+            );
+          };
+          saveButton.addEventListener("click", requestSave);
         }
         const leaveDocument = event => { if (!event.persisted) report(auth.close()); };
         window.addEventListener("pagehide", leaveDocument);
       }
 
-      for (const template of providerTemplates) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "settings-connection-card";
-        button.appendChild(providerMark(template));
-        const copy = document.createElement("span");
-        copy.className = "settings-card-copy";
-        const title = document.createElement("strong");
-        const detail = document.createElement("small");
-        title.textContent = template.label;
-        detail.textContent = template.detail;
-        copy.append(title, detail);
-        button.append(copy);
-        button.insertAdjacentHTML("beforeend", CHEVRON_ICON);
-        button.lastElementChild.classList.add("settings-template-action");
-        button.addEventListener("click", () => startCreate(template, button));
-        addList.appendChild(button);
-      }
+      renderTemplates();
       if (!providerTemplates.length) addList.textContent = "没有 Provider 插件提供连接方式。";
       addToggle.addEventListener("click", () => {
-        if (addPanel.hidden) { setAddPanel(true); return; }
+        if (activeEditor && !closeActiveEditor()) return;
+        setAddPanel(true);
+      });
+      addClose.addEventListener("click", () => {
         if (activeEditor?.kind === "create" && !closeActiveEditor()) return;
         setAddPanel(false);
+      });
+      templateSearch.addEventListener("input", () => {
+        if (activeEditor?.kind === "create" && !closeActiveEditor()) return;
+        renderTemplates();
       });
       searchInput.addEventListener("input", () => {
         query = searchInput.value;
         if (catalog) renderCatalog();
       });
-      report(load());
+      if (catalogResource.current) {
+        catalog = catalogResource.current;
+        renderCatalog();
+      }
+      report(reads.run());
 
       return () => {
         closed = true;
@@ -1470,6 +1911,18 @@ function requireProviderEntry(entry) {
   return entry;
 }
 
+// 按付费方式分组；模板或连接类型用 group 声明，未声明的归入按量付费。
+const TEMPLATE_GROUPS = [
+  ["subscription", "订阅", "按月付费，能看到额度"],
+  ["provider", "按量付费", "用 API 密钥，按 token 计费"],
+  ["custom", "自定义", "任何 OpenAI 或 Gemini 兼容的地址"],
+];
+
+function templateGroup(template) {
+  const group = template.group ?? template.owner.group;
+  return TEMPLATE_GROUPS.some(([id]) => id === group) ? group : "provider";
+}
+
 function templatesFor(entry) {
   const templates = Array.isArray(entry.templates) && entry.templates.length ? entry.templates : [entry];
   return templates.map((template) => {
@@ -1485,11 +1938,23 @@ function editTemplate(entry) {
   return templates.find((template) => template.id === entry.editTemplateId) ?? templates[0];
 }
 
-function connectionMark(entry, fallback) {
-  return providerMark({icon: entry?.connectionIcon}, fallback);
+function connectionMark(entry, connection) {
+  return providerMark({icon: connectionIcon(entry, connection)});
 }
 
-function providerMark(entry, fallback) {
+// 同一驱动接多家服务（兼容 API）时，按连接地址的主机找到对应模板的品牌图标。
+function connectionIcon(entry, connection) {
+  const host = connection?.endpointHost;
+  const template = host ? entry?.templates?.find((item) => item.icon && endpointHost(item.defaults?.endpoint) === host) : null;
+  return template?.icon ?? entry?.connectionIcon;
+}
+
+function endpointHost(endpoint) {
+  try { return new URL(endpoint).hostname; } catch { return ""; }
+}
+
+// 有插件声明的品牌图标就用它；没有时用中性的服务器图标，不拿首字母充当标识。
+function providerMark(entry) {
   const mark = document.createElement("span");
   mark.className = "settings-connection-mark";
   mark.setAttribute("aria-hidden", "true");
@@ -1498,10 +1963,8 @@ function providerMark(entry, fallback) {
     image.src = entry.icon;
     image.alt = "";
     mark.appendChild(image);
-  } else if (fallback) {
-    mark.textContent = String(fallback).slice(0, 1).toUpperCase();
   } else {
-    mark.innerHTML = KEY_ICON;
+    mark.innerHTML = SERVER_ICON;
   }
   return mark;
 }
@@ -1510,13 +1973,13 @@ export function createLatestCatalogRead(read, apply) {
   let active = null;
   let closed = false;
   return {
-    async run(canApply = () => true) {
+    async run(canApply = () => true, fresh = false) {
       if (closed) return;
       active?.abort();
       const controller = new AbortController();
       active = controller;
       try {
-        const value = await read(controller.signal);
+        const value = await read(controller.signal, fresh);
         if (!closed && active === controller && canApply()) apply(value);
       } catch (error) {
         if (!controller.signal.aborted) throw error;
@@ -1580,11 +2043,6 @@ export function capabilitySummary(models) {
     visionCount ? `${visionCount} 个可看图` : "",
     unknownCount ? `${unknownCount} 个待识别` : "",
   ].filter(Boolean).join(" · ");
-}
-
-export function modelsForRole(models, role) {
-  if (role !== "vision") return models;
-  return models.filter((model) => model.capabilities.inputModalities.includes("image"));
 }
 
 // 模型与探测候选共享同一组能力徽标：上下文、多模态、开放强度。
@@ -1658,6 +2116,24 @@ export function formatTokenCount(value) {
   if (number % 1_000_000 === 0) return `${number / 1_000_000}M`;
   if (number % 1000 === 0) return `${number / 1000}K`;
   return String(number);
+}
+
+// 读取时间写成「刚刚 / N 分钟前 / N 小时前」，超过一天给日期。
+function relativeTime(iso) {
+  const minutes = Math.floor((Date.now() - Date.parse(iso)) / 60_000);
+  if (!Number.isFinite(minutes) || minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时前`;
+  return `${resetTime(iso)} `;
+}
+
+// 重置时间：一天内只写钟点，否则带上月日。
+function resetTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const time = date.toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit", hour12: false});
+  const sameDay = Math.abs(date.getTime() - Date.now()) < 24 * 3600_000 && date.getDate() === new Date().getDate();
+  return sameDay ? `${time} ` : `${date.getMonth() + 1}月${date.getDate()}日 ${time} `;
 }
 
 function randomToken() {

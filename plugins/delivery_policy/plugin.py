@@ -10,6 +10,7 @@ from typing import cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent.plugin_composition import (
+    stop_spawned,
     RUNTIME_STARTED,
     RUNTIME_STARTING,
     RUNTIME_STOPPING,
@@ -29,7 +30,7 @@ from plugins.delivery.contract import (
 )
 from plugins.conversation.contract import CHECK_ORIGIN, OriginCheck
 from plugins.reply.contract import REPLY_COMPLETION
-from .follow import follow
+from .follow import RouteError, follow
 
 logger = logging.getLogger(__name__)
 
@@ -191,19 +192,29 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.effect(lambda: close_recovery, label="pending-delivery")
 
     def select(reader: MessageReader, message: Message) -> tuple[Mapping[str, object], ...] | None:
-        if message.source not in config.sources or reader.attributes.visibility == "internal":
+        if message.author == "delivery" or message.source not in config.sources or reader.attributes.visibility == "internal":
             return None
-        route = origin(reader, message, config.sources, check_origin=origin_check)
+        try:
+            route = origin(reader, message, config.sources, check_origin=origin_check)
+        except ValueError as error:
+            raise RouteError(f"输入渠道无效: {error}") from error
         if route is None:
             return ()
         name, address = route
-        binding = ctx.require(DELIVERY_SENDERS).bind(name, ctx.require(BINDINGS))
+        try:
+            binding = ctx.require(DELIVERY_SENDERS).bind(name, ctx.require(BINDINGS))
+        except KeyError as error:
+            raise RouteError(f"渠道 {name} 没有已注册的发送者") from error
         return ({"name": name, "binding_id": binding, "address": address},)
 
     class ReplyCompletion:
         def activity(self, reader: MessageReader, source: str) -> AbstractContextManager[None]:
-            route = (input_origin(reader, source, through_seq=reader.head(), check_origin=origin_check)
-                     if source in config.sources and reader.attributes.visibility != "internal" else None)
+            try:
+                route = (input_origin(reader, source, through_seq=reader.head(), check_origin=origin_check)
+                         if source in config.sources and reader.attributes.visibility != "internal" else None)
+            except ValueError:
+                # No target can be held; select records the route failure once a reply exists.
+                return nullcontext()
             return nullcontext() if route is None else current_delivery().activity(*route)
 
         @asynccontextmanager
@@ -222,9 +233,9 @@ async def apply(ctx: Context) -> None:
                     yield
                 finally:
                     for message in reader.snapshot(after_seq=head):
-                        if message.source != source or origin(
-                            reader, message, config.sources, check_origin=origin_check,
-                        ) is None:
+                        if (message.source != source or source not in config.sources
+                                or reader.attributes.visibility == "internal"
+                                or not isinstance(message.body, Output) or message.body.finish != "complete"):
                             continue
                         try:
                             if delivery.selection(message.message_id) is None:
@@ -244,6 +255,9 @@ async def apply(ctx: Context) -> None:
                                     raise
                                 if permit is not None:
                                     task.on_done(permit.release)
+                        except RouteError as error:
+                            logger.warning("[paused] 选路失败，登记 rejected 回执，该消息不会送出：message=%s 原因=%s", message.message_id, error)
+                            _ = await delivery.reject_async(reader, message, str(error))
                         except Exception:
                             # 回复事实已提交；发送失败不能反向改写来源为推理失败。
                             logger.exception("回复发送未结算，保留原效果 message=%s", message.message_id)
@@ -258,12 +272,7 @@ async def apply(ctx: Context) -> None:
 
     async def stop(_event: object) -> None:
         try:
-            if watcher is not None:
-                _ = watcher.cancel()
-                try:
-                    await watcher
-                except asyncio.CancelledError:
-                    pass
+            await stop_spawned(watcher)
         finally:
             close_recovery()
 

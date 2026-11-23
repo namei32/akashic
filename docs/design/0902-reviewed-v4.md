@@ -85,7 +85,7 @@
 | 连续 control ID 与 proactive 特殊分组 | [`logical_history_unit_ranges`](../../session/manager.py)，190 行 |
 | 按全部 user IDs 与 final assistant ID 建立 Akasha 样本 | `AkashaEngine._commit_source_event`（历史删除：`plugins/akasha/engine.py`），1211 行 |
 | 插件发布借用父 Turn terminal 触发 | [`TurnPluginRollout.turn_terminal`](../../agent/plugins/turn_rollout.py)，205 行 |
-| 来源无关的一次性等待、Scheduler 业务状态 | [`PluginTimers`](../../agent/plugin_composition/timers.py)、[`Scheduler message plugin`](../../plugins/scheduler/plugin.py) |
+| 来源无关的一次性等待、Scheduler 业务状态 | [`PluginTimers`](../../agent/plugin_composition/timers.py)、[`Scheduler message plugin`](https://github.com/kachofugetsu09/akashic-plugins/blob/main/plugins/scheduler/plugin.py) |
 
 Citation 与 Meme 的本地源码也显示了另一类耦合：Citation 改共享 `ctx.reply` 并提取引用，Meme 改同一正文和 media，Meme Prompt 还依赖 `citation.prompt`。检查路径是 `/mnt/data/coding/akashic-plugin/citation/plugin.py` 与 `/mnt/data/coding/akashic-plugin/meme/plugin.py`。这些 checkout 声明的是 V2 接口，只证明该份源码的依赖，不证明正式运行中的安装版本；迁移前必须核对正式 generation 对应的源码、cache 和实际消费者。
 
@@ -353,7 +353,7 @@ Models 聊天的调用读取、开始、首字与终结记账使用现有有界�
 完成记账期间取消也等待实际提交，成功回执保持可回放。这里没有诊断与前台的独立线程额度保证，
 同步 Settings、credential 与 key_recovery 等额外路径仍需独立核对。
 
-预算必须注明适用范围。单次请求内的纠正/传输重试计数可以在内存；默认来源的已完成循环步数从最后 complete/quiet 或 abandon 边界后的 Output 重建，不因 scope 替换归零。按 [0129](../decisions/0129-exhausted-react-budget-renews-on-new-input.md)，达到上限并记录 failure 后，同来源新的用户 Input 可以重新取得循环额度；这不改变 Turn、工具回执和历史保留边界。若配置跨重启的模型调用/费用硬上限，额度 owner 在发请求前耐久占额，Model owner 保存实际调用、binding、usage 或 unknown；未知费用不得算作零。调用方用来源与边界消息引用绑定额度，Model 只接收额度凭据，无需理解 Session/Turn。没有这套 provider/query 证据时，只能承诺本地调用次数限制，不能声称精确费用硬上限。
+预算必须注明适用范围。单次请求内的纠正/传输重试计数可以在内存；默认来源的已完成循环步数从最后 complete/quiet 或 abandon 边界后的 Output 重建，不因 scope 替换归零。若配置跨重启的模型调用/费用硬上限，额度 owner 在发请求前耐久占额，Model owner 保存实际调用、binding、usage 或 unknown；未知费用不得算作零。调用方用来源与边界消息引用绑定额度，Model 只接收额度凭据，无需理解 Session/Turn。没有这套 provider/query 证据时，只能承诺本地调用次数限制，不能声称精确费用硬上限。
 
 Tool Search 自己提供候选 schema 和选择状态。ReAct 只取得 tool view，不识别字符串 `tool_search`，更不写 `message_push._commit_role=passive`。工具发现不等于授权；Tool 执行边界始终验证真实权限。可见工具集、LRU/preload 属于发现插件，catalog 注册与 exact binding 属于能力 owner。
 
@@ -824,7 +824,7 @@ Observe 不依靠最终 Turn 事件夹带整份 context/tool/model 状态。Mode
 外部插件适配使用以下窄接口：
 
 - `Content.register(..., prepare=...)` 在每次 `bind()` 内一次性固定动态 TextProtocol 的提示与 decoder。prepare 不能改变协议名或内容 schema；归档声明不保存可变分类提示。分类与选图仍由协议插件拥有。
-- `Tools.register_authorize(...)` 为工具登记最终参数的限制 owner。工具 prepare 后依次执行固定 binding 中的限制和调用程序的 authorize；缺少已固定的限制时明确失败，旧 binding 不借用当前规则。
+- `Tools.register_authorize(...)` 为工具登记最终参数的限制 owner。工具 prepare 后依次执行该工具当前注册的限制和调用程序的 authorize。限制不写进 binding：限制插件撤下或换代后，旧 binding 按当前状态执行，撤下即放行（fail-open），与新建 binding 一致；固定限制只会让旧调用永久打不开（2026-10-30 shell_safety 事故，#1766）。
 - `COMPACTION_SUMMARIES.head(session_id)` 只读当前发布摘要，状态命令用其确切 source message IDs 计算覆盖，不获得发布或模型权限。
 - 历史方案（2026-10-15 随 Observe 退役删除，调用账保留）：Models 的 `MODEL_CALL_HISTORY(after_id, limit)` 返回调用账分页快照，包括尚未结算和未产生 Message 的请求；原 `MODEL_CALLS(id)` 仍负责点读。分页按 ID 排列，每轮必须从头开始，不能把 ID 或秒级时间戳当作跨轮提交游标。`started` 后续可更新，`error` 不能展示为已知零费用。
 - 历史方案（2026-10-15 随 Observe 退役删除，写入回执保留）：Markdown Memory 的 `MEMORY_WRITES(after, limit)` 返回 `(source_ref, kind)` 排序的独立 receipt 副本，包含 payload 与 done_at。每轮重新扫描；消费者按双键去重。draft、backup、applied 分别陈述准备、恢复点和实际文件应用事实，不能把 draft 当作写入成功。
@@ -957,7 +957,7 @@ programmatic admission 的学习资格只在 Session 创建时确定：MC01 显�
           programmatic claim.consume
 ```
 
-连接失败时，FrameBook 移除 active route，把原始 `ConnectionError` 留给 live claim；watcher 随后通过 `abort` 清理 claim 索引。断线不能把另一连接的 Output 或 restart claim 接管。
+连接失败时，FrameBook 移除 active route；只有最终 Output 尚未 drain 时才把原始 `ConnectionError` 留给 live claim，watcher 随后通过 `abort` 清理 claim 索引。已 drain 的 route 只移出索引，之后的任何错误都不推翻送达凭据：`exec`（含 `--final-only`）收到最终回复即退出并断线，若此时记错，宿主自部署会在停机前被拒绝。断线不能把另一连接的 Output 或 restart claim 接管。
 
 
 ### 18.1 第 04 层可观察边界
@@ -1569,6 +1569,8 @@ Mobile 启动只接收 MessageBus 与上传存储；目录及恢复读已绑定�
 `MODEL_CALL_STATS` 只返回调用 ID、模型名、状态、可空耗时与 usage，不公开完整 binding、auth identity、credential 或 continuation。Web `GET /api/chat/model-calls/{call_id}` 和 Mobile `model.call.get` 使用同一个已发布 Root 的窄查询；未知调用和未安装统计服务分别明确失败。Mobile 查询是 ephemeral，不保存 command receipt。查询、刷新和重连均不写 Message、调用账或其他运行状态。
 
 两端输入框优先显示当前活动调用，空闲时读取最后一条模型 Output 的调用 ID。流式生成期间每秒刷新同一记录；完整且准确的 usage 才以 `output_tokens / ((duration_ms - first_token_ms) / 1000)` 显示平均速度。缺失、部分用量、未结算或非正生成时长不估算速度；旧记录不从秒级时间戳推算耗时。切会话、断线和组件卸载取消旧查询，迟到结果不能显示到另一会话。原 ClientTurnMetricsTracker 已无活跃 UI 调用，留待统一清理。
+
+> 勘误（2026-10，插件边界收口）：`/api/chat/model-calls/{call_id}` 已删除。聊天状态行改为 `composer.status` 插件插槽，由 models 插件经插件界面查询 `call.latest` 读取最近一次执行的调用统计；宿主不再解析 `model.facts`，也不借用 `MODEL_CALL_STATS`。
 
 本分项增加 yoyo `20260906_06_model_call_timing`，旧 `model_calls` 只加两列，已有行均为 NULL；未知 schema 或额外索引/触发器拒绝迁移。先建立 SQLite 恢复副本，再原子执行 DDL，提交前核对旧字段与最终 schema。新库与已迁移库使用同一个 schema，重复迁移不增加备份或改写旧记录。Models owner 仍只 INSERT 新调用、原位结算该调用；没有失效或自动删除协议，历史 Message、模型设置 revision 与 credential 保持不变。源码恢复点为 `/tmp/model-call-stats-backup-20260906/`。
 

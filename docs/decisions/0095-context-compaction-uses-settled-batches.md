@@ -1,10 +1,25 @@
 # 0095 · 请求摘要按已结算工具批次切分
 
 - 状态：accepted
+- 后续勘误：[0157](0157-background-idle-compaction.md) 允许同一 owner 在后台提前生成空闲摘要；其余数据与批次合同不变。
 - 日期：2026-10-06
 - 关联条款：CTX-001、CTX-003、CTX-007、MEM-011、MEM-012
 - 部分 supersedes：0030、0052、0068 的整 Turn 请求切点与 20K 最低保留量；原数据、插件 owner 和单窗口摘要合同不变。
 - 勘误（2026-10-18）：第 4 条此前实现为只接受软水位以下的切点，当前输入本身较大时直接阻断；现按原意执行。另补充图片估算（第 7 条）、输出余量（第 8 条，修订 0030 的 `context_window - request_max_output_tokens`）与摘要预算（第 9 条）。
+
+> 2026-10-25：连续前缀与只处理末尾增量的约束由 [0134](0134-compaction-covers-message-identities.md)
+> 替代。工具批次配对、容量、原消息保全和真实摘要输入分区规则保持有效。
+> 2026-11-09：新增参考 Claude Code `timeBasedMCConfig` 的请求前空闲压缩触发（`trigger="idle"`）：
+> 支持按 `idle_scope`（`selected` 绑定指定对话、`all` 全部对话、`off` 关闭）与 `idle_sessions`
+> 选择启用空闲预压缩的会话；当命中范围内的会话新回合尾部 `Input` 距上一条已结算非 `Input` 消息
+> 达到 `idle_trigger_minutes`（默认 60 分钟，服务端 KV 缓存已过期）且完整请求估算达到
+> `idle_trigger_tokens`（默认 200,000 tokens）时，在发送首步请求前按同一已结算批次切点生成
+> 增量摘要并保留近期原文目标（默认 20,000 tokens）。设置状态同时返回候选对话的消息规模、
+> 历史压缩次数与最近压缩前后 token 等信息供界面选择。
+> 2026-11-09 补充：空闲路径是可选优化，边界见下方“空闲预压缩”；启用后的数据是前向变更，回滚步骤在同一节。
+> 2026-11-20：撤掉请求前（前台）空闲压缩，空闲预压缩只由后台巡检在静默期完成；前台回合只在软水位
+> （74%）、硬容量或强制时压缩。起因：后台压完仍高于 `idle_trigger_tokens` 时，前台把后台写的边界当作
+> 缺口起点，又在用户发消息时同步压了一遍（生产实测挡住回合 46 秒）。材料注册的 `reduce_due` 扩展点随之删除。
 
 ## 背景
 
@@ -40,7 +55,7 @@
    计费无关；按字符计时三张手机截图即可把估算推过窗口。Codex、Claude Code、Pi、DSH
    都按固定或按尺寸计价，不按编码长度。
 
-8. `context_window` 是输入上限（与 `litellm_capabilities` 的口径一致）。硬容量为
+8. `context_window` 是输入上限（与 `modelsdev_capabilities` 的口径一致）。硬容量为
    `context_window - output_reserve`，余量取 `min(max_output_tokens 或 16384, 16384, 窗口/4)`，
    同 Pi 的 `reserveTokens` 且小窗口按比例留。不再整段扣除模型最大输出：272K 窗口扣 128K
    后硬容量只剩 144K，低于 74% 软水位。会发送输出上限的驱动由 Context 把本次上限收紧到
@@ -78,6 +93,35 @@
 Message 正常只追加；本次无既有消息原位更新、逻辑失效或物理减少。摘要 owner 只新增
 不可变 v2 记录，以现有事务和 parent CAS 推进 head；旧摘要与调用账保留。没有 schema
 迁移或自动删除。诊断随原生成准备恢复，不要求重跑摘要。源码基线由 Git 保留。
+
+## 空闲预压缩
+
+空闲预压缩只在后台巡检里做，不挡任何回合（2026-11-20 起前台不再判定空闲）：
+
+- 巡检对范围内、末条会话消息已结算且静默达到 `idle_trigger_minutes`、估算达到 `idle_trigger_tokens`
+  的会话压缩，并写出 `compaction.boundary`；新回合到来时只等正在进行的巡检让出会话。
+- 失败只记日志，模型调用期限 120 秒。
+- 同一静默期（末条会话消息）只试一次；已写边界的静默期不再试。
+- `(session_id, binding_id)` 连续失败 3 次后跳过；成功（含软水位和强制压缩）、换模型或保存模型设置后清零。
+  这些记录只在进程内，重启后重新尝试；force 与硬水位路径不读它们。
+- 计划节省不足请求估算的 20% 时（新摘要按父摘要原长算）不调用模型。
+
+### 回滚
+
+启用后写出的数据是前向变更：`trigger="idle"` 的摘要记录和 `idle_*` 配置都不能被 #1945
+之前的版本读取。前者让该会话每轮失败，后者因 `extra="forbid"` 校验失败让所有会话每轮失败。
+写入时不把 `trigger` 改存成 `soft_limit`，保留真实来源。回滚到 #1945 之前的版本前：
+
+1. 停服务，备份 `workspace/sessions.db` 和 `workspace/plugin-data/compaction-builtin/config.input.json`。
+2. 从 `config.input.json` 删除 `idle_scope`、`idle_sessions`、`idle_trigger_minutes`、`idle_trigger_tokens`。
+3. 改写记录，再部署旧版本：
+
+   ```sql
+   UPDATE owner_records SET value = json_set(value, '$.trigger', 'soft_limit')
+   WHERE key LIKE 'summary:%' AND json_extract(value, '$.trigger') = 'idle';
+   ```
+
+只回滚 #1956 而保留 #1945/#1946 时不需要这些步骤。
 
 ## 验收
 

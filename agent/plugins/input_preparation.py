@@ -12,14 +12,21 @@ from pathlib import Path
 from typing import Literal, cast
 
 from agent.plugin_composition.config_input import load_config, config_bytes, CONFIG_INPUT
+from agent.plugins.importer import (
+    ensure_source_compiles,
+    record_source_compile,
+    source_compile_verified,
+)
 from agent.plugins.selection import PluginSelection
 from agent.plugins.manifest import (
     validate_workspace_plugin_data_path,
     workspace_plugin_data_dir,
 )
-from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments, read_environment_refs
+from agent.plugins.resources import declared_refs
+from agent.plugins.python_environment import ENVIRONMENT_FILE, PythonEnvironments, inprocess_runtime, read_environment_refs
 from agent.plugins.static_manifest import (
     PluginSourceCompileError,
+    PluginSourceContentError,
     StaticPluginManifest,
     load_static_plugin_manifest,
 )
@@ -50,6 +57,48 @@ class PreparedPluginInput:
     source_type: Literal["builtin", "installed"]
 
 
+class PluginInitialConfigError(PluginSourceContentError):
+    pass
+
+
+# Check packaged defaults without reading or changing the workspace configuration.
+def read_initial_config(plugin_dir: Path) -> tuple[dict[str, object], str] | None:
+    path = plugin_dir / "initial_config.json"
+    if path.is_symlink():
+        raise PluginInitialConfigError(f"初始配置不能是符号链接: {path}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise PluginInitialConfigError(f"初始配置必须是普通文件: {path}")
+    try:
+        config = json.loads(path.read_bytes())
+        if not isinstance(config, dict):
+            raise ValueError("初始配置必须是映射")
+        revision = hashlib.sha256(config_bytes(config)).hexdigest()
+    except ValueError as error:
+        raise PluginInitialConfigError(f"初始配置无效: {path}: {error}") from error
+    return config, revision
+
+
+# Check every Python source before publishing an installation pointer.
+def check_plugin_source(code_dir: Path) -> None:
+    for source_path in sorted(code_dir.rglob("*.py")):
+        if any(part in {"__pycache__", ".venv", "node_modules"} for part in source_path.parts):
+            continue
+        try:
+            source_bytes = source_path.read_bytes()
+            # UTF-8 严格性保持不变；同一内容只在首次真正编译，之后以内容哈希
+            # 事实命中；未命中时经与导入共用的 PEP 552 缓存编译，同时温暖导入。
+            source_bytes.decode("utf-8")
+            if not source_compile_verified(source_bytes):
+                ensure_source_compiles(source_bytes, str(source_path))
+                record_source_compile(source_bytes)
+        except (SyntaxError, UnicodeError) as error:
+            raise PluginSourceCompileError(
+                f"插件源码无法编译: {source_path}"
+            ) from error
+
+
 def prepare_plugin_input(
     mod: Mapping[str, str], *, workspace: Path, selection: PluginSelection, initial: bool = False,
 ) -> PreparedPluginInput:
@@ -70,31 +119,20 @@ def prepare_plugin_input(
     data_dir = _resolve_plugin_data_dir(mod["name"], mod, workspace)
     validate_workspace_plugin_data_path(data_dir, workspace)
     config, config_revision = load_config(data_dir)
-    defaults = plugin_dir / "initial_config.json"
-    if initial and not (data_dir / CONFIG_INPUT).exists() and defaults.exists():
-        if defaults.is_symlink():
-            raise ValueError("初始配置不能是符号链接")
-        config = json.loads(defaults.read_bytes())
-        if not isinstance(config, dict):
-            raise ValueError("初始配置必须是映射")
-        config_revision = hashlib.sha256(config_bytes(config)).hexdigest()
+    if initial and not (data_dir / CONFIG_INPUT).exists():
+        defaults = read_initial_config(plugin_dir)
+        if defaults is not None:
+            config, config_revision = defaults
 
     # 2. 直接编译安装目录；外部环境变化不会被另一个代码快照隐藏。
     code_dir = plugin_dir.resolve(strict=True)
-    for source_path in sorted(code_dir.rglob("*.py")):
-        if any(part in {"__pycache__", ".venv", "node_modules"} for part in source_path.parts):
-            continue
-        try:
-            source_text = source_path.read_text(encoding="utf-8")
-            compile(source_text, str(source_path), "exec")
-        except (SyntaxError, UnicodeError) as error:
-            raise PluginSourceCompileError(
-                f"插件源码无法编译: {source_path}"
-            ) from error
+    check_plugin_source(code_dir)
 
     # 3. 准备当前选择的元数据；代码字段只表示实际安装路径。
     environments: dict[str, str] = {}
-    if identity.python:
+    if mod["source_type"] != "installed" and declared_refs(plugin_dir):
+        raise RuntimeError(f"内置插件不支持声明资源（resources.json）：{plugin_id}；资源只在安装流程里取回")
+    if identity.python or inprocess_runtime(plugin_dir) is not None or declared_refs(plugin_dir):
         if (plugin_dir / ENVIRONMENT_FILE).exists():
             environments = read_environment_refs(plugin_dir, identity)
         elif mod["source_type"] == "installed":

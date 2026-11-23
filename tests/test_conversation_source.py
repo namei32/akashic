@@ -46,12 +46,12 @@ async def test_interrupt_inputs_survive_and_old_output_cannot_commit(tmp_path):
             finally:
                 cancelled.set()
                 await drain.wait()
-        snapshot = reader.snapshot()
+        reader.snapshot()
         return writer.append("answer", Output((ContentPart("text", "answer"),), "complete"),
                              expected_source_head=reader.head(source="conversation"))
     async with source(tmp_path, run) as (conversation, log, writer, program):
         first = await conversation.accept("u1", Input(()))
-        task = await conversation.start(program)
+        await conversation.start(program)
         await entered.wait()
         await conversation.accept("u2", Input(()))
         await cancelled.wait()
@@ -78,7 +78,7 @@ async def test_source_commit_drains_before_cancel_and_rejects_late_start(tmp_pat
     from contextlib import closing as close_connection
     from agent.plugin_composition.tasks import TaskServiceClosed
     from plugins.sources.session import check_source
-    from tests.test_akasha_execution import WorkerGate, loop_turn
+    from tests.support.worker_gate import WorkerGate, loop_turn
 
     changed = []
     started = asyncio.Event()

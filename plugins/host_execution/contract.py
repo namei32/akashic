@@ -6,7 +6,6 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, Protocol
 from contextlib import AbstractAsyncContextManager
-from collections.abc import Mapping
 from enum import Enum
 import shlex
 from pydantic import BaseModel, ConfigDict
@@ -19,6 +18,11 @@ WorkloadMode = Literal["candidate", "formal"]
 
 class WorkloadEffectUnknown(RuntimeError):
     """The connection failed after Controller may have changed Docker state."""
+
+
+# Controller 在启动失败后按稳定名核实过：没有容器也没有 lease，这次请求没有留下任何资源。
+class WorkloadStartRejected(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +59,8 @@ class WorkloadStartRequest:
     limits: tuple[int, float, int]
     loopback_ports: tuple[tuple[str, int], ...] = ()
     user_namespaces: bool = False
+    udp_ports: tuple[int, ...] = ()
+    host_egress: bool = False
 
     @property
     def spec_digest(self) -> str:
@@ -66,6 +72,11 @@ class WorkloadStartRequest:
             "limits": list(self.limits), "loopback_ports": [list(item) for item in self.loopback_ports],
             "user_namespaces": self.user_namespaces,
         }
+        # 没有 UDP 端口的规格保持原摘要，升级后已有容器仍可直接接管。
+        if self.udp_ports:
+            value["udp_ports"] = list(self.udp_ports)
+        if self.host_egress:
+            value["host_egress"] = True
         return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def to_dict(self) -> dict[str, object]:
@@ -113,6 +124,9 @@ HOST_STATUS = ServiceKey[HostStatus]("host.status.v1")
 
 class ShellProcessManagerProtocol(Protocol):
     """Host-backed or local process owner used by a shell provider."""
+
+    @property
+    def raw(self) -> RawProcessBackend: ...
 
     async def exec_command(
         self,
@@ -173,10 +187,8 @@ DEFAULT_INITIAL_YIELD_TIME_MS = 10_000
 DEFAULT_MAX_OUTPUT_TOKENS = 10_000
 
 
+# 前台命令的默认硬截止；hard_timeout_s 为 0 表示不设截止。
 DEFAULT_HARD_TIMEOUT_S = 4 * 3600
-
-
-MAX_HARD_TIMEOUT_S = 4 * 3600
 
 
 class UnknownExecutionError(RuntimeError):
@@ -286,6 +298,35 @@ def clamp_write_stdin_yield_time(
     return min(max(value, MIN_EMPTY_YIELD_TIME_MS), max_empty_ms)
 
 
+@dataclass(frozen=True, slots=True)
+class RawProcessOutput:
+    data: bytes
+    next_offset: int
+    eof: bool
+    exit_code: int | None
+
+
+class RawProcessBackend(Protocol):
+    async def open(self, *, owner: str, argv: tuple[str, ...], cwd: str, env: dict[str, str]) -> str: ...
+    async def read(self, *, owner: str, identity: str, stream: str, offset: int) -> RawProcessOutput: ...
+    async def write(self, *, owner: str, identity: str, data: bytes) -> None: ...
+    async def close(self, *, owner: str, identity: str) -> bool: ...
+
+
+# Binary protocol pipes owned by the calling plugin and manager lease. Children get a
+# minimal host env (PATH, HOME, locale...) plus the explicit env; nothing else is inherited.
+class ProcessStreams(Protocol):
+    async def open(self, ctx: Context, owner_key: str, *, argv: tuple[str, ...], cwd: str,
+                   env: dict[str, str]) -> str: ...
+    async def read(self, ctx: Context, owner_key: str, *, identity: str, stream: str,
+                   offset: int) -> RawProcessOutput: ...
+    async def write(self, ctx: Context, owner_key: str, *, identity: str, data: bytes) -> None: ...
+    async def close(self, ctx: Context, owner_key: str, *, identity: str) -> bool: ...
+
+
+PROCESS_STREAMS = ServiceKey[ProcessStreams]("host.process_streams.v1")
+
+
 class Processes(Protocol):
     def resolve_shell(self, requested: str | None = None) -> ResolvedShell: ...
     def requirements_checker(self) -> RequirementsChecker | None: ...
@@ -352,7 +393,7 @@ class ResolvedShell:
 
 PathStatus = Literal[
     "available", "not_found", "not_directory", "permission_denied",
-    "not_file", "too_large", "invalid_text", "io_error", "offline",
+    "not_file", "too_large", "invalid_text", "binary", "io_error", "offline",
 ]
 
 
@@ -360,6 +401,7 @@ class DirectoryEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str
     path: str
+    kind: Literal["directory", "file", "other"] | None = None
 
 
 class AgentsChainFile(BaseModel):
@@ -392,6 +434,10 @@ class PathInfo(BaseModel):
     error: str | None = None
     text: str | None = None
     bytes: int | None = None
+    mime_type: str | None = None
+    mtime_ms: int | None = None
+    truncated: bool | None = None
+    tail: bool | None = None
     items: list[DirectoryEntry] | None = None
     after: str | None = None
     parent: str | None = None
@@ -425,6 +471,22 @@ class FileImage:
 FileResult = str | FileError | FileImage
 
 
+FILE_CHUNK_BYTES = 1024 * 1024
+FILE_IMPORT_BYTES = 50 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class FileChunk:
+    data: bytes
+    filename: str
+    size: int
+    version: str
+
+
+class FileByteReader(Protocol):
+    async def read(self, path: str, *, offset: int = 0, version: str | None = None) -> FileChunk | FileError: ...
+
+
 class FileOperation(Protocol):
     async def execute(self, **arguments: Any) -> FileResult: ...
     async def aclose(self) -> None: ...
@@ -440,6 +502,7 @@ class PathReader(Protocol):
 class Files(Protocol):
     def open(self, name: str, allowed_dir: Path | None = None) -> FileOperation: ...
     def paths(self) -> AbstractAsyncContextManager[PathReader]: ...
+    def bytes(self) -> AbstractAsyncContextManager[FileByteReader]: ...
 
 
 FILES = ServiceKey[Files]("host.files.v1")

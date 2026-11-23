@@ -10,14 +10,14 @@
     "bootstrap",
     "core",
     "infra",
-    "plugins/ledger"
+    "plugins/ledger",
+    "scripts/akashic_release"
   ],
   "exclude": [
     ".venv",
     ".venv-test",
     "tests",
     "private_tests",
-    "private_runtime/scripts",
     "mcp_servers",
     "eval"
   ],

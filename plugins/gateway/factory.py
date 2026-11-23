@@ -5,7 +5,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from typing import cast
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent.plugin_composition import Context
 from plugins.channels.contract import CHANNEL_INPUT_V2, ChannelInboundMessage
@@ -13,18 +13,28 @@ from plugins.ledger.contract import CHANNEL_ATTACHMENT_READ
 from .contract import CONTROL_FRAMES
 from agent.plugin_composition.host import HOST_INFO
 from plugins.ledger.contract import MESSAGE_CATALOG
-from agent.plugin_composition.plugin_updates import PLUGIN_UPDATES
+from agent.plugin_composition.plugin_updates import PLUGIN_UPDATES, UpdateStatus
 from plugins.ledger.contract import CallRef
 from plugins.ui.contract import MESSAGE_DISPLAY, message_rows
 from agent.plugin_composition.tasks import RESTART_GATE
 from plugins.ui.contract import MessagePage
 from plugins.ledger.contract import Message
 from .contract import RpcMethod
-from .errors import RuntimeClosedError
+from .errors import UpdateNotFoundError
 from .protocol.errors import JsonRpcError, SERVER_OVERLOADED
+from .protocol.models import StrictModel
 from .runtime_stop import CancelStopParams, StopParams, prepare_stop
 from .service import ControlService
 from .status_feed import RuntimeReplyStatus
+
+
+class SetEnabledParams(StrictModel):
+    plugin_id: str = Field(min_length=1, max_length=256)
+    enabled: bool
+
+
+class PrerequisitesParams(StrictModel):
+    needs: list[str] = Field(max_length=32)
 
 
 def build_control_service(ctx: Context, *, workspace_token: str | None) -> ControlService:
@@ -40,10 +50,15 @@ def build_control_service(ctx: Context, *, workspace_token: str | None) -> Contr
         with ctx.borrow(RpcMethod.key(name)) as method:
             yield method
 
+    def _serialize_update(status: UpdateStatus) -> dict[str, object]:
+        payload = asdict(status)
+        payload["terminal"] = status.state != "accepted"
+        return payload
+
     @ctx.entrypoint
     async def install(source: str, marketplace: str, ref: str, sparse: list[str],
                       update_id: str) -> dict[str, object]:
-        return asdict(await updates.install(ctx, update_id, source=source,
+        return _serialize_update(await updates.install(ctx, update_id, source=source,
             marketplace=marketplace, ref=ref, sparse=tuple(sparse)))
 
     @ctx.entrypoint
@@ -60,8 +75,8 @@ def build_control_service(ctx: Context, *, workspace_token: str | None) -> Contr
     def update(identity: str) -> dict[str, object]:
         status = updates.read(ctx, identity)
         if status is None:
-            raise KeyError(identity)
-        return asdict(status)
+            raise UpdateNotFoundError(identity)
+        return _serialize_update(status)
 
     async def message_display(page: MessagePage, *, display_only: bool) -> list[dict[str, object]]:
         with ctx.borrow(MESSAGE_DISPLAY) as display:
@@ -90,6 +105,15 @@ def build_control_service(ctx: Context, *, workspace_token: str | None) -> Contr
         gate.abort(request.request_id)
         return {"accepting": gate.accepting}
 
+    # 在线启停：与设置页同一条路径（PluginUpdates.set_enabled，含启用前的外部前置条件检测与热重载）。
+    async def set_enabled(params: BaseModel) -> object:
+        request = cast(SetEnabledParams, params)
+        return await updates.set_enabled(ctx, request.plugin_id, request.enabled)
+
+    # 在 Core 里检测外部前置条件：pkg 在宿主 Shell 里运行时，以 Core 的 PATH 与 Docker 通道为准。
+    async def prerequisites(params: BaseModel) -> object:
+        return {"unmet": await updates.unmet(ctx, cast(PrerequisitesParams, params).needs)}
+
     return ControlService(
         ctx.require(MESSAGE_CATALOG), ctx.runtime.workspace, accept=accept,
         attachments=ctx.require(CHANNEL_ATTACHMENT_READ).resolve_refs,
@@ -100,5 +124,7 @@ def build_control_service(ctx: Context, *, workspace_token: str | None) -> Contr
         control_frames=ctx.require(CONTROL_FRAMES), resolve_method=resolve_method,
         request_scope=ctx.runtime_scope,
         methods={"runtime/prepare-stop": RpcMethod(StopParams, stop),
-                 "runtime/cancel-stop": RpcMethod(CancelStopParams, cancel_stop)},
+                 "runtime/cancel-stop": RpcMethod(CancelStopParams, cancel_stop),
+                 "plugin/set-enabled": RpcMethod(SetEnabledParams, set_enabled),
+                 "plugin/prerequisites": RpcMethod(PrerequisitesParams, prerequisites)},
     )

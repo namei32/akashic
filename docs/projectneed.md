@@ -156,7 +156,7 @@ Android Shell 只拥有服务器地址、WebView、系统通知、后台连接�
 
 ### WEBUI-001 聊天页只维护一份 Web 源码
 
-浏览器和 Android Shell 加载同一服务端 `frontend/chat` 页面。Shell 不消费单独打包的移动 WebUI，也不通过原生 bridge 驱动消息、插件或模型统计。窄屏布局、流式正文和插件控件仍在共享页面实现。
+浏览器和 Android Shell 加载同一服务端 `frontend/plugins/akashic_clients/chat` 页面。Shell 不消费单独打包的移动 WebUI，也不通过原生 bridge 驱动消息、插件或模型统计。窄屏布局、流式正文和插件控件仍在共享页面实现。
 
 ### WEBUI-002 平台状态各有 owner
 
@@ -172,6 +172,9 @@ Thinking 与工具调用沿共享页面的一条过程轨迹展示；流式消�
 
 发送附件时立即在消息区显示本地预览，上传与等待回答分别反馈。上传失败或取消时保留
 本次文字和附件；成功只清除本次提交内容，上传期间新写的草稿和新添加的附件继续保留。
+同一份未发送草稿重试时复用已经确认成功的上传身份；移除后重新选择视为新附件，回执不跨页面刷新保存。
+一次最多并行上传三个附件，全部成功后才按选择顺序发送消息。失败或取消时停止后续上传并中止在途请求；
+请求中止不证明服务端没有落盘，不自动删除已经产生的附件。
 
 ### WEBUI-004 Shell 通知消费已提交消息
 
@@ -305,7 +308,9 @@ D 类效果只能由拥有 prepared、committed、failed 和必要补偿语义�
 
 模型长度截断不等于空响应、quiet 或完成；截断批次的工具不得执行。默认回复预算包含推理，显式预算保留，缺省跟随固定模型能力；选择与未知能力策略见 [0089](decisions/0089-reply-output-budget-includes-reasoning.md)。
 
-工具结果使用 `success / denied / error / interrupted`。error 和 interrupted 不证明外部效果为零；模型获得原错误与先检查现场的提示，不能自动重复原操作。Tools/Delivery 仅在原 key 查询或 provider 幂等合同下恢复；后台发送失败必须关闭本次业务等待，不保留 unknown 未决状态。数据库、binding 和内部契约异常仍向上传播。完整自愈、跳过、重试和中断规则见 [0063](decisions/0063-execution-failures-have-terminal-results.md)。
+工具结果使用 `success / denied / error / interrupted`。error 和 interrupted 不证明外部效果为零；模型获得原错误与先检查现场的提示，不能自动重复原操作。工具打开、参数准备、授权和执行边界的异常保存为有界错误回执，模型可以在本轮修正；取消仍向上传播。结果保存失败时只尝试保存错误回执，不重跑工具；错误回执也无法保存时传播存储故障。Tools/Delivery 仅在原 key 查询或 provider 幂等合同下恢复；后台发送失败必须关闭本次业务等待，不保留 unknown 未决状态。边界之外的数据库和内部契约异常仍向上传播。完整自愈、跳过、重试和中断规则见 [0063](decisions/0063-execution-failures-have-terminal-results.md)。
+
+ReAct 按同来源已提交调用的顺序统计连续失败；同一模型工具名和 JSON 参数（忽略对象键序）连续 3 次 error、denied 或协议拒绝后，后续相同调用不执行，保存可行动的纠正提示。连续两个模型响应仍请求该调用时，以带工具名和原错误的 failure 停止本轮。批内提示只计一个响应，保证模型至少有一次看到提示后改方案的机会。成功、中断、不同调用、新 Input、完成或放弃重置计数；其他来源不影响它。`max_steps=0` 仍表示不限制总步数，此保护不限制有进展的长任务，不改写或删除历史。
 
 默认消息工具调用按 [0100](decisions/0100-message-tool-calls-recover-at-turn-granularity.md) 使用 ToolCall/ToolResult 表达意图与终态；重启后未结调用不执行，补充结果未知的 error。ReAct 重启与用户显式重试使用当前材料发起新模型请求，不恢复旧请求，接受旧请求可能已处理所带来的重复付费。原消息、旧请求记录和工具回执保留。
 
@@ -324,6 +329,8 @@ D 类效果只能由拥有 prepared、committed、failed 和必要补偿语义�
 ### CTX-003 窗口保留当前输入和工具配对
 
 Prompt 历史不得从孤立 tool result 开始。assistant 工具调用和对应结果成对保留；摘要提供前文时，近期原文可以从 assistant 消息开始。当前工作 Input 逐字保留。长工具结果只允许在临时模型视图中截短。
+
+工具文本在首次进入模型请求前统一限量，同一 Output 的全部工具结果共享预览预算：最多 50,000 UTF-8 字节，且不超过已知模型窗口的四分之一；各调用均分，必要的回读地址和截断说明始终保留。超大结果给头尾预览，并明确提示缩小范围或用 `read_content` 按原消息的 `message_id/part_index/start/end` 分段读取。回读展开后的文本同样受限；没有回读工具时说明目录缺口，不假造可用能力。原始 ToolResult 和页面全文不变，不新增归档副本；预览不得记作完整展示的 content ref，也不得续接基于不同内容的 opaque continuation。未超限结果持续完整可见，不按 seen 状态自动折叠。
 
 Turn 是按 source 过滤的 Message 日志上的无状态读投影：`Output.finish=complete|quiet` 关闭一段，`Control.abandon` 在 `through_seq` 处关闭被放弃前缀；暂停和一次 provider 失败不能把消息日志拆成多个 Turn。Turn 投影返回消息引用和状态，不拥有执行、取消或写入权限。Context 可以复用同一分组，但必须保留工具请求/结果配对。
 
@@ -392,10 +399,13 @@ Turn；持久 Turn 不拆分。当前工作 Input 逐字保留，未闭合工具
 但不作为 provider 输入、replay 或摘要资料。tool batch 完成后下一次请求重新检查容量。
 理由见 [0095](decisions/0095-context-compaction-uses-settled-batches.md)。
 
-首次 compact 从日志起点记录累计覆盖，以安全批次选近期原文。每代仍只把上一摘要和
-一个可容纳的连续近期窗口送入摘要模型；更早退出请求的资料写入 omitted 分区，不冒充
-真实摘要输入。当前工作不可跳过，SessionDB 原消息完整保留。已有 generation 后只
-处理上次覆盖末尾到当前的增量；真实模型输入与省略资料沿 0068 的分区合同保存。
+Compaction 按消息身份累计覆盖本轮可见的已结算批次，不要求覆盖整个日志连续前缀。
+其他来源未完成而隐藏的消息不进入摘要，也不阻挡它之后的已结算批次；后来变为可见时，
+未覆盖的旧消息恢复原文并保留后续摘要与学习资格。每代仍只把上一摘要和未覆盖候选中
+一个可容纳的近期窗口送入摘要模型；更早退出请求的候选写入 omitted 分区，不冒充
+真实摘要输入。隐藏消息不属于 omitted。当前工作不可跳过，SessionDB 原消息完整保留。
+已有 generation 后处理所有尚未覆盖的可见消息；理由与旧记录兼容见
+[0134](decisions/0134-compaction-covers-message-identities.md)。
 
 持久 checkpoint 写入 `session_compactions`，保存 summary、parent lineage、source_ref、
 retained tail、usage、失效字段和模型容量；`sessions.last_consolidated` 只表示当前
@@ -496,19 +506,6 @@ Core 只保存和比较 scope，不解释维度含义。每个维度必须有唯
 预期模型失败、超时或空响应可使用首句截断；内部与存储错误必须可见。
 标题变化不改变消息、attributes、学习输入、`updated_at` 或目录排序；不自动减少任何数据。
 
-### SES-013 回复循环耗尽后由新输入续额
-
-普通回复、调度任务与子任务的模型输出步数默认不设上限；`max_steps = 0` 表示不限步数，
-正整数表示显式上限，负数无效。已有显式上限继续生效，不因升级覆盖配置。
-步数设置不改变模型生成重试、输出 token 预算、工具权限和用户取消能力。
-
-同一来源已消耗配置的模型输出额度并记录覆盖该段输出的失败事实后，下一条同来源用户 Input
-取得新的循环额度。续额只改变执行计数，不关闭原 Turn，不改写消息、模型调用账或工具结果，
-已完成工具仍按原 CallRef 读取。运行中插话、未耗尽时的失败、pause/resume、重启与其他来源的
-输入不续额；没有新输入时不得自动续额。既有日志可直接重建这一判定，无需迁移或修改旧失败。
-续额理由见 [0129](decisions/0129-exhausted-react-budget-renews-on-new-input.md)，默认值与配置边界见
-[0132](decisions/0132-step-limits-are-explicit.md)。
-
 ## 8. 记忆系统
 
 ### MEM-001 档案重写同时验证结构和事实保全
@@ -567,7 +564,7 @@ session compaction ledger 的派生 checkpoint，不替代上述记忆状态；�
 
 Akasha 按固定版本的 Turn 投影取得全部 Input 与唯一完成 Output，且为每个参与的非空 user/assistant Message 使用已持久化的固定 embedding，建立一个学习样本。多条 Input 按固定版本的规范化文本连接和向量聚合规则处理；Control、未完成工具和失败开放段只按 Akasha 明确的来源规则处理，不从相邻角色推断归属。在线提交和离线 builder 必须共用相同 Message IDs、规范化文本、向量和 digest 规则。旧数据只能走名称明确的 legacy 兼容路径。
 
-自动召回只由真实用户 Input（`author=user`）触发；同一输入首次准备后保存并复用实际 Recall，工具续步、system reminder、重试和重启不得重复检索。新的真实用户输入只以该条输入构造召回 cue，不混入同 Turn 的旧输入；聊天卡片按对应输入展示其自动与主动查询。主动调用 `recall_memory` 独立触发检索，并按原调用身份复用结果；后台 Input 不触发自动召回。查询记录只追加，不因复用而改写或删除历史记录。
+自动召回只由用户 Input（`author=user`，经任一渠道进入）触发，判定统一读 `plugins/ledger/contract.py` 的出处一节（见 ADR 0145）；同一输入首次准备后保存并复用实际 Recall，工具续步、system reminder、重试和重启不得重复检索。新的真实用户输入只以该条输入构造召回 cue，不混入同 Turn 的旧输入；聊天卡片按对应输入展示其自动与主动查询。主动调用 `recall_memory` 独立触发检索，并按原调用身份复用结果；后台 Input 不触发自动召回。查询记录只追加，不因复用而改写或删除历史记录。
 
 ### MEM-011 历史投影按完整 Turn 和 token tail 保留
 
@@ -581,7 +578,7 @@ CTX-007 的安全工具批次切分，20,000 token 是近期原文目标。每�
 
 ### MEM-012 Markdown 新用户事实必须有用户原文证据
 
-Markdown 新草稿逐条引用本次可学习的真实 Message ID。用户事实、偏好、明确要求及关系判断，必须包含 author=user 的 Input 引用；助手转述、工具、后台结果或摘要不能成为唯一依据。
+Markdown 新草稿逐条引用本次可学习的真实 Message ID。用户事实、偏好、明确要求及关系判断，必须包含 author=user 的 Input 引用（`is_user_input`）；助手转述、工具、后台结果或摘要不能成为唯一依据。
 来源与 Session 学习资格由消息和学习 owner 决定，模型不能自行声明。压缩仍保留跨来源工作进展；Markdown 从摘要覆盖的原始消息读取事实，不把摘要正文作为用户原话。
 既有草稿与 before-image 恢复协议保留；本规则不授权删除、改写或补造旧条目和历史引用。引用资格检查证明来源存在且合格，不证明模型推断的语义必然正确。
 
@@ -638,7 +635,7 @@ Linux 上无子命令执行 `python main.py` 是正式服务入口，必须先�
 
 ### RUN-008 来源内输入与控制按序收束
 
-来源 owner 在活动 Task scope 上按 source 顺序接纳普通 Input：Input 先追加到 Message 日志，再取消并替换旧 scope；旧 scope 的 Output writer 以旧 `expected_source_head` 提交时必须冲突。控制只接受 `pause`、`resume`、`abandon` 和 `failure`，通过明确 `source` 与 `through_seq` 追加到 Message 日志，再按 owner 规则取消 scope；`/stop` 入口映射为 `pause`，继续等待已经开始的工作结算。Output 只允许 `continue`、`complete` 或 `quiet`，失败由 `Control.failure` 或 owner receipt 追加一次。下一条普通 Input 是否续接开放 Turn 由来源插件决定，不建立 Core 专属执行记录。
+来源 owner 在活动 Task scope 上按 source 顺序接纳普通 Input：Input 先追加到 Message 日志，再取消并替换旧 scope；旧 scope 的 Output writer 以旧 `expected_source_head` 提交时必须冲突。控制只接受 `pause`、`resume`、`abandon` 和 `failure`，通过明确 `source` 与 `through_seq` 追加到 Message 日志，再按 owner 规则取消 scope；`/stop` 入口映射为 `pause`；`pause` 的取消必须作为中断传给正在执行的工具，再等待原 owner 保存终态和清理前台资源，不能只屏蔽取消并等待工具自然结束；普通 Input 的撤权不中断已开始的工具，工具结果提交后新回复连同新输入一起推理，撤权后再 `pause` 时升级为中断。回复进行中的插话在下一步模型请求前写入；回复结束或被停止时尚未写入的插话转为普通 Input。显式后台任务继续由后台 owner 管理。取消不撤销已发生的外部效果，也不跳过不响应取消的工具收尾。Output 只允许 `continue`、`complete` 或 `quiet`，失败由 `Control.failure` 或 owner receipt 追加一次。下一条普通 Input 是否续接开放 Turn 由来源插件决定，不建立 Core 专属执行记录。
 
 明确 `abandon` 的接纳不等待工具执行或物理清理。Tools 对被放弃前缀内的调用保留已提交结果；未启动的结算为 `denied`，已启动但未提交结果的结算为 `interrupted`。每个调用仍只有一个 ToolResult；迟到返回不覆盖它，也不唤醒下一轮推理。`interrupted` 只表示已停止等待，不证明外部效果撤销，不授予重跑权限。实际工具与清理 owner 继续持有资源及必要的重启许可；新工作不等待旧工具退出，旧清理不得影响新工作的资源。暂停、恢复和普通新输入不自动采用放弃语义。
 
@@ -646,15 +643,15 @@ Linux 上无子命令执行 `python main.py` 是正式服务入口，必须先�
 
 Turn、proactive tick、schedule、plugin job、compaction 和 Markdown profile projection 等独立推理单元在真正开始执行时，由普通 `models` 插件复制一份不可变 `ModelExecution`。它冻结完整 provider artifact、model、connection ID、auth identity、窄 `CredentialHandle`、能力和角色映射，并保持到该模型执行结束；同一 auth identity 的 token payload 可以由该 handle 原位刷新。执行期间修改角色绑定、连接配置或重装插件只服务后续执行；已经开始的执行及其工具循环、重试和上下文压缩继续使用旧绑定。模型固定不扩展为整 Turn 占用：该执行的工具目录与后续调用不固定所有插件，每次实际调用按目标 owner 的当前 activation 取得保护；排队但尚未开始的执行读取开始时的当前运行实例与模型 revision。Core 不再维护模型专用 generation manager、retired generation 或第二套 lease。
 
-### RUN-010 默认模型和模型角色可在运行时修改
+### RUN-010 默认模型和插件模型选择可在运行时修改
 
-`default`、`fast`、`agent` 和 `vision` 角色引用 named model。普通 `models` 插件对候选连接和模型完成真实校验并原子持久化后，下一次 admission 读取新 revision；它不停止 admission、不排空无关 turn，也不请求 Supervisor 重启。候选校验或配置提交失败时不增加 revision，并向设置调用方返回明确失败。
+`models` 只保存一个全局 `default` 聊天绑定。其余调用模型的插件在自己的配置里声明模型选择（跟随默认、跟随当前对话或指定 named model），由 `models` 在执行内按同一冻结目录解析；指定模型不可用或不满足该用途声明的能力时回到 default（见 ADR 0129）。普通 `models` 插件对候选连接和模型完成真实校验并原子持久化后，下一次 admission 读取新 revision；它不停止 admission、不排空无关 turn，也不请求 Supervisor 重启。候选校验或配置提交失败时不增加 revision，并向设置调用方返回明确失败。
 
-角色绑定和 Provider/model 目录的权威当前值保存在 workspace 模型注册库，成功事务增加单调 revision。该状态由普通 `models` 插件唯一拥有。完整 passive ReAct、proactive ReAct、schedule SOFT、compaction、Markdown profile projection、plugin job 和其他独立推理单元在入口读取最新 revision，并冻结整组角色直到执行结束；没有外层执行单元的单次调用在调用前读取最新 revision。普通模型设置不得通过改写 `config.toml`、重启进程或 Core 私有 provider locator 传播。
+角色绑定和 Provider/model 目录的权威当前值保存在 workspace 模型注册库，成功事务增加单调 revision。该状态由普通 `models` 插件唯一拥有。完整 passive ReAct、proactive ReAct、schedule SOFT、compaction、Markdown profile projection、plugin job 和其他独立推理单元在入口读取最新 revision，并冻结目录与主模型直到执行结束，执行内按插件选择补绑的模型取自同一冻结目录；没有外层执行单元的单次调用在调用前读取最新 revision。普通模型设置不得通过改写 `config.toml`、重启进程或 Core 私有 provider locator 传播。
 
 Provider connection 的 Base URL、API Key、Codex access/refresh token 与账号路由字段由同一个 workspace 模型注册库拥有，数据库及其备份按 secret 使用 `0600`。设置状态、日志、Observe 和会话 metadata 只返回 credential 状态或引用，不得返回 secret。已迁移模型不得回退读取全局 HOME credential；旧 credential 文件只保留为迁移输入、恢复证据或非模型兼容状态。Codex token refresh 可以原位更新 credential payload，不改变当前模型 revision；来源、模型、角色和显式 key 设置变化仍按完整候选事务增加 revision。
 
-对话模型选择按“本次消息显式 model ref/effort → session selection → 当前 default”解析。Session selection 以版本化对象持久化后跨 Gateway 重启保留；清除后重新跟随动态 default。显式 effort 只属于显式选择的 default/agent 主推理，不传播给 fast、vision 等内部角色；不受支持的值明确失败。实际执行绑定写入 turn 诊断元数据，不得反向改写既有消息。旧字符串 override 只读兼容，并在下一次显式选择时升级。
+对话模型选择按“本次消息显式 model ref/effort → session selection → 当前 default”解析。Session selection 以版本化对象持久化后跨 Gateway 重启保留；清除后重新跟随动态 default。显式 effort 只属于本次对话的主推理，不传播给压缩、看图等插件用途（跟随当前对话的用途沿用同一选择）；不受支持的值明确失败。实际执行绑定写入 turn 诊断元数据，不得反向改写既有消息。旧字符串 override 只读兼容，并在下一次显式选择时升级。
 
 用户取消模型选择时物理移除该模型配置；既有消息和会话引用在后续执行时回到当前 default，清除旧型号的显式 effort。删除 default 时按 model ID 选择一个仍可用的已选聊天模型；无候选时明确报未配置。在途执行继续使用冻结绑定，历史消息、调用账和凭据不减少。向量模型删除不得替换既有向量空间。目录探测只产生候选，只有用户显式勾选才增加配置；同步只刷新已选模型的可用性与能力。
 
@@ -786,7 +783,7 @@ Scope 唯一持有资源关闭责任，provider 实现实际关闭。消费者�
 
 ### PLG-009 Skill 和 MCP 通过插件安装发布
 
-普通 Skill 按 workspace、用户目录、插件来源的顺序选择，使用时热读取；来源分层不授予额外权限。Drift skill 和 MCP server 由已安装插件代码通过对应 provider 注册。插件底座不解释 `akashic.plugin.toml`，不保留静态资产导出与 `apply` 并行的注册路径。安装只准备代码与运行环境；资源请求只定义一次，由拥有该资源的 provider 验证和执行。Core 固定制品与组合，不解释 Skill 格式、MCP 命令或 Workload 端点关联。Skill 不复制资源目录或永久保存历史文件树；相对资源使用实际目录。历史 skill 目录、归档、软链接和 ownership journal 保留，不自动减少；未完成外部效果仍由原 owner 负责。
+普通 Skill 按 workspace、用户目录、插件来源的顺序选择，使用时热读取；来源分层不授予额外权限。MCP server 由已安装插件代码通过对应 provider 注册。插件底座不解释 `akashic.plugin.toml`，不保留静态资产导出与 `apply` 并行的注册路径。安装只准备代码与运行环境；资源请求只定义一次，由拥有该资源的 provider 验证和执行。Core 固定制品与组合，不解释 Skill 格式、MCP 命令或 Workload 端点关联。Skill 不复制资源目录或永久保存历史文件树；相对资源使用实际目录。历史 skill 目录、归档、软链接和 ownership journal 保留，不自动减少；未完成外部效果仍由原 owner 负责。
 
 ### PLG-010 卸载插件默认保留 plugin-data
 
@@ -812,7 +809,7 @@ Core 只负责通用传输、revision、运行实例引用、调度、取消和�
 
 新插件只通过运行 Root 下的 Context、Service、Inject、Fiber 和 Effect 组合能力；Job、Channel、Prompt、Tool、UI、MCP、存储和外部效果由各自领域 Service 定义，Core 不维护新的固定插件能力总表。`inject` 只表达 Fiber 激活所必需的硬依赖；可选能力由使用点查询，或由不阻塞 Root readiness 的嵌套 Fiber 承载。listener、后台 task 和其他注册随所属 Fiber 逆序回收，依赖消失、重启和卸载后不得残留。
 
-通用事件只有五种 dispatch 合同：`emit` 同步串行并立即传播失败；`serial` 逐个等待且只有显式 `Bail` 可以短路；`parallel` 只接收异步 listener，并发执行、等待全部 settle 后聚合失败；`transform` 按注册顺序把同类型 immutable payload 显式变换成下一份；`observe` 调用全部 observer、等待异步 settle，并把普通失败隔离成 Incident 而不改写最终事实。listener 只使用同一运行图内稳定注册顺序，不增加 priority、listener dependency DAG 或通用 waterfall。同步并发由有界 Executor Service 执行插件显式提交的纯同步任务；工作线程不得取得 Context、Fiber 或 Core 权限。
+通用事件按已采纳的 ADR-0155 只保留两种有真实消费者的 dispatch 合同：`emit` 同步串行并立即传播失败；`serial` 逐个等待且只有显式 `Bail` 可以短路（lifecycle 信号明确拒绝 `Bail`）。listener 只使用同一运行图内稳定注册顺序，不增加 priority、listener dependency DAG 或通用 waterfall；此前设计的 `parallel`、`transform`、`observe` 派发与通用 `ExecutorService` 已按 ADR-0155 移除，后续若出现真实需求由消费插件带着明确用例再行引入。
 
 组合拓扑只能表达能力与依赖关系，不能自行发起安装应用。底座唯一拥有制品身份、组合装配、Scope、调用与资源保护、接纳与已选输入提交；具体能力、业务验证、配置和数据由其 owner 管理。每次 Fiber activation 固定自己的实际依赖绑定；图中登记随各 owner 的 Effect 生命周期增减，整张图本身不是封存结果，不列举各类扩展目录。迁移完成后删除旧协议，不为仓库内插件长期保留适配器。
 
@@ -979,57 +976,37 @@ Host Bridge 必须保留 SH-001 的完成/续接结果、增量输出、PTY 输�
 
 add、cancel 和 reschedule 先构造 candidate，持久化成功后才替换内存。stop 后不再产生新 tick；关闭回收 in-flight，停止期间周期任务不重排。
 
-### SCH-003 定时任务在固定目标会话里执行
+### SCH-003 定时任务在创建它的会话或独立会话里执行
 
-任务默认属于创建它的会话；用户也可以选择已有可见会话或新建专用会话，创建时固定目标，后续触发与恢复复用该身份（[0126](decisions/0126-task-destination-sessions.md)）。`notify` 到点原文推送；`run` 在目标会话里以本次触发独占的来源跑一轮回复，Input、工具调用、工具结果与最终回复都追加到该会话，不读取同一 job 的旧触发过程。历史范围由任务指定，默认只看本次触发；选择带会话历史时与普通对话相同。主对话空闲后才开始，用户的新输入优先。任务来源不进入记忆学习，任务内不提供写长期记忆的工具。
+任务属于创建它的会话。`notify` 到点原文推送；`run` 支持两种会话形态：
+- 默认在固定目标会话里以本次触发独占的来源跑一轮回复，Input、工具调用、工具结果与最终回复都追加到该会话，主对话空闲后才开始，用户的新输入优先；最终回复非空时只投递这条原消息。
+- 当 `session_id` 设为 `"scheduler"`（`schedule(session="isolated")`）时，每次触发新建独立的 `scheduler:<fire_key>` 会话（`visibility="internal", learning="excluded"`，Web 端不可见、不复用旧历史）执行，完成后直接结算，由任务内自行按需调用 `message_push` 推送产物。
 
-最终回复非空时只投递这条原消息。回复完成、实际送达和 job 结算分别依据各自事实，失败、空结果或未知效果不得伪装成已送达。重启先恢复同一次触发的原消息、工具与发送回执，不能重新执行已完成的工作。
+任务来源不进入记忆学习，任务内不提供写长期记忆的工具。回复完成、实际送达和 job 结算分别依据各自事实，失败、空结果或未知效果不得伪装成已送达。重启先恢复同一次触发的原消息、工具与发送回执，不能重新执行已完成的工作。
 
 ### PRO-001 主动流程的空、跳过和失败可区分
 
-主动联系由 [0144 · 受限 Watch](decisions/0144-watch-scoped-contact.md) 决定时机。
-新流程用值班记录及逐事件去向替代 PRO-005 的旧 Wake Timer attempt 与 PRO-006 的质量池准入；
-既有记录、授权及领取/回执仍由原 owner 保存。停用 Watch 不得触发旧循环作为后备。
-
 sensor、session、context 和 store 故障不得伪装成“无事件”。decision、dedupe、presence 和成功状态只在真实送达后提交；合法 skip 带 reason，内部错误可观察。
 
-### PRO-002 主动、Wake 和 Drift 状态必须连续恢复
+### PRO-002 主动与 Wake 状态必须连续恢复
 
-`proactive.db`、`wake_proactive.db` 和 `drift/drift.db` 中影响 delivery dedupe、cooldown、pending ack、reservoir consumption、hazard timer、cursor、journal 和下一轮选择的内容属于运行连续性。启用对应功能时，备份和恢复必须保留这些状态；日志表与连续性表可以制定不同 retention，但不得把整库按诊断日志清空。
+`proactive.db` 与 `wake_proactive.db` 中影响 delivery dedupe、cooldown、pending ack、reservoir consumption、hazard timer、cursor、journal 和下一轮选择的内容属于运行连续性。启用对应功能时，备份和恢复必须保留这些状态；日志表与连续性表可以制定不同 retention，但不得把整库按诊断日志清空。
 
-### PRO-003 Wake 用主动历史保持连续性而不预设重复惩罚
+### PRO-003 主动判断用最近对话保持连续性而不预设重复惩罚
 
-Wake 判断内容时必须把最近被动对话与已经送达的主动消息作为两个明确区分的运行时区块；主动消息保留实际发送时间，不能伪装成用户陈述或本轮候选。模型把主动历史作为理解近期连续性的背景，并保持对用户及其关注事项的开放好奇；话题聊过、结论相同、事件反复发生或发送次数较多，都不能单独推导出用户疲劳、不感兴趣或禁止再次分享。当前事件是否值得主动告诉用户仍由模型结合正文证据、长期偏好、真实用户反馈、最近上下文和时机自主判断，不增加按主题、URL、相似度或次数硬编码的 share/skip 规则。
+值班员和被叫醒的主 Agent 看到的最近对话每次从消息账本现查，不保存副本；用户原话、对话回复与不经用户发起的主动消息必须能区分，主动消息保留实际发送时间并标明之后用户有没有接话。这些只作为判断的背景：话题聊过、结论相同、事件反复发生或发送次数较多，都不能单独推导出用户疲劳或禁止再次分享。是否值得现在告诉用户由模型结合正文、长期记忆、真实用户反馈、最近上下文和时机自主判断，不增加按主题、URL、相似度或次数硬编码的规则（ADR 0149）。
 
-### PRO-004 EventMail 统一不可变信封而不统一三类生命周期
+### PRO-004 来源只有一个事件入口
 
-Content、Alert 和 Context 进入同一个普通 EventMail 插件，但使用三个独立、版本化的提交能力。
-权威信封只追加；修正、supersede、expiry、selection、ack 和 settlement 以新 transition 追加，
-不得改写或删除既有信封。Content 只表达可选择和结算的材料，Alert 只表达需处理且可过期的
-信号，Context 只表达可 supersede 或过期的当前事实；三类不得共享万能 publish 入口或通用
-status 状态机。可更新的查询投影必须能从信封和 transition 确定性重建。
+外部发生的事进入系统只有一种形状：事件（`id、source、at、title、text、url、state、key`）。插件经 `watch.events.v1` 交事件；工作区 `watch/sources/` 里，别的程序往 `名字.jsonl` 追加一行，或者放一个 `名字.sh`／`名字.py` 由值班每轮运行、输出的每一行算一条，都落在同一处。不按内容、告警、状态区分提交能力，也不为来源保留批次、修订、结算或查询投递状态的接口：事件被收下即交付完成，来源随即向自己的后端确认。来源用 `key` 表达自己的稳定标识，同一来源同一个 key 只记一次；用 `state` 表示这是该来源的当前状态，状态没变的重复上报不产生新事件。紧急与否、要不要告诉用户由值班员和主 Agent 看内容判断，来源不携带优先级（ADR 0149、0150、0151）。
 
-### PRO-005 Wake 每次实际触发都留下独立 attempt
+### PRO-005 值班的每次判断都留下可读记录
 
-每次 Wake Timer 实际触发先追加 attempt，再读取冻结的 EventMail watermark。没有 due、Content
-不足、admission 拒绝、模型 skip、defer、触发后关闭、执行失败或发送失败都必须以明确终态和具体诊断收口；
-未进入 scoped Turn 不等于没有记录。Wake attempt 是执行事实，不作为第四种 EventMail，也不
-拥有 Content、Alert、Context 或 delivery 的领域状态。进程停机期间未实际触发的理论时间槽
-不由 Wake 伪造；如需补记，由 scheduler 的独立 durable missed-tick 合同拥有。
+值班员对每条事件的去向（wake、inbox、log）和理由、所用模型、模型失败，以及每次叫醒主 Agent 的结果，都追加到工作区 `watch/log/` 的当日文件。模型链全部失败时事件留在原处、游标不前进，不得把失败记成"没有事件"。值班记录是执行事实，不拥有 delivery 的领域状态；进程停机期间未运行的间隔不补记。
 
-### PRO-006 Wake Content 使用一次评分的确定性衰减池
+### PRO-006 值班不使用评分池，叫醒次数有上限
 
-EventMail 中到期的 pending 或 deferred Content 共同组成 Wake Content 池。Wake 至少每五分钟实际
-触发一次池维护，并为每次触发记录 active、due、expired、scored、new、new mass、衰减后的
-pool mass、固定 threshold、below-floor 数量和 driver；没有 Content 或证据不足也必须留下终态。
-每个稳定的 source/item/revision 在首次到期时只计算并持久化一次初始质量：先合成 preprocess 与
-会话语义的兴趣概率，再沿用 `-ln(1-interest)` 的旧 Wake 质量尺度，并固化发布时间可信度和静态
-eligibility。以后不重新读取会话语义，只让这个初始质量按发布时间或首次观察时间以 36 小时半衰期
-衰减。低于 admission floor 的 revision 不再贡献 pool mass。仍参与的 revision 质量直接相加，
-pool mass 超过固定 threshold 时才进入 Wake Turn，不使用随机
-抽签或 refractory。拒绝或证据不足只消费本次新到达检查，不得把 Content 从 EventMail 移走；
-没有新到达时维护只记录、衰减与淘汰，不重复启动 Turn。Content 驻留至少 24 小时且低于 floor 后，
-由 Wake 通过 EventMail 的窄 transition 能力逻辑标记 expired；权威信封和 transition 不物理删除。
+事件的去向由值班模型对照主 Agent 写的嘱托、用户记忆和最近对话判断，不计算兴趣分、质量或阈值。叫醒主 Agent 只有两种理由：命中嘱托，或值班员判断这件事等不起。每天叫醒次数有配置的上限，超出的事件进入待看列表而不是丢弃。嘱托每行带到期日，一次性嘱托触发后归档，到期未续的归档；待看列表里超过保留期的条目自动清除。
 
 ### BAK-001 备份必须能验证和恢复
 
@@ -1055,6 +1032,10 @@ pool mass 超过固定 threshold 时才进入 Wake Turn，不使用随机
 调用方继续指定同一 `programmatic:` Session ID，即可复用原生历史与上下文压缩。
 
 新 programmatic session 使用当前运行图；不提供 `latest`、候选或旧版本选择器。学习资格在 `programmatic/session/admit` 首次创建 Session 时固定：`persist_memory` 省略或 false 为 `learning=excluded`，显式 true 为 `learning=eligible`。同一 Session ID 与相同属性的重试幂等，属性冲突必须失败；后续 send、pause/resume、retry 和 result 不得改变资格。普通 Session 的既有默认不变。
+
+`programmatic/message/abandon` 接受 `session_id` 与新的 `message_id`，显式放弃当前 programmatic 前缀，沿用来源控制的撤权、工具结算与原文保留规则；同一控制 ID 重试不放弃后来接纳的工作。它不撤销外部效果，也不改变学习资格。来源同时前进导致冲突时，调用方重新读取结果后再决定是否放弃。
+
+失败不自动作废工具调用，也不成为成功学习样本。没有未回执调用的失败前缀可以进入上下文摘要；同来源新 Input 不再强制保留此前失败输入的全文，重试原输入仍保留它。容量或未结算调用导致的确定性失败必须展示放弃出口，未收到工具回执且没有活动回复时显示状态未知。
 
 Session 无论是否可学习，都正常持久化 Input、Control、工具调用及结果、Output 与终态。Akasha 和 Markdown 只有在 Session 为 eligible 且各自来源配置允许时才学习；不为 programmatic 新建逐 Turn suppress scope。历史消息的排除事实仍按 MEM-009 只读处理。Prompt 是否读取既有记忆与 Tool 是否可用分别由 `disabled_prompt_sections` 和 `ToolGrant` 决定，均不由学习资格推断。
 
@@ -1138,9 +1119,9 @@ Schedule 在整个 workspace 维度默认最多同时存在 10 个 active job。
 
 Shell retained log 由进程 owner 管理；Subagent 的同步与后台形式共用 Subagent 准入 owner，不能通过同步形式绕过容量限制。MessageBus 不拥有 Shell/Subagent 的准入，也不设置独立的全局 backpressure 或容量拒绝，只负责 channel lane 顺序。容量拒绝只影响当前操作；terminal cleanup 失败保留 execution owner 和诊断，不能把已提交 turn 改成失败。控制 admission 只统计 queued/running Task 的数量、实际字节和 live runtime objects，不统计历史 Message 或 programmatic source。
 
-### SEC-011 Subagent 与 Wake 的内部消息可恢复
+### SEC-011 Subagent 与值班唤醒的内部消息可恢复
 
-Subagent 与 Wake 每次独立工作保留完整输入、输出、工具调用、工具结果和恢复回执。内部 Session 默认不列入聊天目录，不自动投递内部正文，不进入记忆学习；最终回传或通知仍按来源原有业务路径处理。消息和业务恢复材料没有自动删除协议，代码升级不得回填猜测的历史消息或自动重跑旧执行记录。用户取消只撤销新决策，已开始的工具和发送必须如实结算。 Subagent 是主 Agent 调用的工具：同步调用返回结果，异步调用先返回接纳回执，完成后由主 Agent 读取结果并回复用户。内部结果不冒充新的用户输入，异步回执不冒充任务结果。
+Subagent 与值班唤醒的后台回合每次独立工作保留完整输入、输出、工具调用、工具结果和恢复回执。内部 Session 默认不列入聊天目录，不自动投递内部正文，不进入记忆学习；最终回传或通知仍按来源原有业务路径处理。消息和业务恢复材料没有自动删除协议，代码升级不得回填猜测的历史消息或自动重跑旧执行记录。用户取消只撤销新决策，已开始的工具和发送必须如实结算。 Subagent 是主 Agent 调用的工具：同步调用返回结果，异步调用先返回接纳回执，完成后由主 Agent 读取结果并回复用户。内部结果不冒充新的用户输入，异步回执不冒充任务结果。
 
 ### SEC-008 Control replay 是临时投影
 

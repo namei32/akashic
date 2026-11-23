@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import UTC, datetime
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 from scripts.akashic_release.doctor import read_environment
 from scripts.akashic_release.manifest import read_json, write_json, release_lock
@@ -28,6 +30,24 @@ def _request_path(root: Path, identity: str) -> Path:
 def _user_environment() -> dict[str, str]:
     # Host Bridge 是系统 service；不能依赖桌面登录注入用户 bus 路径。
     return {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _commit_subject(checkout: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(checkout), "log", "-1", "--format=%s"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    line = completed.stdout.strip().splitlines()[0].strip() if completed.stdout.strip() else ""
+    return line[:160] if line else None
 
 
 def submit(args: argparse.Namespace) -> dict[str, object]:
@@ -51,6 +71,9 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
         raise RuntimeError("Shell 调用不属于当前就绪 boot")
     path = _request_path(root, identity)
     unit = f"akashic-deploy-{identity}.service"
+    session = args.session or stop.session_id
+    if not session or len(session) > 512:
+        raise ValueError("--session 必须是 1–512 字符的会话编号")
     request = {
         "targetCommit": args.commit,
         "stop": stop.model_dump(),
@@ -59,6 +82,7 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
         "backup": args.backup,
         "mise": str(args.mise.resolve()),
         "unit": unit,
+        "notifySession": session,
     }
     with release_lock(path.with_suffix(".lock")):
         if path.exists():
@@ -74,8 +98,14 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
                 "status": record["status"],
                 "unit": unit,
                 "targetCommit": args.commit,
+                "notifySession": session,
             }
-        record = {"request": request, "status": "submitting"}
+        record = {
+            "request": request,
+            "status": "submitting",
+            "phase": "submitting",
+            "submittedAt": _utc_now_iso(),
+        }
         write_json(path, record)
         try:
             asyncio.run(_arm_stop(request, current))
@@ -109,33 +139,33 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
                 if isinstance(error, subprocess.CalledProcessError)
                 else str(error)
             )
-            record.update(status="failed", error=detail)
+            record.update(status="failed", error=detail, notice="not-accepted")
             write_json(path, record)
             raise RuntimeError(f"部署未接纳：{record['error']}") from error
         # worker 通过同一把锁等待此提交，不覆盖后来阶段。
         record["status"] = "accepted"
+        record["phase"] = "accepted"
         write_json(path, record)
     return {
         "requestId": identity,
         "status": "accepted",
         "unit": unit,
         "targetCommit": args.commit,
+        "notifySession": session,
     }
-
-
-async def stop_rpc(workspace: Path, method: str, params: dict[str, Any]) -> Any:
-    from akashic_sdk import AsyncAkashic
-    from plugins.gateway.cli import find_endpoint, read_token
-
-    endpoint = find_endpoint(workspace)
-    async with await AsyncAkashic.connect(endpoint, workspace_token=read_token(workspace, endpoint)) as client:
-        return await client.request(method, params)
 
 
 async def _arm_stop(request: dict[str, Any], current: dict[str, str]) -> None:
     """返回接单前保留同一调用的最终送达凭据。"""
-    await stop_rpc(Path(current["AKASHIC_WORKSPACE"]), "runtime/prepare-stop",
-                   {**request["stop"], "arm_only": True})
+    from akashic_sdk import AsyncAkashic
+    from plugins.gateway.cli import find_endpoint, read_token
+
+    workspace = Path(current["AKASHIC_WORKSPACE"])
+    endpoint = find_endpoint(workspace)
+    async with await AsyncAkashic.connect(endpoint, workspace_token=read_token(workspace, endpoint)) as client:
+        await client.request(
+            "runtime/prepare-stop", {**request["stop"], "arm_only": True}
+        )
 
 
 async def _prepare_stop(
@@ -151,7 +181,8 @@ async def _prepare_stop(
     async with await AsyncAkashic.connect(endpoint, workspace_token=read_token(workspace, endpoint)) as client:
         result = await client.request("runtime/prepare-stop", request["stop"])
         try:
-            if not isinstance(result, dict) or result.get("state") != "drained":
+            if (not isinstance(result, dict) or result.get("state") != "drained"
+                    or result.get("bootId") != request["stop"]["boot_id"]):
                 raise RuntimeError("Core 未确认正常回合和排空")
             controller = await UnixWorkloadController(
                 Path(current["AKASHIC_WORKLOAD_RUNTIME_DIR"]) / "controller.sock"
@@ -177,17 +208,31 @@ def wait_for_stop(record: dict[str, Any], current: dict[str, str]) -> dict[str, 
     return asyncio.run(_prepare_stop(record["request"], current))
 
 
-def verify_closed(ack: dict[str, object], current: dict[str, str]) -> None:
-    """停止命令成功之外，核对正常关闭证据和实际容器退出。"""
-    closed = read_json(
-        Path(current["AKASHIC_WORKSPACE"]) / "runtime/closed" / f"{ack['bootId']}.json"
-    )
-    if (
-        closed.get("state") != "closed"
-        or closed.get("bootId") != ack["bootId"]
-        or closed.get("rootIdentity") != ack["rootIdentity"]
-    ):
-        raise RuntimeError("旧 Core 缺少正常关闭证据")
+async def _cancel_stop(request: dict[str, Any], current: dict[str, str]) -> None:
+    from akashic_sdk import AsyncAkashic
+    from plugins.gateway.cli import find_endpoint, read_token
+
+    workspace = Path(current["AKASHIC_WORKSPACE"])
+    endpoint = find_endpoint(workspace)
+    async with await AsyncAkashic.connect(endpoint, workspace_token=read_token(workspace, endpoint)) as client:
+        await client.request("runtime/cancel-stop", request["stop"])
+
+
+def cancel_stop(record: dict[str, Any], current: dict[str, str]) -> None:
+    """在 drained 之后、正式停机之前发生宿主 I/O 故障时，恢复旧 Core 的准入（#2130）。"""
+    asyncio.run(_cancel_stop(record["request"], current))
+
+
+def verify_closed(ack: dict[str, object], current: dict[str, str]) -> str:
+    """核对 boot 回执、实际容器及 Controller 退出，返回可由发布器结算的 boot。"""
+    from bootstrap.runtime_readiness import read_closed_boot
+
+    boot_id = ack["bootId"]
+    if not isinstance(boot_id, str):
+        raise RuntimeError("停止回执缺少 boot ID")
+    root, _pending = read_closed_boot(Path(current["AKASHIC_WORKSPACE"]), boot_id)
+    if root != ack["rootIdentity"]:
+        raise RuntimeError("旧 Core 关闭回执与排空的 Root 不符")
     controller = read_json(
         Path(current["AKASHIC_EXPERIMENT_ROOT"])
         / "workload-controller"
@@ -233,6 +278,8 @@ def verify_closed(ack: dict[str, object], current: dict[str, str]) -> None:
             state.splitlines()
         ):
             raise RuntimeError(f"旧服务未正常停止: {unit}: {state}")
+
+    return boot_id
 
 
 def _exec_target(path: Path, request: dict[str, Any]) -> None:
@@ -308,6 +355,8 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
             raise RuntimeError("任务未接纳或已执行，不自动重放")
         record["recordPath"] = str(path)
         record["status"] = "running"
+        record.setdefault("phase", "preparing")
+        record.setdefault("startedAt", _utc_now_iso())
         write_json(path, record)
     try:
         request = record["request"]
@@ -323,6 +372,14 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
         origin = "https://github.com/kachofugetsu09/akashic-agent.git"
         if not args.prepared:
             _exec_target(path, request)
+        record["phase"] = "preparing"
+        if "previousCommit" not in record and current.get("AKASHIC_RUNTIME_COMMIT"):
+            record["previousCommit"] = current["AKASHIC_RUNTIME_COMMIT"]
+        if "commitSubject" not in record:
+            subject = _commit_subject(source)
+            if subject:
+                record["commitSubject"] = subject
+        write_json(path, record)
         result = install(
             argparse.Namespace(
                 root=root,
@@ -341,13 +398,69 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
             ),
             self_deploy=record,
         )
-        record.update(status="active", result=result)
+        record.update(
+            status="active",
+            phase="active",
+            finishedAt=_utc_now_iso(),
+            result=result,
+        )
     except Exception as error:
-        record.update(status="failed", error=f"{type(error).__name__}: {error}")
+        record.update(
+            status="failed",
+            phase="failed",
+            finishedAt=_utc_now_iso(),
+            error=f"{type(error).__name__}: {error}",
+        )
+        write_json(path, record)
+        # 原异常仍让 systemd 记为失败；通知结果单独留在任务记录里。
+        record["notice"] = notify_failure(record)
         write_json(path, record)
         raise
     write_json(path, record)
     return record
+
+
+_NOTICE_WAIT_S = 180
+
+
+# Try prompt delivery; Core also reads the durable task after a delayed boot.
+def notify_failure(record: dict[str, Any]) -> str:
+    from plugins.jobs.host_notices import failure_notice
+
+    request = record["request"]
+    notice = failure_notice(record)
+    params = notice.model_dump(mode="json")
+    session = notice.session_id
+    deadline = time.monotonic() + _NOTICE_WAIT_S
+    last = ""
+    while True:
+        try:
+            current = read_environment(Path(request["runtimeEnv"]))
+            ready = read_json(Path(current["AKASHIC_WORKSPACE"]) / ".runtime-ready.json")
+            if ready.get("state") != "ready":
+                raise RuntimeError(f"Core 未就绪: {ready.get('state')}")
+            asyncio.run(_send_notice(current, params))
+            print(f"self-deploy.notice sent session={session}", file=sys.stderr, flush=True)
+            return "sent"
+        except Exception as notice_error:
+            last = f"{type(notice_error).__name__}: {notice_error}"
+            # 参数被拒（会话不存在或不是对话会话）重试也不会变；未就绪、方法尚未注册才等待。
+            if getattr(notice_error, "code", None) == -32602:
+                deadline = time.monotonic()
+        if time.monotonic() >= deadline:
+            print(f"self-deploy.notice failed session={session} error={last}", file=sys.stderr, flush=True)
+            return "pending Core recovery: " + last
+        time.sleep(5)
+
+
+async def _send_notice(current: dict[str, str], params: dict[str, object]) -> None:
+    from akashic_sdk import AsyncAkashic
+    from plugins.gateway.cli import find_endpoint, read_token
+
+    workspace = Path(current["AKASHIC_WORKSPACE"])
+    endpoint = find_endpoint(workspace)
+    async with await AsyncAkashic.connect(endpoint, workspace_token=read_token(workspace, endpoint)) as client:
+        await client.request("jobs/host-notice", params)
 
 
 def status(args: argparse.Namespace) -> dict[str, object]:

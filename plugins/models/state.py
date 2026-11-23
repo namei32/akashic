@@ -8,6 +8,8 @@ import math
 import random
 import re
 import secrets
+import sqlite3
+from urllib.parse import urlsplit
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -45,6 +47,9 @@ from plugins.models.contract import (
 from plugins.models.contract import (
     BoundModelDescriptor,
     ChatModelSelection,
+    MODEL_NEED_LABELS,
+    ModelChoice,
+    ModelUse,
     ConnectionDescriptor,
     CredentialHandle,
     DiscoveredModel,
@@ -56,6 +61,8 @@ from plugins.models.contract import (
     ModelAvailability,
     ModelCatalogSnapshot,
     ModelDescriptor,
+    DriverQuota,
+    QuotaReading,
 )
 from plugins.models.contract import (
     EMBEDDINGS,
@@ -65,6 +72,7 @@ from plugins.models.contract import (
     RevisionConflictError,
     ModelUnavailableError,
     ModelTimeoutError,
+    GenerationTimeoutError,
     SavedEmbedding,
 )
 from plugins.models.contract import (
@@ -81,7 +89,8 @@ from plugins.models.contract import (
     ModelUsage,
     ToolCall,
 )
-from plugins.models.contract import EmptyResponseError, ModelAttemptStatus
+from plugins.models.contract import RetryWaitInterrupted
+from plugins.models.contract import EmptyResponseError, InputReductionRequired, ModelAttemptStatus
 from agent.plugin_composition.tasks import register_task_bound_context
 from core.common.file_io import run_file_io
 
@@ -92,25 +101,28 @@ from .settings import (
     CancelConnectionAuth,
     CreateConnectionWithModel,
     DisableConnection,
+    EnableConnection,
     FinishConnectionAuth,
     ModelChange,
     SetDefaultModel,
     RemoveModel,
+    SetCatalogMode,
     SettingsReceipt,
     StartConnectionAuth,
     SyncModels,
     UpdateConnection,
     UpdateModel,
-    ExtendModelReasoningEfforts,
     VerifyModel,
 )
+from .composition import measure
+from .quota import ConnectionQuota, QuotaCache
 from .store import (
-    MODEL_ROLES,
     ModelsStore,
     StoredConnection,
     StoredModel,
     StoredSnapshot,
     _request_digest,
+    adoptable_chat_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -123,9 +135,10 @@ _RUN_ADMISSION = threading.Lock()
 _AUTH_ATTEMPT_TTL_SECONDS = 15 * 60
 _SETTINGS_MAX_MODEL_PROBES = 16
 _SETTINGS_MODEL_PROBE_SECONDS = 60
+_SETTINGS_MODEL_PROBE_CONCURRENCY = 4
 _DEFAULT_ROLE = "default"
-_AGENT_ROLE = "agent"
-_VISION_ROLE = "vision"
+# 主模型的调用出处名；插件经 use() 取的模型记为各自的 use_id。
+_MAIN_ROLE = "chat"
 
 
 class _CapabilityCatalog(Protocol):
@@ -134,6 +147,7 @@ class _CapabilityCatalog(Protocol):
         discovered: tuple[DiscoveredModel, ...],
         *,
         provider_id: str,
+        endpoint: str = "",
     ) -> tuple[DiscoveredModel, ...]: ...
 
 
@@ -153,7 +167,7 @@ def _decode_response(payload: object) -> LLMResponse:
         tool_calls=[
             ToolCall(
                 cast(str, item["id"]), cast(str, item["name"]),
-                cast(Mapping[str, Any], item["arguments"]),
+                cast(Mapping[str, Any] | str, item["arguments"]),
             )
             for item in cast(Sequence[Mapping[str, Any]], calls)
         ],
@@ -180,12 +194,14 @@ class _BoundChat:
         *,
         root_instance: str = _LOCAL_ROOT,
         max_attempts: int | None = 1,
+        generation_timeout: float = 3600.0,
     ) -> None:
         self._descriptor = descriptor
         self._driver = driver
         self._store = store
         self._root_instance = root_instance
         self._max_attempts = None if max_attempts is None else max(1, max_attempts)
+        self._generation_timeout = generation_timeout
         self._request_encodings: dict[int, tuple[object, bytes]] = {}
 
     @property
@@ -203,9 +219,9 @@ class _BoundChat:
         digest = _request_digest(request, self._request_encodings)
         if request.request_key is None:
             # 无 key 调用是独立效果身份：单次尝试记账，不共享回执也不占用重试预算。
-            return await self._attempts(
+            return await self._composed(request, await self._attempts(
                 request, f"anonymous:{secrets.token_hex(8)}", digest, budget=1
-            )
+            ))
         request_key = request.request_key
         # 同一 Store 合并活等待者；不同 Store 仍由共同账本的事务核对准入。
         live_runs = cast(
@@ -241,9 +257,21 @@ class _BoundChat:
         else:
             if not shared.done():
                 shared.set_result(result)
-            return result
+            return await self._composed(request, result)
         finally:
             live_runs.pop(run_key, None)
+
+    # 成功调用记下各部分份额；纯估算加一次小写入，失败只记日志，不影响回答。
+    async def _composed(self, request: ModelRequest, response: LLMResponse) -> LLMResponse:
+        log, call_id = self._store.composition, response.call_record_id
+        if log is None or call_id is None:
+            return response
+        try:
+            parts = measure(request)
+            await run_file_io(lambda: log.put(call_id, parts))
+        except (sqlite3.Error, OSError, ValueError, TypeError):
+            logger.warning("context composition record failed call=%s", call_id, exc_info=True)
+        return response
 
     def key_recovery(self, request_key: str) -> str:
         """同 key 最近耐久记录的恢复裁决，Models 独占分类、调用方只消费决定：
@@ -373,6 +401,8 @@ class _BoundChat:
         """Models 独占重试预算：一次 complete 内按预算恢复（默认最多 11 次）；每个真实
         attempt 先记账再结算，失败写耐久 next_attempt_at，重试前重新核对准入与孤儿。"""
         budget = self._max_attempts if budget is None else max(1, budget)
+        if request.max_attempts is not None:
+            budget = request.max_attempts if budget is None else min(budget, request.max_attempts)
         while True:
             # 1. 读取原请求回执和退避；成功只回放，终态不重新领取额度。
             replayed, records = await self._scan(request_key, digest, budget=budget)
@@ -395,21 +425,27 @@ class _BoundChat:
                     f"该请求已终结失败，同一请求不会自动重发。上次失败：{last['failure']}"
                 ).exception()
             limit = "" if budget is None else f"/{budget}"
+            # 调用方续接同一步时预算只是剩余额度，序号不是本步的总次数。
+            attempts_note = "" if request.max_attempts is None else "（本步剩余额度，此前的尝试另计）"
             next_at = None if last is None else last.get("next_attempt_at")
             # 已有失败时，退避与随后整次尝试都携带可见进度，直到这次尝试结束。
             attempt_status = _attempt_status(records, budget)
             if isinstance(next_at, (int, float)) and not isinstance(next_at, bool):
                 delay = float(next_at) - time.time()
+                if request.max_retry_wait is not None and delay > request.max_retry_wait:
+                    raise ModelUnavailableError(
+                        f"剩余重试等待 {math.ceil(delay)} 秒超过本请求的 {request.max_retry_wait:g} 秒上限；已停止，请稍后重新发起任务。"
+                    ).exception()
                 if delay > 0:
                     if request.on_delta is not None and attempt_status is not None and last is not None:
                         # 首行是状态标题，其后是原始失败原因；前端按行分开排版。
                         await request.on_delta({"retry_status": (
-                            f"模型暂时不可用，约 {math.ceil(delay)} 秒后进行第 {len(records) + 1}{limit} 次尝试\n"
+                            f"模型暂时不可用，约 {math.ceil(delay)} 秒后进行第 {len(records) + 1}{limit} 次尝试{attempts_note}\n"
                             f"{last['failure']}"
                         ), "attempt_status": replace(attempt_status, next_attempt_at=float(next_at)).encode()})
                     # 等待可取消；已结算的失败与允许时间保留，恢复按剩余额度继续。
                     log_timing("model.retry.wait", request_id=request_key, counts={"attempt": len(records) + 1})
-                    await asyncio.sleep(delay)
+                    await _wait_retry(delay, request.retry_wake, None if budget is None else budget - len(records))
             # 2. 先原子登记新的物理尝试，再调用单次 driver。
             owner_id = (
                 f"{self._store.host_epoch or 0}:{_PROCESS_INSTANCE}"
@@ -451,6 +487,8 @@ class _BoundChat:
             first_token_ms: float | None = None
             response: LLMResponse | None = None
             callback_failed = False
+            content_parts: list[str] = []
+            thinking_parts: list[str] = []
 
             async def publish(value: dict[str, str]) -> None:
                 nonlocal callback_failed
@@ -464,6 +502,10 @@ class _BoundChat:
             async def delta(value: dict[str, str]) -> None:
                 nonlocal first_token, first_token_ms
                 assert started is not None
+                if value.get("content_delta"):
+                    content_parts.append(value["content_delta"])
+                if value.get("thinking_delta"):
+                    thinking_parts.append(value["thinking_delta"])
                 if not first_token and (
                     value.get("content_delta") or value.get("thinking_delta")
                 ):
@@ -479,7 +521,7 @@ class _BoundChat:
                 try:
                     # driver 恒单次尝试：accounted 调用统一置 key，重试预算只由 Models 持有。
                     driver_request = replace(
-                        request, on_delta=None if request.on_delta is None else delta,
+                        request, on_delta=delta,
                         request_key=request_key,
                     )
                     if request.on_delta is not None:
@@ -488,10 +530,26 @@ class _BoundChat:
                         )})
                     started = monotonic_ns()
                     log_timing("model.driver.begin", operation_id=call_id, request_id=request_key)
-                    response = await self._driver.complete(driver_request)
+                    deadline = asyncio.timeout(self._generation_timeout)
+                    try:
+                        async with deadline:
+                            response = await self._driver.complete(driver_request)
+                    except TimeoutError:
+                        if not deadline.expired():
+                            raise
+                    if deadline.expired():
+                        response = LLMResponse(
+                            "".join(content_parts) or None,
+                            thinking="".join(thinking_parts) or None,
+                            finish_reason="timeout",
+                        )
+                        raise GenerationTimeoutError(
+                            f"本次模型生成已达到 {self._generation_timeout:g} 秒总期限，已停止且不会自动重试；"
+                            "已接收的部分输出保存在调用记录中，未执行其中的工具。请调整模型或任务后重新发起。"
+                        ).exception()
                     log_timing("model.driver.end", operation_id=call_id, request_id=request_key)
                     # 空生成没有可交付输出；使用同一请求恢复，不能把它提交为 quiet。
-                    if (response.finish_reason != "length"
+                    if (response.finish_reason not in {"length", "malformed_function_call"}
                             and not (response.content and response.content.strip())
                             and not response.tool_calls):
                         raise EmptyResponseError("模型没有产生正文或工具调用，正在重新生成").exception()
@@ -501,10 +559,22 @@ class _BoundChat:
                     # 模型生成与本地工具效果分开：暂时故障允许重发生成，
                     # 保留真实发送证据和未知 usage，不声称第一次请求没有计费。
                     original_failure = failure
+                    # Count settled consecutive empties, including a reopened key.
+                    if request.reduce_on_empty and ModelError.matches(failure, EmptyResponseError):
+                        empty_count = 1
+                        for record in reversed(records):
+                            if not str(record.get("failure", "")).startswith("EmptyResponseError:"):
+                                break
+                            empty_count += 1
+                        remaining = None if budget is None else budget - len(records) - 1
+                        if empty_count >= 3 and (remaining is None or remaining > 0):
+                            failure = InputReductionRequired(
+                                "模型连续 3 次返回空响应；先尝试缩减输入，随后只使用本步剩余尝试额度。",
+                                remaining_attempts=remaining,
+                            ).exception()
                     model_failure = ModelError.read(failure)
-                    partial_response = first_token or (
-                        model_failure.response_delta_seen if model_failure is not None
-                        else bool(getattr(failure, "response_delta_seen", False))
+                    partial_response = first_token or bool(getattr(failure, "response_delta_seen", False)) or (
+                        model_failure is not None and model_failure.response_delta_seen
                     )
                     evidence = None if model_failure is None else model_failure.send_evidence
                     retryable = model_failure is not None and not callback_failed and (
@@ -524,11 +594,20 @@ class _BoundChat:
                             candidate = now + float(hint)
                         else:
                             candidate = now + _backoff_seconds(len(records) + 1)
-                        retry_at = candidate
-                        stop_reason = "将自动恢复当前模型请求；此前生成的 usage 可能未知"
+                        if request.max_retry_wait is not None and candidate - now > request.max_retry_wait:
+                            stop_reason = (
+                                f"上游要求等待 {math.ceil(candidate - now)} 秒，超过本请求的 {request.max_retry_wait:g} 秒上限；"
+                                "已停止自动重试，请在上游允许后重新发起任务"
+                            )
+                            failure = ModelError.change(failure, retryable=False, retry_safe=False, retry_at=None, retry_after=None)
+                        else:
+                            retry_at = candidate
+                            stop_reason = "将自动恢复当前模型请求；此前生成的 usage 可能未知"
                     elif retryable:
                         stop_reason = "自动重试次数已用完；已完成的工具结果仍保留"
                         exhausted = budget is not None and budget > 1
+                    elif isinstance(model_failure, InputReductionRequired):
+                        stop_reason = "已将缩减选择交回调用方；本步未使用的尝试额度仍保留"
                     else:
                         stop_reason = "当前错误无法自动恢复；已完成的工具结果仍保留"
                     if isinstance(failure, asyncio.CancelledError) and (
@@ -538,12 +617,12 @@ class _BoundChat:
                         retry_at = time.time()
                     if model_failure is not None:
                         # 预算用完时先说结论和下一步，最后一次失败原因放在后面。
-                        failure = ModelError.change(failure, message=(
+                        failure = ModelError.change(failure, response_delta_seen=partial_response, message=(
                             f"上游连续失败 {len(records) + 1} 次，已停止重试；已完成的工具结果仍保留，"
                             f"可以发「继续」重试。\n最后一次失败：模型 {descriptor.model} 调用失败：{failure}"
                         ) if exhausted else (
                             f"模型 {descriptor.model} 调用失败：{failure}\n"
-                            f"已尝试 {len(records) + 1}{limit} 次。{stop_reason}"
+                            f"已尝试 {len(records) + 1}{limit} 次{attempts_note}。{stop_reason}"
                         ))
                     try:
                         await self._finish_call(partial(self._store.finish_call,
@@ -554,13 +633,20 @@ class _BoundChat:
                             duration_ms=None if started is None else (monotonic_ns() - started) / 1_000_000,
                             next_attempt_at=retry_at,
                             partial_response=partial_response,
+                            response=response if ModelError.matches(failure, GenerationTimeoutError) else None,
                             send_evidence=evidence,
                             first_token_ms=first_token_ms,
                         ), failure if isinstance(failure, asyncio.CancelledError) else None)
-                    except (asyncio.CancelledError, BaseExceptionGroup) as record_failure:
+                    except asyncio.CancelledError:
+                        # 回执已落盘，原错误在调用账本里；调用方已被取消，只传播取消。
+                        # 包成异常组会绕过各 owner 的 except Exception 和取消结算。
+                        if not isinstance(failure, asyncio.CancelledError):
+                            logger.info("模型请求失败后调用方被取消: %s", failure)
+                        raise
+                    except BaseExceptionGroup as record_failure:
                         if isinstance(failure, asyncio.CancelledError):
                             raise
-                        # 真实 provider 错误不能被后来的取消或回执拒写覆盖。
+                        # 回执没写成：真实 provider 错误不能被取消或回执拒写覆盖。
                         raise BaseExceptionGroup(
                             f"模型请求失败且回执结算被取消。原请求错误：{failure}", [failure, record_failure]
                         ) from None
@@ -582,6 +668,9 @@ class _BoundChat:
                     duration_ms=(monotonic_ns() - started) / 1_000_000,
                     response=response,
                     first_token_ms=first_token_ms,
+                    estimated_input_tokens=max(1, self.estimate_context_tokens(
+                        request.messages, request.tools,
+                    )) if not request.system_prompt else None,
                 ))
                 log_timing("model.response.committed", operation_id=call_id, request_id=request_key)
                 response = replace(response, call_record_id=call_id)
@@ -743,6 +832,24 @@ class _DriverScope:
             raise errors[0]
         raise BaseExceptionGroup("model driver scope 清理失败", errors)
 
+    # 执行中途追加一个连接：同样先进入 owner 作用域并登记关闭 Effect，再允许打开。
+    async def add(self, item: _SelectedDriver) -> None:
+        if item.connection_id in self.selected:
+            return
+        context = item.registration.context
+        if not any(existing.registration.context is context for existing in self.selected.values()):
+            scope = context.runtime_scope()
+            await scope.__aenter__()
+            self._runtime_scopes.append(scope)
+        holder = _ConnectionHolder()
+        effect = await context.effect(
+            lambda holder=holder: lambda: _close_connection(holder),
+            label=f"model-connection:{item.connection_id}",
+        )
+        self._effects.append(effect)
+        self.selected[item.connection_id] = item
+        self._holders[item.connection_id] = holder
+
     def holder(self, connection_id: str) -> _ConnectionHolder:
         """Return the pre-registered holder for one selected connection."""
 
@@ -779,7 +886,8 @@ class _Execution:
         snapshot: StoredSnapshot,
         model_id: str | None,
         reasoning_effort: str | None,
-        chat: Mapping[str, BoundChatModel],
+        main: BoundChatModel,
+        scope: _DriverScope,
     ) -> None:
         self.owner_task = asyncio.current_task()
         self.state = state
@@ -787,13 +895,32 @@ class _Execution:
         self.snapshot = snapshot
         self.model_id = model_id
         self.reasoning_effort = reasoning_effort
-        self._chat = MappingProxyType(dict(chat))
+        self._main = main
+        self._scope = scope
+        self._uses: dict[tuple[str, str, str | None], BoundChatModel] = {}
+        self._lock = asyncio.Lock()
 
-    def chat(self, role: str) -> BoundChatModel:
-        try:
-            return self._chat[role]
-        except KeyError as exc:
-            raise ModelUnavailableError(f"模型角色不可用: {role}").exception() from exc
+    def chat(self) -> BoundChatModel:
+        return self._main
+
+    # 插件按自己的配置取模型：同一冻结目录里解析，按 use_id 记出处，同一选择只绑定一次。
+    async def use(self, use: ModelUse, choice: ModelChoice) -> BoundChatModel:
+        if self.owner_task is not asyncio.current_task():
+            raise RuntimeError("model execution 不能由子 task 继承")
+        main = self._main.descriptor
+        requested = (
+            (main.model_id, main.reasoning_effort)
+            if use.check(choice).follow == "session"
+            else None if choice.model_id is None else (choice.model_id, choice.reasoning_effort)
+        )
+        model_id, effort = self.state.pick_chat(self.snapshot, use, requested)
+        key = (use.use_id, model_id, effort)
+        async with self._lock:
+            bound = self._uses.get(key)
+            if bound is None:
+                bound = await self.state.bind_use(self, model_id, use.use_id, effort, self._scope)
+                self._uses[key] = bound
+            return bound
 
 
 _CURRENT_EXECUTION: ContextVar[_Execution | None] = ContextVar(
@@ -836,24 +963,6 @@ register_task_bound_context(_CURRENT_MODEL_SELECTION, copy_to_child=_copy_model_
 register_task_bound_context(_CURRENT_EXECUTION, copy_to_child=_copy_execution_selection)
 
 
-def _check_vision_binding(snapshot: StoredSnapshot) -> None:
-    """Reject a corrupt historical vision binding before any driver opens."""
-
-    model_id = snapshot.role_bindings.get(_VISION_ROLE)
-    if model_id is None:
-        return
-    model = snapshot.models.get(model_id)
-    if model is None or model.kind != 'chat' or not model.enabled:
-        raise ModelUnavailableError(f"vision model 不可用: {model_id}").exception()
-    connection = snapshot.connections.get(model.connection_id)
-    if connection is None or not connection.enabled:
-        raise ModelUnavailableError(
-            f"vision model connection 不可用: {model.connection_id}"
-        ).exception()
-    if "image" not in model.capabilities.input_modalities:
-        raise ModelUnavailableError("vision role requires an image-capable model").exception()
-
-
 class _DriversView:
     def __init__(self, state: ModelsState) -> None:
         self._state = state
@@ -885,6 +994,12 @@ class _ChatModelsView:
         reasoning_effort: str | None = None,
     ):
         return self._state.independent_execution(model_id, reasoning_effort)
+
+    async def resolve(
+        self, use: ModelUse, choice: ModelChoice, session: ChatModelSelection = ChatModelSelection(),
+    ) -> ChatModelSelection:
+        async with self._state.context.runtime_scope():
+            return await self._state.resolve(use, choice, session)
 
 
 class _EmbeddingsView:
@@ -931,6 +1046,9 @@ class _SettingsView:
     async def apply(self, command: ModelChange) -> SettingsReceipt:
         return await self._state.apply_change(command)
 
+    async def quotas(self, *, fresh: bool, connection_id: str | None = None) -> tuple[ConnectionQuota, ...]:
+        return await self._state.read_quotas(fresh=fresh, connection_id=connection_id)
+
 
 class _MemoryCredential:
     def __init__(
@@ -974,6 +1092,7 @@ class ModelsState:
         self.embeddings = _EmbeddingsView(self)
         self.catalog = _CatalogView(self)
         self.settings = _SettingsView(self)
+        self.quotas = QuotaCache(self.read_quota)
         self._auth_attempts: dict[str, _AuthAttempt] = {}
         # Root 实例身份进入每次真实 attempt 的 owner_id，进程重启后不再继承。
         self._root_instance = secrets.token_hex(8)
@@ -1087,9 +1206,39 @@ class ModelsState:
         if failures:
             raise BaseExceptionGroup("model auth attempt 清理失败", failures)
 
+    # 全部连接的驱动图标只读一次目录；逐连接读取在几十个连接时会把聊天模型列表拖到数百毫秒。
+    async def connection_icons(self) -> dict[str, str | None]:
+        snapshot = await run_file_io(self._snapshot_or_empty)
+        return {connection_id: await self._connection_icon(connection)
+                for connection_id, connection in snapshot.connections.items()}
+
+    # 驱动为连接声明的图标；驱动缺席、未声明、出错或内容不像 SVG 时没有图标。
+    async def _connection_icon(self, connection: StoredConnection) -> str | None:
+        record = self._registrations.get(connection.driver_id)
+        if record is None or record.definition.icon is None:
+            return None
+        try:
+            async with record.context.runtime_scope():
+                icon = record.definition.icon(_driver_connection_descriptor(connection))
+        except Exception:
+            logger.exception("model driver icon failed: %s", connection.driver_id)
+            return None
+        if not isinstance(icon, str) or not icon.lstrip().startswith("<svg") or len(icon.encode()) > 16 * 1024:
+            return None
+        return icon
+
     def catalog_snapshot(self) -> ModelCatalogSnapshot:
         self._check_snapshot_service(MODEL_CATALOG, self.catalog)
-        snapshot = self._snapshot_or_empty()
+        return self._catalog_snapshot(self._snapshot_or_empty())
+
+    async def read_catalog(self) -> ModelCatalogSnapshot:
+        """Read storage in a worker, then project live driver state on the loop."""
+        self._check_snapshot_service(MODEL_CATALOG, self.catalog)
+        snapshot = await run_file_io(self._snapshot_or_empty)
+        return self._catalog_snapshot(snapshot)
+
+    def _catalog_snapshot(self, snapshot: StoredSnapshot) -> ModelCatalogSnapshot:
+        """Project a saved catalog with the current driver availability."""
         connections = tuple(
             ConnectionDescriptor(
                 connection_id=item.connection_id,
@@ -1097,6 +1246,9 @@ class ModelsState:
                 driver_id=item.driver_id,
                 auth_identity=item.auth_identity,
                 availability=self._availability(item),
+                endpoint_host=urlsplit(item.endpoint).hostname or "",
+                catalog_mode=item.catalog_mode,
+                endpoint=item.endpoint,
             )
             for item in snapshot.connections.values()
         )
@@ -1116,11 +1268,24 @@ class ModelsState:
         selection: ChatModelSelection,
     ) -> ChatModelSelection:
         self._check_snapshot_service(CHAT_MODELS, self.chat_models)
+        snapshot = self._snapshot_required() if selection.model_id is not None else None
+        return self._validate_chat_selection(selection, snapshot)
+
+    async def read_chat_selection(self, selection: ChatModelSelection) -> ChatModelSelection:
+        """Validate a chat preference after its storage read has drained."""
+        self._check_snapshot_service(CHAT_MODELS, self.chat_models)
+        snapshot = await run_file_io(self._snapshot_required) if selection.model_id is not None else None
+        return self._validate_chat_selection(selection, snapshot)
+
+    def _validate_chat_selection(
+        self, selection: ChatModelSelection, snapshot: StoredSnapshot | None,
+    ) -> ChatModelSelection:
+        """Check the saved model and live driver without doing storage work."""
         if selection.reasoning_effort and selection.model_id is None:
             raise ValueError("推理强度必须绑定显式模型")
         if selection.model_id is None:
             return ChatModelSelection()
-        snapshot = self._snapshot_required()
+        assert snapshot is not None
         model = snapshot.models.get(selection.model_id)
         if model is None:
             # 已移除的会话偏好跟随 default，旧型号的推理强度不能带到替代模型。
@@ -1139,45 +1304,76 @@ class ModelsState:
             raise ValueError(f"模型不支持推理强度: {selection.reasoning_effort}")
         return selection
 
-    def _select_chat_models(
+    def _select_main(
         self,
         snapshot: StoredSnapshot,
         explicit_model_id: str | None,
         reasoning_effort: str | None,
-    ) -> tuple[_SelectedChat, ...]:
-        """Freeze role-to-model choices before any driver connection can await."""
+    ) -> _SelectedChat:
+        """Freeze the execution's main model before any driver connection can await."""
 
-        _check_vision_binding(snapshot)
-        selected: list[_SelectedChat] = []
-        for role in MODEL_ROLES:
-            model_id = snapshot.role_bindings.get(role)
-            binding_role = role
-            if explicit_model_id is not None and role == _AGENT_ROLE:
-                model_id = explicit_model_id
-            if model_id is None:
-                # 已验证的会话选择直接供 agent 使用，不要求另存系统默认。
-                if role == _DEFAULT_ROLE and explicit_model_id is None:
-                    raise ModelUnavailableError("尚未配置 default 聊天模型").exception()
-                default_id = snapshot.role_bindings.get(_DEFAULT_ROLE)
-                if role == _VISION_ROLE:
-                    if (
-                        default_id is None
-                        or "image"
-                        not in snapshot.models[default_id].capabilities.input_modalities
-                    ):
-                        continue
-                model_id = default_id
-                binding_role = _DEFAULT_ROLE
-            if model_id is None:
-                continue
-            effort = (
-                reasoning_effort
-                if explicit_model_id and role == _AGENT_ROLE
-                else snapshot.role_reasoning_efforts.get(binding_role)
-                or snapshot.models[model_id].default_reasoning_effort
-            )
-            selected.append(_SelectedChat(role, model_id, effort))
-        return tuple(selected)
+        if explicit_model_id is not None:
+            return _SelectedChat(_MAIN_ROLE, explicit_model_id, reasoning_effort)
+        model_id, effort = self._default_chat(snapshot)
+        return _SelectedChat(_MAIN_ROLE, model_id, effort)
+
+    def _default_chat(self, snapshot: StoredSnapshot) -> tuple[str, str | None]:
+        model_id = snapshot.role_bindings.get(_DEFAULT_ROLE)
+        if model_id is None:
+            raise ModelUnavailableError("尚未配置 default 聊天模型").exception()
+        return model_id, (snapshot.role_reasoning_efforts.get(_DEFAULT_ROLE)
+                          or snapshot.models[model_id].default_reasoning_effort)
+
+    # 插件选择落到冻结目录：请求的模型可用且满足能力门槛时用它，否则回到默认模型；默认也不满足则明确失败。
+    def pick_chat(
+        self, snapshot: StoredSnapshot, use: ModelUse, requested: tuple[str, str | None] | None,
+    ) -> tuple[str, str | None]:
+        if requested is not None:
+            model = snapshot.models.get(requested[0])
+            connection = None if model is None else snapshot.connections.get(model.connection_id)
+            if (model is not None and connection is not None and model.kind == 'chat' and model.enabled
+                    and self._availability(connection) == 'available' and use.accepts(model.capabilities)):
+                effort = requested[1]
+                if effort is None or effort not in model.capabilities.supported_reasoning_efforts:
+                    effort = model.default_reasoning_effort
+                return model.model_id, effort
+            logger.warning("模型用途 %s 请求的 %s 不可用，改用默认模型", use.use_id, requested[0])
+        model_id, effort = self._default_chat(snapshot)
+        if not use.accepts(snapshot.models[model_id].capabilities):
+            raise ModelUnavailableError(
+                f"默认模型不满足「{use.label}」的要求（需要{'、'.join(MODEL_NEED_LABELS[need] for need in sorted(use.needs))}），"
+                "请在该插件设置里指定模型"
+            ).exception()
+        return model_id, effort
+
+    # 执行中途绑定另一个模型：连接按需追加进本次执行的驱动作用域，随执行一起关闭。
+    async def bind_use(
+        self, execution: _Execution, model_id: str, role: str, effort: str | None, scope: _DriverScope,
+    ) -> BoundChatModel:
+        connection = execution.snapshot.connections[execution.snapshot.models[model_id].connection_id]
+        (selected,) = self._select_driver_records((connection,))
+        await scope.add(selected)
+        return await self._bind_chat(
+            self._runtime_namespace((selected,)), execution.snapshot, model_id, role, effort, scope,
+        )
+
+    # 交给另一回合的选择：跟随对话用调用方读到的会话选择；回到默认时给空选择，让那一回合自己冻结默认模型。
+    async def resolve(
+        self, use: ModelUse, choice: ModelChoice, session: ChatModelSelection,
+    ) -> ChatModelSelection:
+        if use.check(choice).follow == "session":
+            requested = None if session.model_id is None else (session.model_id, session.reasoning_effort)
+        else:
+            requested = None if choice.model_id is None else (choice.model_id, choice.reasoning_effort)
+        if requested is None and not use.needs:
+            return ChatModelSelection()
+        snapshot = await run_file_io(self._snapshot_required)
+        model_id, effort = self.pick_chat(snapshot, use, requested)
+        if choice.follow == "session" and model_id == session.model_id:
+            return session
+        if (model_id, effort) == self._default_chat(snapshot):
+            return ChatModelSelection()
+        return ChatModelSelection(model_id, effort)
 
     @asynccontextmanager
     async def execution(
@@ -1219,27 +1415,22 @@ class ModelsState:
                     ChatModelSelection(model_id, reasoning_effort)
                 )
                 snapshot = self._snapshot_required()
-            selected_models = self._select_chat_models(
+            main = self._select_main(
                 snapshot,
                 selection.model_id,
                 selection.reasoning_effort,
             )
-            connections = tuple(
-                snapshot.connections[snapshot.models[item.model_id].connection_id]
-                for item in selected_models
-            )
-            selected_drivers = self._select_driver_records(connections)
+            connection = snapshot.connections[snapshot.models[main.model_id].connection_id]
+            selected_drivers = self._select_driver_records((connection,))
             namespace = self._runtime_namespace(selected_drivers)
             async with _driver_scope(
-                self, connections, selected=selected_drivers
+                self, (connection,), selected=selected_drivers
             ) as opened:
-                execution = await self._build_execution(
-                    namespace,
-                    snapshot,
-                    selection.model_id,
-                    selection.reasoning_effort,
-                    selected_models,
-                    opened,
+                bound = await self._bind_chat(
+                    namespace, snapshot, main.model_id, main.role, main.effort, opened,
+                )
+                execution = _Execution(
+                    self, namespace, snapshot, selection.model_id, selection.reasoning_effort, bound, opened,
                 )
                 token = _CURRENT_EXECUTION.set(execution)
                 try:
@@ -1378,34 +1569,6 @@ class ModelsState:
             raise ModelUnavailableError(f"模型连接已禁用: {connection.connection_id}").exception()
         return connection
 
-    async def _build_execution(
-        self,
-        plugin_snapshot_id: str,
-        snapshot: StoredSnapshot,
-        explicit_model_id: str | None,
-        reasoning_effort: str | None,
-        selected: tuple[_SelectedChat, ...],
-        opened: _DriverScope,
-    ) -> _Execution:
-        chat: dict[str, BoundChatModel] = {}
-        for item in selected:
-            chat[item.role] = await self._bind_chat(
-                plugin_snapshot_id,
-                snapshot,
-                item.model_id,
-                item.role,
-                item.effort,
-                opened,
-            )
-        return _Execution(
-            self,
-            plugin_snapshot_id,
-            snapshot,
-            explicit_model_id,
-            reasoning_effort,
-            chat,
-        )
-
     async def _bind_chat(
         self,
         plugin_snapshot_id: str,
@@ -1454,6 +1617,7 @@ class ModelsState:
             self.store,
             root_instance=self._root_instance,
             max_attempts=max_attempts,
+            generation_timeout=_generation_timeout(connection.driver_config),
         )
 
     async def _bind_embedding(
@@ -1542,16 +1706,24 @@ class ModelsState:
     async def _apply_change(self, command: ModelChange) -> SettingsReceipt:
         if isinstance(command, AddConnection):
             await self._probe_new_connection(command)
-            revision = self.store.add_connection(command)
+            revision = self.store.add_connection(command, await self._initial_models(command))
         elif isinstance(command, CreateConnectionWithModel):
             self._check_initial_model_identity(command)
             await self._check_new_connection_model(command)
             revision = self.store.create_connection_with_model(command)
         elif isinstance(command, UpdateConnection):
             await self._probe_updated_connection(command)
-            revision = self.store.update_connection(command)
+            snapshot = self._snapshot_required()
+            candidates = sorted(
+                model.model_id for model in snapshot.models.values()
+                if model.model_id not in command.remove_model_ids and model.kind == "chat"
+                and model.enabled and self._availability(snapshot.connections[model.connection_id]) == "available"
+            )
+            revision = self.store.update_connection(command, fallback_model_id=next(iter(candidates), None))
         elif isinstance(command, DisableConnection):
             revision = self.store.disable_connection(command)
+        elif isinstance(command, EnableConnection):
+            revision = self.store.enable_connection(command)
         elif isinstance(command, AddModel):
             await self._check_model(command)
             revision = self.store.add_model(command)
@@ -1589,8 +1761,6 @@ class ModelsState:
             if model.kind != 'chat':
                 raise ModelUnavailableError("向量模型的参数由试算维度决定，不支持手动编辑。").exception()
             revision = self.store.update_model(command)
-        elif isinstance(command, ExtendModelReasoningEfforts):
-            revision = self.store.extend_model_reasoning_efforts(command)
         elif isinstance(command, SetDefaultModel):
             if command.verify_embedding:
                 if command.role is not None:
@@ -1608,6 +1778,11 @@ class ModelsState:
             revision = self.store.set_default(command)
         elif isinstance(command, SyncModels):
             revision = await self._sync_models(command)
+        elif isinstance(command, SetCatalogMode):
+            adopted = await self._discover_saved(command.connection_id) if command.mode == "all" else ()
+            revision = self.store.set_catalog_mode(
+                command.expected_revision, command.connection_id, command.mode, adopted,
+            )
         elif isinstance(command, StartConnectionAuth):
             return await self._start_auth(command)
         elif isinstance(command, FinishConnectionAuth):
@@ -1621,10 +1796,19 @@ class ModelsState:
     async def _sync_models(self, command: SyncModels) -> int:
         """Discover outside SQLite, then publish one catalog revision with CAS."""
 
+        discovered = await self._discover_saved(command.connection_id)
+        return self.store.sync_models(
+            command.expected_revision,
+            command.connection_id,
+            discovered,
+        )
+
+    # 用保存的凭据读取并补全目录；不写库。
+    async def _discover_saved(self, connection_id: str) -> tuple[DiscoveredModel, ...]:
         snapshot = self._snapshot_required()
-        connection = snapshot.connections.get(command.connection_id)
+        connection = snapshot.connections.get(connection_id)
         if connection is None or not connection.enabled:
-            raise ModelUnavailableError(f"模型连接不可用: {command.connection_id}").exception()
+            raise ModelUnavailableError(f"模型连接不可用: {connection_id}").exception()
         registration = self._registration_required(connection.driver_id)
         definition = registration.definition
         if definition.discover is None:
@@ -1644,12 +1828,9 @@ class ModelsState:
                     connection.driver_config,
                     connection.driver_id,
                 ),
+                endpoint=connection.endpoint,
             )
-        return self.store.sync_models(
-            command.expected_revision,
-            connection.connection_id,
-            discovered,
-        )
+        return discovered
 
     async def probe_embedding_model(
         self, model: str, expected_revision: int, *,
@@ -1668,7 +1849,7 @@ class ModelsState:
                 descriptor = DriverConnectionDescriptor(
                     connection_id=connection.connection_id, name=connection.name,
                     driver_id=connection.driver_id, endpoint=connection.endpoint,
-                    auth_identity=connection.auth_identity, config=connection.driver_config,
+                    auth_identity=connection.auth_identity, config=_driver_config(connection.driver_config),
                 )
                 credential = _MemoryCredential(connection.connection_id, connection.auth_identity, connection.credential)
             else:
@@ -1706,10 +1887,41 @@ class ModelsState:
                 self.store.credential_handle(connection_id, connection.auth_identity))
         if self.capability_catalog is not None:
             models = await self.capability_catalog.enrich(models,
-                provider_id=_capability_provider_id(connection.driver_config, connection.driver_id))
+                provider_id=_capability_provider_id(connection.driver_config, connection.driver_id),
+                endpoint=connection.endpoint)
         if self._snapshot_required().revision != expected_revision:
             raise RevisionConflictError("配置已改变，请重新读取目录。").exception()
         return models
+
+    # 只读启用中、驱动声明了额度读取的连接；停用或删除的连接一并清出缓存。
+    async def read_quotas(self, *, fresh: bool, connection_id: str | None) -> tuple[ConnectionQuota, ...]:
+        snapshot = self._snapshot_required()
+        readable = [
+            connection.connection_id for connection in snapshot.connections.values()
+            if connection.enabled and self._quota_reader(connection.driver_id) is not None
+        ]
+        self.quotas.forget(readable)
+        if connection_id is not None:
+            readable = [item for item in readable if item == connection_id]
+        return tuple(item for item in await self.quotas.read(readable, fresh=fresh) if item.shown)
+
+    async def read_quota(self, connection_id: str) -> QuotaReading | None:
+        connection = self._snapshot_required().connections.get(connection_id)
+        if connection is None or not connection.enabled:
+            raise ModelUnavailableError("连接不存在或已停用。").exception()
+        registration = self._registration_required(connection.driver_id)
+        read = registration.definition.read_quota
+        if read is None:
+            raise ModelUnavailableError("该连接不提供额度。").exception()
+        async with registration.context.runtime_scope():
+            return await read(_driver_connection_descriptor(connection),
+                self.store.credential_handle(connection_id, connection.auth_identity))
+
+    def _quota_reader(self, driver_id: str) -> DriverQuota | None:
+        record = self._registrations.get(driver_id)
+        if record is None or record.context.fiber.state is not FiberState.ACTIVE:
+            return None
+        return record.definition.read_quota
 
     async def _discover_new_connection(
         self,
@@ -1727,7 +1939,7 @@ class ModelsState:
             driver_id=connection.driver_id,
             endpoint=connection.endpoint,
             auth_identity=connection.auth_identity,
-            config=connection.driver_config,
+            config=_driver_config(connection.driver_config),
         )
         credential = _MemoryCredential(
             connection.connection_id,
@@ -1743,8 +1955,29 @@ class ModelsState:
                     connection.driver_config,
                     connection.driver_id,
                 ),
+                endpoint=connection.endpoint,
             )
         return discovered
+
+    # 新连接要带上的模型：all 收目录里全部对话模型，picked 只收用户在目录里勾的。
+    async def _initial_models(self, command: AddConnection) -> tuple[DiscoveredModel, ...]:
+        # 1. 没要求模型时不读目录，保持原来的只建连接。
+        if command.catalog_mode == "picked" and not command.adopt_models:
+            return ()
+        discovered = await self._discover_new_connection(command)
+        # 2. 与写入时同一条规则过滤，过滤后为空就不建连接。
+        chat = tuple(item for item in discovered if adoptable_chat_model(item))
+        if command.catalog_mode == "all":
+            if not chat:
+                raise ModelUnavailableError("服务商的模型列表里没有可用的对话模型。").exception()
+            return chat
+        # 3. 勾选的必须都是目录里的对话模型；目录外的型号走手动添加。
+        wanted = set(command.adopt_models)
+        picked = tuple(item for item in chat if item.model in wanted)
+        missing = wanted - {item.model for item in picked}
+        if missing:
+            raise ModelUnavailableError(f"服务商目录里没有这些对话模型：{', '.join(sorted(missing))}").exception()
+        return picked
 
     async def _probe_new_connection(self, command: AddConnection) -> None:
         connection = StoredConnection(
@@ -1770,6 +2003,11 @@ class ModelsState:
             raise ModelUnavailableError(f"模型连接不存在: {command.connection_id}").exception()
         if not existing.enabled:
             raise ModelUnavailableError("连接已停用；请新建连接，历史配置保留。").exception()
+        # 取消的型号只属于本连接；验证和提交使用同一份明确的移除清单。
+        for model_id in command.remove_model_ids:
+            model = snapshot.models.get(model_id)
+            if model is None or model.connection_id != command.connection_id:
+                raise ValueError(f"待移除模型不属于此连接: {model_id}")
         connection = replace(
             existing,
             name=command.name,
@@ -1796,7 +2034,8 @@ class ModelsState:
                    or connection.auth_identity != existing.auth_identity
                    or connection.driver_config != existing.driver_config)
         models = tuple(model for model in snapshot.models.values()
-                       if changed and model.connection_id == connection.connection_id and model.enabled)
+                       if changed and model.connection_id == connection.connection_id and model.enabled
+                       and model.model_id not in command.remove_model_ids)
         if len(models) > _SETTINGS_MAX_MODEL_PROBES:
             raise ValueError(f"连接有 {len(models)} 个已启用模型，超出一次验证上限 {_SETTINGS_MAX_MODEL_PROBES}。请新建连接选择需要的型号，再显式停用旧连接。")
         selected = self._select_driver_records((connection,))
@@ -1805,13 +2044,23 @@ class ModelsState:
             if not models:
                 return
             # 2. 所有候选调用成功才允许原事务更新；失败不改写旧凭证或用途。
+            # 各模型的验证互不依赖，限量并发：总耗时约等于最慢的一个，而不是逐个相加。
             definition, driver = await self._open_driver(connection, opened, credential=credential)
+            gate = asyncio.Semaphore(_SETTINGS_MODEL_PROBE_CONCURRENCY)
+
+            async def check(model: StoredModel) -> None:
+                async with gate:
+                    await self._check_bound_model(snapshot, connection, model, definition, driver, credential)
+
             try:
-                async with asyncio.timeout(_SETTINGS_MODEL_PROBE_SECONDS):
+                async with asyncio.timeout(_SETTINGS_MODEL_PROBE_SECONDS), asyncio.TaskGroup() as group:
                     for model in models:
-                        await self._check_bound_model(snapshot, connection, model, definition, driver, credential)
+                        _ = group.create_task(check(model))
             except TimeoutError as error:
                 raise ModelTimeoutError("模型验证超过一分钟；连接未更新，请稍后重试。").exception() from error
+            except BaseExceptionGroup as failures:
+                # 3. 报第一个失败的模型，其余验证已被取消；错误形状与逐个验证时相同。
+                raise failures.exceptions[0] from None
 
     async def _probe_connection(
         self,
@@ -2223,8 +2472,36 @@ def _driver_connection_descriptor(
         driver_id=connection.driver_id,
         endpoint=connection.endpoint,
         auth_identity=connection.auth_identity,
-        config=connection.driver_config,
+        config=_driver_config(connection.driver_config),
     )
+
+
+# Backoff stays cancellable; a wake ends this key and hands back only its unused attempts.
+async def _wait_retry(delay: float, wake: asyncio.Event | None, remaining: int | None) -> None:
+    if wake is None:
+        await asyncio.sleep(delay)
+        return
+    try:
+        async with asyncio.timeout(delay):
+            _ = await wake.wait()
+    except TimeoutError:
+        return
+    raise RetryWaitInterrupted("调用方结束了本次退避等待", remaining_attempts=remaining).exception()
+
+
+# Models consumes its own deadline before passing provider config to a driver.
+def _driver_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    _generation_timeout(config)
+    return {key: value for key, value in config.items() if key != "generation_timeout"}
+
+
+# A finite per-generation deadline is separate from idle time and retry waiting.
+def _generation_timeout(config: Mapping[str, Any]) -> float:
+    value = config.get("generation_timeout", 3600.0)
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value <= 0):
+        raise ValueError("generation_timeout must be a finite positive number of seconds")
+    return float(value)
 
 
 # 未配置时与 Claude Code DEFAULT_MAX_RETRIES 一致：首次加 10 次重试。

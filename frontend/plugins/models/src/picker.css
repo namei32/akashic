@@ -1,0 +1,277 @@
+/* 模型选择器主体：聊天胶囊与设置页场景选择共用；这里不放动画与全局命名规则，设置页样式表才能引入。 */
+.model-picker__group-icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  object-fit: contain;
+}
+
+/* 选择器主体：搜索行横跨两列，下方左侧来源栏、右侧列表；只有一个来源时没有来源栏。 */
+.model-picker__body {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.model-picker__body.has-rail {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.model-picker__body.has-rail .model-picker__search {
+  grid-column: 1 / -1;
+}
+
+.model-picker__rail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  overflow-y: auto;
+  border-inline-end: 1px solid var(--ak-rule-subtle);
+  padding: 6px 5px;
+  scrollbar-width: none;
+}
+
+.model-picker__rail-item {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: var(--ak-radius-sm);
+  color: var(--ak-ink-secondary);
+  background: transparent;
+  font: inherit;
+  font-size: var(--chat-type-caption);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.model-picker__rail-item img {
+  width: 16px;
+  height: 16px;
+  object-fit: contain;
+}
+
+.model-picker__rail-item[aria-pressed="true"] {
+  color: var(--ak-ink-primary);
+  background: color-mix(in oklab, var(--ak-ink-primary) 8%, transparent);
+}
+@media (hover: hover) {
+  .model-picker__rail-item:hover { color: var(--ak-ink-primary); background: color-mix(in oklab, var(--ak-ink-primary) 5%, transparent); }
+}
+
+.model-picker__rail-item:focus-visible {
+  outline: 2px solid var(--ak-rule-focus);
+  outline-offset: -2px;
+}
+
+.model-picker__rail-rule {
+  width: 18px;
+  flex: 0 0 auto;
+  margin: 3px 0;
+  border-top: 1px solid var(--ak-rule-default);
+}
+
+.model-picker__search {
+  display: flex;
+  height: 2.5rem;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--ak-rule-subtle);
+  padding: 0 12px;
+  color: var(--ak-ink-secondary);
+}
+
+.model-picker__search input {
+  width: 100%;
+  border: 0;
+  color: var(--ak-ink-primary);
+  background: transparent;
+  font: inherit;
+  font-size: 0.8125rem;
+  outline: none;
+}
+
+.model-picker__list {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+  scrollbar-color: var(--ak-rule-strong) transparent;
+  scrollbar-width: thin;
+}
+
+/* 跟随默认不属于任何来源，和下面的来源分组隔开一点。 */
+.model-picker__follow {
+  margin-block-end: 4px;
+}
+
+.model-picker__group + .model-picker__group {
+  margin-block-start: 6px;
+}
+
+.model-picker__group-title {
+  display: flex;
+  min-height: 1.5rem;
+  align-items: center;
+  gap: 6px;
+  padding: 0.15rem 8px;
+  color: var(--ak-ink-secondary);
+  font-size: var(--chat-type-caption);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* Cursor 式单行选项：名字与能力同一行，勾选在行尾；当前项（键盘或指针）6% 墨，已选 8%，两者叠加 11%。 */
+.model-picker__option {
+  display: flex;
+  width: 100%;
+  min-height: 30px;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: var(--ak-radius-sm);
+  padding: 5px 8px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  user-select: none;
+}
+
+.model-picker__option + .model-picker__option {
+  margin-block-start: 1px;
+}
+
+.model-picker__option[data-active] {
+  background: color-mix(in oklab, var(--ak-ink-primary) 6%, transparent);
+}
+
+.model-picker__option.is-selected {
+  background: color-mix(in oklab, var(--ak-ink-primary) 8%, transparent);
+}
+
+.model-picker__option.is-selected[data-active] {
+  background: color-mix(in oklab, var(--ak-ink-primary) 11%, transparent);
+}
+
+.model-picker__check {
+  flex: 0 0 auto;
+  margin-inline-start: auto;
+  color: var(--ak-ink-primary);
+  opacity: 0;
+}
+
+.model-picker__option.is-selected .model-picker__check {
+  opacity: 0.8;
+}
+
+.model-picker__copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 8px;
+  text-align: start;
+}
+
+/* 模型名必须能区分版本，不能在选择列表里只留下相同的省略前缀：放不下就折行。 */
+.model-picker__copy strong {
+  min-width: 0;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+.model-picker__copy mark {
+  color: var(--ak-rule-focus);
+  background: transparent;
+  font-weight: 650;
+}
+
+.model-picker__option.is-selected .model-picker__copy strong {
+  font-weight: 600;
+}
+
+.model-picker__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-picker__meta em,
+.model-picker__meta i {
+  color: var(--ak-ink-muted);
+  font-size: var(--chat-type-micro);
+  font-style: normal;
+}
+
+.model-picker__meta i {
+  font-variant-numeric: tabular-nums;
+}
+
+.model-picker__meta svg {
+  color: var(--ak-ink-muted);
+}
+
+.model-picker__star {
+  display: grid;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: var(--ak-radius-xs);
+  padding: 2px;
+  color: var(--ak-ink-muted);
+  background: transparent;
+  cursor: pointer;
+  opacity: 0;
+  transition-property: opacity, color;
+  transition-duration: var(--ak-sys-duration-short);
+}
+
+.model-picker__option[data-active] .model-picker__star,
+.model-picker__star.is-favorite {
+  opacity: 1;
+}
+
+@media (hover: hover) {
+  .model-picker__star:hover {
+    color: var(--ak-ink-primary);
+  }
+}
+
+.model-picker__star.is-favorite svg {
+  fill: currentColor;
+}
+/* 触屏没有悬停，未收藏的星淡显（不是藏起来）才找得到收藏入口；热区放大到约 36px，负边距不撑高行。 */
+@media (hover: none) {
+  .model-picker__star:not(.is-favorite) { opacity: 0.45; }
+}
+@media (pointer: coarse) {
+  .model-picker__star { padding: 10px; margin: -9px -4px -9px -10px; }
+}
+
+.model-picker__empty {
+  margin: 1.25rem 0;
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 0.8125rem;
+  text-align: center;
+}
+
+.model-picker__search > .lucide-search {
+  translate: 0.5px -0.5px;
+}
+
+@media (forced-colors: active) {
+  .model-picker__option.is-selected,
+  .model-picker__option[data-active] {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+}

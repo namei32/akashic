@@ -14,14 +14,13 @@ from plugins.ledger.contract import ARTIFACT_READ
 from plugins.ledger.contract import MESSAGE_WRITERS, OWNER_STATE
 from plugins.reply_program.contract import (
     REPLY_EXECUTE_V4,
-    REPLY_EXECUTE_GLOBAL_PROMPT,
 )
 from plugins.sources.contract import (
     SourceGuard,
 )
 
 from plugins.content.contract import CONTENT
-from plugins.context.contract import CONTEXT, GLOBAL_PROMPT_MATERIALS, MATERIALS_V4
+from plugins.context.contract import CONTEXT, MATERIALS_V4
 from plugins.models.contract import (
     MODEL_CALLS, MODEL_CHECKS, MODEL_CONTENT, MODEL_PROJECTION, MODEL_SELECTION,
 )
@@ -32,7 +31,7 @@ from .program import run_reply
 
 api_version = 3
 name = "reply_program"
-version = "1.1.0"
+version = "1.0.0"
 desc = "一次回复的资源与执行组合；不拥有来源策略或后台监听"
 inject = (CHAT_MODELS, CONTENT, CONTEXT, MATERIALS_V4, MODEL_CALLS, MODEL_CHECKS,
           MODEL_CONTENT, MODEL_PROJECTION, MODEL_SELECTION, REACT_ORDERED_V2, TOOL_CLEANUP,
@@ -71,17 +70,7 @@ async def apply(ctx: Context) -> None:
         """新合同只把用途选择交给当前材料 provider。"""
         return await execute(ctx, task, reader, source,
                              check_admission=check_admission,
-                             materials=materials.bind(exclude_kinds=exclude_material_kinds), **options)
+                             materials=materials.bind(exclude_kinds=exclude_material_kinds),
+                             history_start=materials.history_start, **options)
 
     _ = await ctx.provide(REPLY_EXECUTE_V4, ctx.entrypoint(selected))
-
-    async def global_prompts(child: Context) -> None:
-        global_materials = child.require(GLOBAL_PROMPT_MATERIALS)
-        async def selected_global(ctx: Context, task: Task, reader: MessageReader, source: str, *,
-                                  check_admission: SourceGuard,
-                                  exclude_material_kinds: frozenset[MaterialKind] = frozenset(),
-                                  **options: Any) -> Message:
-            return await execute(ctx, task, reader, source, check_admission=check_admission,
-                                 materials=global_materials.bind(exclude_kinds=exclude_material_kinds), **options)
-        _ = await child.provide(REPLY_EXECUTE_GLOBAL_PROMPT, child.entrypoint(selected_global))
-    _ = await ctx.inject((GLOBAL_PROMPT_MATERIALS,), global_prompts, name="global-prompts")

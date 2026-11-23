@@ -198,7 +198,7 @@ class ExecutionStatesReply(_message.Message):
     def __init__(self, states: _Optional[_Iterable[_Union[ExecutionState, _Mapping]]] = ...) -> None: ...
 
 class FileRequest(_message.Message):
-    __slots__ = ("context", "allowed_dir", "read", "write", "edit", "list", "path_info")
+    __slots__ = ("context", "allowed_dir", "read", "write", "edit", "list", "path_info", "read_chunk")
     CONTEXT_FIELD_NUMBER: _ClassVar[int]
     ALLOWED_DIR_FIELD_NUMBER: _ClassVar[int]
     READ_FIELD_NUMBER: _ClassVar[int]
@@ -206,6 +206,7 @@ class FileRequest(_message.Message):
     EDIT_FIELD_NUMBER: _ClassVar[int]
     LIST_FIELD_NUMBER: _ClassVar[int]
     PATH_INFO_FIELD_NUMBER: _ClassVar[int]
+    READ_CHUNK_FIELD_NUMBER: _ClassVar[int]
     context: RequestContext
     allowed_dir: str
     read: ReadFile
@@ -213,7 +214,8 @@ class FileRequest(_message.Message):
     edit: EditFile
     list: ListDir
     path_info: PathInfo
-    def __init__(self, context: _Optional[_Union[RequestContext, _Mapping]] = ..., allowed_dir: _Optional[str] = ..., read: _Optional[_Union[ReadFile, _Mapping]] = ..., write: _Optional[_Union[WriteFile, _Mapping]] = ..., edit: _Optional[_Union[EditFile, _Mapping]] = ..., list: _Optional[_Union[ListDir, _Mapping]] = ..., path_info: _Optional[_Union[PathInfo, _Mapping]] = ...) -> None: ...
+    read_chunk: ReadFileChunk
+    def __init__(self, context: _Optional[_Union[RequestContext, _Mapping]] = ..., allowed_dir: _Optional[str] = ..., read: _Optional[_Union[ReadFile, _Mapping]] = ..., write: _Optional[_Union[WriteFile, _Mapping]] = ..., edit: _Optional[_Union[EditFile, _Mapping]] = ..., list: _Optional[_Union[ListDir, _Mapping]] = ..., path_info: _Optional[_Union[PathInfo, _Mapping]] = ..., read_chunk: _Optional[_Union[ReadFileChunk, _Mapping]] = ...) -> None: ...
 
 class ReadFile(_message.Message):
     __slots__ = ("path", "offset", "limit")
@@ -274,14 +276,38 @@ class PathInfo(_message.Message):
     def __init__(self, action: _Optional[str] = ..., path: _Optional[str] = ..., base_dir: _Optional[str] = ..., after: _Optional[str] = ..., limit: _Optional[int] = ..., max_bytes: _Optional[int] = ...) -> None: ...
 
 class FileReply(_message.Message):
-    __slots__ = ("text", "image", "error")
+    __slots__ = ("text", "image", "error", "chunk")
     TEXT_FIELD_NUMBER: _ClassVar[int]
     IMAGE_FIELD_NUMBER: _ClassVar[int]
     ERROR_FIELD_NUMBER: _ClassVar[int]
+    CHUNK_FIELD_NUMBER: _ClassVar[int]
     text: str
     image: FileImage
     error: FileError
-    def __init__(self, text: _Optional[str] = ..., image: _Optional[_Union[FileImage, _Mapping]] = ..., error: _Optional[_Union[FileError, _Mapping]] = ...) -> None: ...
+    chunk: FileChunk
+    def __init__(self, text: _Optional[str] = ..., image: _Optional[_Union[FileImage, _Mapping]] = ..., error: _Optional[_Union[FileError, _Mapping]] = ..., chunk: _Optional[_Union[FileChunk, _Mapping]] = ...) -> None: ...
+
+class ReadFileChunk(_message.Message):
+    __slots__ = ("path", "offset", "version")
+    PATH_FIELD_NUMBER: _ClassVar[int]
+    OFFSET_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    path: str
+    offset: int
+    version: str
+    def __init__(self, path: _Optional[str] = ..., offset: _Optional[int] = ..., version: _Optional[str] = ...) -> None: ...
+
+class FileChunk(_message.Message):
+    __slots__ = ("data", "filename", "size", "version")
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    FILENAME_FIELD_NUMBER: _ClassVar[int]
+    SIZE_FIELD_NUMBER: _ClassVar[int]
+    VERSION_FIELD_NUMBER: _ClassVar[int]
+    data: bytes
+    filename: str
+    size: int
+    version: str
+    def __init__(self, data: _Optional[bytes] = ..., filename: _Optional[str] = ..., size: _Optional[int] = ..., version: _Optional[str] = ...) -> None: ...
 
 class FileError(_message.Message):
     __slots__ = ("text", "is_error")
@@ -432,3 +458,50 @@ class TerminalReply(_message.Message):
     list: TerminalList
     unknown_terminal_id: int
     def __init__(self, info: _Optional[_Union[TerminalInfo, _Mapping]] = ..., done: bool = ..., output: _Optional[_Union[TerminalOutput, _Mapping]] = ..., list: _Optional[_Union[TerminalList, _Mapping]] = ..., unknown_terminal_id: _Optional[int] = ...) -> None: ...
+
+class RawProcessRequest(_message.Message):
+    __slots__ = ("context", "owner_session_key", "operation", "identity", "argv", "cwd", "env", "data", "stream", "offset")
+    class EnvEntry(_message.Message):
+        __slots__ = ("key", "value")
+        KEY_FIELD_NUMBER: _ClassVar[int]
+        VALUE_FIELD_NUMBER: _ClassVar[int]
+        key: str
+        value: str
+        def __init__(self, key: _Optional[str] = ..., value: _Optional[str] = ...) -> None: ...
+    CONTEXT_FIELD_NUMBER: _ClassVar[int]
+    OWNER_SESSION_KEY_FIELD_NUMBER: _ClassVar[int]
+    OPERATION_FIELD_NUMBER: _ClassVar[int]
+    IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    ARGV_FIELD_NUMBER: _ClassVar[int]
+    CWD_FIELD_NUMBER: _ClassVar[int]
+    ENV_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    STREAM_FIELD_NUMBER: _ClassVar[int]
+    OFFSET_FIELD_NUMBER: _ClassVar[int]
+    context: RequestContext
+    owner_session_key: str
+    operation: str
+    identity: str
+    argv: _containers.RepeatedScalarFieldContainer[str]
+    cwd: str
+    env: _containers.ScalarMap[str, str]
+    data: bytes
+    stream: str
+    offset: int
+    def __init__(self, context: _Optional[_Union[RequestContext, _Mapping]] = ..., owner_session_key: _Optional[str] = ..., operation: _Optional[str] = ..., identity: _Optional[str] = ..., argv: _Optional[_Iterable[str]] = ..., cwd: _Optional[str] = ..., env: _Optional[_Mapping[str, str]] = ..., data: _Optional[bytes] = ..., stream: _Optional[str] = ..., offset: _Optional[int] = ...) -> None: ...
+
+class RawProcessReply(_message.Message):
+    __slots__ = ("identity", "data", "next_offset", "eof", "exit_code", "closed")
+    IDENTITY_FIELD_NUMBER: _ClassVar[int]
+    DATA_FIELD_NUMBER: _ClassVar[int]
+    NEXT_OFFSET_FIELD_NUMBER: _ClassVar[int]
+    EOF_FIELD_NUMBER: _ClassVar[int]
+    EXIT_CODE_FIELD_NUMBER: _ClassVar[int]
+    CLOSED_FIELD_NUMBER: _ClassVar[int]
+    identity: str
+    data: bytes
+    next_offset: int
+    eof: bool
+    exit_code: int
+    closed: bool
+    def __init__(self, identity: _Optional[str] = ..., data: _Optional[bytes] = ..., next_offset: _Optional[int] = ..., eof: bool = ..., exit_code: _Optional[int] = ..., closed: bool = ...) -> None: ...

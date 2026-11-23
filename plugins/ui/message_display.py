@@ -1,13 +1,15 @@
 """UI owner 在本次实际回调的作用域内投影消息。"""
 from __future__ import annotations
 
+import inspect
+
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 
 from agent.plugin_composition import Context, ServiceKey
 from plugins.ledger.contract import MESSAGE_CATALOG, MessageReader
-from plugins.ui.contract import MessageDisplayProviders, PartDisplayProvider, message_rows
-from plugins.tools.contract import TOOL_DISPLAY_NAME
+from plugins.ui.contract import MessageDisplayProviders, PartDisplayHandler, PartDisplayValue, hidden_part, message_rows, part_display_key
+from plugins.tools.contract import TOOL_DISPLAY
 from plugins.ui.contract import ToolResultDisplayProvider, MessagePage
 from plugins.ledger.contract import ContentPart, Control, Message, ToolCall, ToolResult
 
@@ -27,19 +29,19 @@ async def project_message_rows(
                 kinds.append(part.kind)
             elif isinstance(part, ToolCall):
                 has_tool_call = True
-    providers: dict[str, PartDisplayProvider] = {}
+    providers: dict[str, PartDisplayHandler] = {}
     result_providers: dict[str, ToolResultDisplayProvider] = {}
 
     # 2. 借用从唯一 provider 目录取得真实 scope，不持有或查询 Root。
     with ExitStack() as scopes:
         for kind in kinds:
-            display = scopes.enter_context(ctx.borrow(ServiceKey[PartDisplayProvider](f"message.display:{kind}")))
+            display = scopes.enter_context(ctx.borrow(part_display_key(kind)))
             if display is not None:
                 providers[kind] = display
             result_display = scopes.enter_context(ctx.borrow(ServiceKey[ToolResultDisplayProvider](f"message.result_display:{kind}")))
             if result_display is not None:
                 result_providers[kind] = result_display
-        tool_name = scopes.enter_context(ctx.borrow(TOOL_DISPLAY_NAME)) if has_tool_call else None
+        tool_display = scopes.enter_context(ctx.borrow(TOOL_DISPLAY)) if has_tool_call else None
         result_values: dict[tuple[str, int], object] = {}
         if result_providers:
             catalog = scopes.enter_context(ctx.borrow(MESSAGE_CATALOG))
@@ -53,8 +55,23 @@ async def project_message_rows(
                     provider = result_providers.get(part.kind)
                     if provider is not None:
                         result_values[message.message_id, index] = await provider(part, read_message)
+        # 3. 异步内容在同代 lease 内读完；同步行投影只取得本页已解析的值。
+        shown: dict[int, PartDisplayValue] = {}
+        for message in page.messages:
+            if isinstance(message.body, Control):
+                continue
+            for index, part in enumerate(message.body.parts):
+                if not isinstance(part, ContentPart) or (message.message_id, index) in result_values:
+                    continue
+                provider = providers.get(part.kind)
+                if provider is not None and provider is not hidden_part:
+                    value = provider(part)
+                    shown[id(part)] = await value if inspect.isawaitable(value) else value
         return message_rows(page, display_only=display_only, providers=MessageDisplayProviders(
-            tool_name=tool_name, part_display=providers, result_values=result_values,
+            tool_display=tool_display,
+            part_display={kind: hidden_part if provider is hidden_part else lambda part: shown[id(part)]
+                          for kind, provider in providers.items()},
+            result_values=result_values,
         ))
 
 

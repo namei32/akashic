@@ -4,13 +4,13 @@ import asyncio
 import json
 from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
-from typing import Annotated
+from typing import cast, Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
-from plugins.ledger.contract import ContentPart, Input, Message, Output
+from plugins.ledger.contract import ContentPart, Input, Message, MessageReader, Output, with_truncated_head
 
-from .services import MessageCatalogPort, MessagePagePort, SessionEntryPort
+from .services import ChannelClosed, MessageCatalogPort, MessagePagePort, SessionEntryPort
 
 POLL_INTERVAL_SECONDS = 2.0
 HEARTBEAT_SECONDS = 15.0
@@ -78,21 +78,33 @@ class NotificationFeed:
         after: tuple[str, str] | None = None
         while True:
             async with self._open_catalog() as catalog:
-                page = catalog.sessions(prefix=self._prefix, visibility="listed", after=after, limit=_PAGE_SIZE)
+                page = await catalog.sessions_async(prefix=self._prefix, visibility="listed", after=after, limit=_PAGE_SIZE)
             for entry in page.items:
                 yield entry
             if page.next_cursor is None:
                 return
             after = page.next_cursor
 
+    async def heads(self) -> Mapping[str, int]:
+        """与 sessions 同一 listed 目录的水位；单条查询，不解码会话条目。"""
+        async with self._open_catalog() as catalog:
+            return await catalog.snapshot_heads_async(prefix=self._prefix, visibility="listed")
+
     async def baseline(self) -> Cursor:
-        return {entry.session_id: entry.head_seq async for entry in self.sessions()}
+        return dict(await self.heads())
+
+    # 提醒预览和其他读者一样看到接回后的整段回答。
+    async def reply(self, entry: SessionEntryPort, message: Message) -> Message:
+        async with self._open_catalog() as catalog:
+            return await catalog.reader(entry.session_id).read_async(
+                lambda reader: with_truncated_head(cast(MessageReader, reader), message))
 
     async def read(self, entry: SessionEntryPort, after: int) -> MessagePagePort | None:
         """页面使用当前 head；会话被用户删除时本轮跳过，绝不写回消息。"""
         async with self._open_catalog() as catalog:
             try:
-                return catalog.reader(entry.session_id).read_page(after_seq=after, limit=_PAGE_SIZE)
+                return await catalog.reader(entry.session_id).read_async(
+                    lambda reader: reader.read_page(after_seq=after, limit=_PAGE_SIZE))
             except KeyError:
                 return None
 
@@ -119,22 +131,14 @@ async def notification_events(
     clock = asyncio.get_running_loop().time
     last_beat = clock()
     while True:
-        # 2. 每轮完整扫目录，页大小只控制内存，不裁掉离线消息；别处已读的消息不再提醒。
-        marks = _reads(feed, reads)
-        async for entry in feed.sessions():
-            after = cursor.get(entry.session_id, -1)
-            while after < entry.head_seq:
-                page = await feed.read(entry, after)
-                if page is None:
-                    break
-                for message in page.messages:
-                    if is_notifiable(message) and message.seq > marks.get(entry.session_id, -1):
-                        yield _event("message", _item(message, entry))
-                after = page.messages[-1].seq if page.has_more else page.through_seq
-                cursor[entry.session_id] = after
-                yield _event("cursor", {"session_id": entry.session_id, "seq": after})
-                # 网络发送期间不持有 catalog 或 generation lease。
-                await asyncio.sleep(0)
+        # 2. 先比目录水位，没有会话前进时整目录扫描不会产出任何事件，直接跳过；通道停止接纳时正常结束，客户端重连。
+        try:
+            heads = await feed.heads()
+        except ChannelClosed:
+            return
+        if any(head > cursor.get(session_id, -1) for session_id, head in heads.items()):
+            async for event in _replay(feed, cursor, _reads(feed, reads)):
+                yield event
         # 3. 已读水位只前进；客户端据此撤掉已在别处读过的提醒。
         if read_events:
             for session_id, seq in _reads(feed, reads).items():
@@ -146,6 +150,24 @@ async def notification_events(
             last_beat = clock()
             yield _event("heartbeat", {})
         await asyncio.sleep(poll_interval)
+
+
+# 完整扫目录补发，页大小只控制内存，不裁掉离线消息；别处已读的消息不再提醒。
+async def _replay(feed: NotificationFeed, cursor: Cursor, marks: Mapping[str, int]) -> AsyncGenerator[bytes, None]:
+    async for entry in feed.sessions():
+        after = cursor.get(entry.session_id, -1)
+        while after < entry.head_seq:
+            page = await feed.read(entry, after)
+            if page is None:
+                break
+            for message in page.messages:
+                if is_notifiable(message) and message.seq > marks.get(entry.session_id, -1):
+                    yield _event("message", _item(await feed.reply(entry, message), entry))
+            after = page.messages[-1].seq if page.has_more else page.through_seq
+            cursor[entry.session_id] = after
+            yield _event("cursor", {"session_id": entry.session_id, "seq": after})
+            # 网络发送期间不持有 catalog 或 generation lease。
+            await asyncio.sleep(0)
 
 
 def _reads(feed: NotificationFeed, reads: ReadMarksReader | None) -> dict[str, int]:

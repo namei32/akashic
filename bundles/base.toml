@@ -4,8 +4,14 @@ schema_version = 1
 [rows."ledger"]
 plugin = "ledger@release"
 
+[rows."userinformation"]
+plugin = "userinformation@release"
+
 [rows."timer"]
 plugin = "timer@release"
+
+[rows."scheduler"]
+plugin = "scheduler@release"
 
 [rows."channels"]
 plugin = "channels@release"
@@ -28,6 +34,9 @@ plugin = "managed_processes@release"
 [rows."mcp"]
 plugin = "mcp@release"
 
+[rows."goal"]
+plugin = "goal@release"
+
 [rows."commands"]
 plugin = "commands@release"
 
@@ -43,17 +52,14 @@ plugin = "shell-ui@release"
 [rows."conversation-ui"]
 plugin = "conversation-ui@release"
 
-[rows."companion"]
-plugin = "companion@release"
-
 [rows."projects"]
 plugin = "projects@release"
 
+[rows."main_session"]
+plugin = "main_session@release"
+
 [rows."models"]
 plugin = "models@release"
-
-[rows."model_usage"]
-plugin = "model_usage@release"
 
 [rows."session_title"]
 plugin = "session_title@release"
@@ -69,7 +75,7 @@ plugin = "content@release"
 
 [rows."context"]
 plugin = "context@release"
-config = { "prompt_sources" = { "default_prompt" = "prompt@release", "markdown_memory" = "markdown_memory@release", "skills" = "standard_tools@release" }, "summary_source" = ["compaction", "compaction@release"] }
+config = { "prompt_sources" = { "default_prompt" = "prompt@release", "markdown_memory" = "markdown_memory@release", "skills" = "skills@release" }, "summary_source" = ["compaction", "compaction@release"] }
 
 [rows."turn_projection"]
 plugin = "turn_projection@release"
@@ -83,26 +89,51 @@ plugin = "tools@release"
 [rows."tool_search"]
 plugin = "tool_search@release"
 
+[rows."codemode"]
+plugin = "codemode@release"
+
 [rows."assets"]
 plugin = "assets@release"
 
 [rows."visuals"]
 plugin = "visuals@release"
 
-[rows."sites"]
-plugin = "sites@release"
+[rows."design"]
+plugin = "design@release"
 
-[rows."sites_tab"]
-plugin = "sites_tab@release"
+[rows."working_directory"]
+plugin = "working_directory@release"
 
-[rows."standard_tools"]
-plugin = "standard_tools@release"
+[rows."privacy_mask"]
+plugin = "privacy_mask@release"
+
+[rows."vision"]
+plugin = "vision@release"
+
+[rows."plugin_settings"]
+plugin = "plugin_settings@release"
+
+[rows."skills"]
+plugin = "skills@release"
+
+# 插件安装工具（plugin_install）与 plugin-system 技能：Agent 自助安装、查看未启用原因并在线启用都靠它。
+[rows."plugin_update"]
+plugin = "plugin_update@release"
+
+[rows."shell"]
+plugin = "shell@release"
+
+[rows."files"]
+plugin = "files@release"
 
 [rows."terminal"]
 plugin = "terminal@release"
 
 [rows."workspace_changes"]
 plugin = "workspace_changes@release"
+
+[rows."markdown_reader"]
+plugin = "markdown_reader@release"
 
 [rows."runtime_inspection"]
 plugin = "runtime_inspection@release"
@@ -135,9 +166,6 @@ plugin = "jobs@release"
 plugin = "akashic_clients@release"
 config = { "enabled" = true, "web" = { "enabled" = true, "socket_path" = "" } }
 
-[rows."eventmail"]
-plugin = "eventmail@release"
-
 [rows."delivery"]
 plugin = "delivery@release"
 
@@ -164,16 +192,11 @@ plugin = "telegram_sender@release"
 
 [rows."akasha"]
 plugin = "akasha@release"
+disabled = true
 
 [rows."default_memory"]
 plugin = "default_memory@release"
-disabled = true
-
-[rows."drift"]
-plugin = "drift@release"
-
-[rows."wake"]
-plugin = "wake@release"
+config = { mode = "active" }
 
 [rows."watch"]
 plugin = "watch@release"
