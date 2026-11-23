@@ -13,7 +13,7 @@ from plugins.models.contract import ChatModels, Embeddings, ModelError
 from plugins.turn_projection.contract import TurnProjection
 from .io import run_io
 from .learning import collect, extract, check, text
-from .retrieval import normalized, render, retrieve
+from .retrieval import normalized, retrieve
 from .schema import Draft, Source, Kind, Fact, Retraction
 from . import management, source_retraction
 from .api import SourceRetraction

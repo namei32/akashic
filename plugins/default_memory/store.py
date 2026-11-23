@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import cast
 from collections.abc import Iterator, Mapping, Sequence
 from .schema import Draft, Fact, Memory, Source
-from .retrieval import cosine, normalized
+from .retrieval import normalized
 
 _SCHEMA = """
 CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);

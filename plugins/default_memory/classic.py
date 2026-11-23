@@ -6,7 +6,7 @@ Storage, permissions, clocks and model calls remain owned by the modern plugin.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import math
 import re

@@ -4,12 +4,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import UTC
 import json
-from typing import Literal
 
-from .api import Browse, Correction, Merge, Similar
+from .api import Browse, Similar
 from .event_time import parse_event_time
 
-from .schema import Kind
 from .store import Store, digest
 
 

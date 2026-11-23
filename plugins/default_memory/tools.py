@@ -1,8 +1,6 @@
 """Explicit recall and user-directed edits with durable tool receipts."""
 from __future__ import annotations
 
-import json
-from dataclasses import asdict
 from collections.abc import Mapping
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError

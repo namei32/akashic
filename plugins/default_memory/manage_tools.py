@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from plugins.ledger.contract import ContentPart, Input, json_value, is_user_input
 from plugins.tools.contract import CallSource, Result
