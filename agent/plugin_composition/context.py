@@ -31,12 +31,8 @@ from agent.plugin_composition.events import (
     EventKey,
     EventListener,
     EventRegistry,
-    ObserveEventKey,
-    ParallelEventKey,
     SerialEventKey,
-    TransformEventKey,
 )
-from agent.plugin_composition.executor import reject_executor_context_access
 from agent.plugin_composition.endpoints import Endpoint, EndpointPublisher
 from agent.plugin_composition.model import (
     CallerIdentity,
@@ -64,6 +60,19 @@ T = TypeVar("T")
 R = TypeVar("R")
 F = TypeVar("F", bound=Callable[..., object])
 PluginApply = Callable[["Context"], object]
+_CALL_DRAIN_TIMEOUT = 300.0
+# 有期限的宿主操作给排空设的截止时刻（事件循环时钟）；到点卸载失败、保留在途调用，由宿主在后台续接。
+drain_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "plugin_drain_deadline", default=None,
+)
+
+
+# 本次排空最多等多久：固定上限与当前操作截止时刻取较早者。
+def _drain_timeout() -> float:
+    deadline = drain_deadline.get()
+    if deadline is None:
+        return _CALL_DRAIN_TIMEOUT
+    return max(0.0, min(_CALL_DRAIN_TIMEOUT, deadline - asyncio.get_running_loop().time()))
 
 
 _lifecycle_binding: contextvars.ContextVar[
@@ -129,30 +138,25 @@ class Context:
 
     @property
     def fiber(self) -> FiberHandle:
-        reject_executor_context_access()
         self._require_current()
         return self._fiber_handle
 
     @property
     def generation_id(self) -> str:
-        reject_executor_context_access()
         return self._root.generation_id
 
     @property
     def root_instance_token(self) -> object:
         """Return the opaque identity of this exact composition Root."""
 
-        reject_executor_context_access()
         return self._root.instance_token
 
     def _declared_dependencies(self) -> tuple[ServiceKey[Any], ...]:
         """供 Core 请求边界冻结声明 Fiber 的能力集合。"""
-        reject_executor_context_access()
         return self._fiber.dependencies
 
     def _reserve_scope(self) -> RuntimeScope | None:
         """在派发时保留准确 owner；生命周期与 Root 由其外层寿命保护。"""
-        reject_executor_context_access()
         self._require_current()
         binding = _lifecycle_binding.get()
         if self._fiber._is_root or binding == (self, asyncio.current_task()):
@@ -203,7 +207,6 @@ class Context:
     @contextmanager
     def borrow(self, key: ServiceKey[T]) -> Iterator[T | None]:
         """临时查询可选服务，借用期间保护实际 provider；缺席返回 None。"""
-        reject_executor_context_access()
         self._require_current()
         provider = self._root._active_provider(cast(ServiceKey[Any], key))
         if provider is None:
@@ -214,7 +217,6 @@ class Context:
 
     def require_runtime_identity(self, key: ServiceKey[Any], service: object) -> CallerIdentity:
         """核对实际 Task、Context 和服务后返回身份；不接受调用方填写的身份字段。"""
-        reject_executor_context_access()
         self._require_current()
         task = asyncio.current_task()
         binding = _lifecycle_binding.get()
@@ -240,7 +242,6 @@ class Context:
 
     def _caller_context(self) -> Context:
         """只读取当前 Task 的实际许可，不信任继承的 ContextVar。"""
-        reject_executor_context_access()
         self._require_current()
         current = _current_runtime_scope()
         if current is not None:
@@ -319,7 +320,6 @@ class Context:
     def capture_runtime_scope(self) -> RuntimeScope:
         """把当前 Task 已接纳的许可延长成一份可移交子 Task 的 scope。"""
 
-        reject_executor_context_access()
         self._require_current()
         owned = self._fiber._call_owned_by_current_task()
         if owned is None:
@@ -339,7 +339,6 @@ class Context:
     def runtime(self) -> PluginRuntime:
         """Return the Core-owned runtime identity for this plugin tree."""
 
-        reject_executor_context_access()
         runtime = self._fiber.runtime
         if runtime is None:
             raise CompositionError(
@@ -352,7 +351,6 @@ class Context:
     def diagnostics(self) -> PluginDiagnostics:
         """Return diagnostics bound to this exact plugin Fiber and generation."""
 
-        reject_executor_context_access()
         runtime = self.runtime
         return CorePluginDiagnostics(
             plugin_id=runtime.plugin_id,
@@ -369,13 +367,11 @@ class Context:
     def workspace_root(self, name: str) -> Path:
         """返回 Core 为当前 generation 投影的声明式 workspace root。"""
 
-        reject_executor_context_access()
         return self.runtime.workspace_root(name)
 
     def workspace_file(self, name: str) -> Path:
         """Return one Core-projected product file declared by the plugin."""
 
-        reject_executor_context_access()
         return self.runtime.workspace_file(name)
 
     async def mount(
@@ -386,7 +382,6 @@ class Context:
         inject: Iterable[ServiceKey[Any]] | None = None,
         required_for_readiness: bool = True,
     ) -> FiberHandle:
-        reject_executor_context_access()
         self._require_current()
         if not callable(plugin) or hasattr(plugin, "apply"):
             raise TypeError("Context.mount 只接受 child callable")
@@ -410,7 +405,6 @@ class Context:
     ) -> FiberHandle:
         """挂载独立随依赖激活的子 Fiber，不阻塞父 Fiber 就绪。"""
 
-        reject_executor_context_access()
         return await self.mount(
             apply,
             name=name or getattr(apply, "__name__", "inject"),
@@ -421,7 +415,6 @@ class Context:
     async def provide(self, key: ServiceKey[T], value: T, *,
                       binding_contributors: Callable[[], tuple[Context, ...]] | None = None) -> Effect:
         """服务 owner 可声明归档时实际需要的动态注册 Context，生命周期随同一 Effect。"""
-        reject_executor_context_access()
         self._require_current()
         typed_key = cast(ServiceKey[Any], key)
         if self._fiber.state == FiberState.ACTIVE:
@@ -484,7 +477,6 @@ class Context:
         return effect
 
     def get(self, key: ServiceKey[T]) -> T | None:
-        reject_executor_context_access()
         self._require_current()
         provider = self._fiber.dependency_store.get(cast(ServiceKey[Any], key))
         if provider is None:
@@ -507,7 +499,6 @@ class Context:
         return cast(T | None, None if provider is None else provider.value)
 
     def require(self, key: ServiceKey[T]) -> T:
-        reject_executor_context_access()
         value = self.get(key)
         if value is None:
             raise CompositionError(
@@ -522,7 +513,6 @@ class Context:
         return self._fiber.dependency_store[key].revision
 
     async def effect(self, setup: EffectSetup, *, label: str = "effect") -> Effect:
-        reject_executor_context_access()
         self._require_current()
         return await self._fiber.add_effect(setup, label=label)
 
@@ -534,7 +524,6 @@ class Context:
     ) -> HealthHandle:
         """注册一个由当前 Fiber Effect 持有的健康项。"""
 
-        reject_executor_context_access()
         self._require_current()
         entry = self._root._new_health_entry(
             self._fiber,
@@ -554,7 +543,6 @@ class Context:
         self, name: str, *, protocol: str, address: str, routes: tuple[str, ...] = (),
     ) -> Effect:
         """发布已就绪的监听器；同一 Effect 先撤下路由，再由插件关闭监听器。"""
-        reject_executor_context_access()
         self._require_current()
         runtime = self._fiber.runtime
         endpoint = Endpoint(name, protocol, address, routes, self._fiber.path,
@@ -569,7 +557,6 @@ class Context:
     def report_incident(self, kind: str, message: str) -> IncidentView:
         """记录一条结构化 Incident，但不隐式改变当前 Health。"""
 
-        reject_executor_context_access()
         self._require_current()
         if not kind or kind.strip() != kind:
             raise ValueError("Incident kind 必须是非空且无首尾空白的字符串")
@@ -586,15 +573,11 @@ class Context:
         key: (
             EmitEventKey[T]
             | SerialEventKey[T, R]
-            | ParallelEventKey[T]
-            | TransformEventKey[T]
-            | ObserveEventKey[T]
         ),
         listener: Callable[[T], object],
     ) -> Effect:
         """Register one typed listener as an Effect of the current Fiber."""
 
-        reject_executor_context_access()
         raw_key = cast(EventKey, key)
         raw_listener = cast(EventListener, listener)
         return await self.effect(
@@ -607,7 +590,6 @@ class Context:
         )
 
     def emit(self, key: EmitEventKey[T], payload: T) -> None:
-        reject_executor_context_access()
         self._require_current()
         self._root._events.emit(key, payload)
 
@@ -616,24 +598,8 @@ class Context:
         key: SerialEventKey[T, R],
         payload: T,
     ) -> Bail[R] | None:
-        reject_executor_context_access()
         self._require_current()
         return await self._root._events.serial(key, payload)
-
-    async def parallel(self, key: ParallelEventKey[T], payload: T) -> None:
-        reject_executor_context_access()
-        self._require_current()
-        await self._root._events.parallel(key, payload)
-
-    async def transform(self, key: TransformEventKey[T], payload: T) -> T:
-        reject_executor_context_access()
-        self._require_current()
-        return await self._root._events.transform(key, payload)
-
-    async def observe(self, key: ObserveEventKey[T], payload: T) -> None:
-        reject_executor_context_access()
-        self._require_current()
-        await self._root._events.observe(key, payload)
 
     async def spawn(
         self,
@@ -643,7 +609,6 @@ class Context:
     ) -> asyncio.Task[T]:
         """Start one Fiber-owned task and expose failures to Core readiness."""
 
-        reject_executor_context_access()
         try:
             self._require_current()
         except BaseException:
@@ -746,24 +711,20 @@ class FiberHandle:
     @property
     def fiber_id(self) -> int:
         """供只读图消费者关联实际功能分支。"""
-        reject_executor_context_access()
         return self._fiber.fiber_id
 
     @property
     def name(self) -> str:
-        reject_executor_context_access()
         return self._fiber.name
 
     @property
     def state(self) -> FiberState:
-        reject_executor_context_access()
         return self._fiber.state
 
     @property
     def activation_token(self) -> object | None:
         """返回当前 Fiber activation 的不透明身份令牌。"""
 
-        reject_executor_context_access()
         return self._fiber._activation_token
 
     def acquire_call(self, expected_activation: object) -> OwnerCall:
@@ -772,11 +733,9 @@ class FiberHandle:
         旧绑定在 owner 换代后必须显式失败，不默认替调用方改绑最新实例。
         """
 
-        reject_executor_context_access()
         return self._fiber._begin_call(expected_activation)
 
     async def dispose(self) -> None:
-        reject_executor_context_access()
         await self._fiber.dispose()
 
 
@@ -996,20 +955,16 @@ class HealthHandle:
 
     @property
     def healthy(self) -> bool:
-        reject_executor_context_access()
         return self._entry.active and self._entry.reason is None
 
     @property
     def reason(self) -> str | None:
-        reject_executor_context_access()
         return self._entry.reason
 
     def degrade(self, reason: str) -> None:
-        reject_executor_context_access()
         self._root._degrade_health(self._entry, reason)
 
     def recover(self) -> None:
-        reject_executor_context_access()
         self._root._recover_health(self._entry)
 
 
@@ -1193,6 +1148,15 @@ class Fiber:
                 "OWNER_CALL_RELEASED", "许可已释放，不能接管"
             )
         self._in_flight_calls[call] = current
+
+    # 持有本 activation 在途许可的 Task（同一调用的嵌套许可算一个）；宿主据此报告排空还在等多少调用。
+    @property
+    def in_flight_tasks(self) -> frozenset[asyncio.Task[object]]:
+        return frozenset(self._in_flight_calls.values())
+
+    # 等已接纳的调用全部释放，不改变任何状态；只用于已停止接纳的 owner。
+    async def wait_calls_idle(self) -> None:
+        _ = await self._calls_idle.wait()
 
     def _end_call(self, call: OwnerCall) -> None:
         if self._in_flight_calls.pop(call, None) is None:
@@ -1381,14 +1345,24 @@ class Fiber:
         self._activation_ready.set()
         await self.root._owner_became_active(self)
 
+    def _close_child_admissions(self) -> None:
+        for child in tuple(self.children):
+            if child.state != FiberState.DISPOSED:
+                child._activation_token = None
+                child.state = FiberState.UNLOADING
+                child._admission_closed.set()
+            child._close_child_admissions()
+
     async def _unload(self, *, next_state: FiberState) -> None:
         # 1. 持本 activation 在途调用的任务不得驱动本次卸载；在撤销
         #    任何状态之前拒绝，避免失败后残留半卸载状态。
         self._reject_self_call_wait()
-        # 2. 撤销本 activation 身份使新调用接纳关闭，再让消费者观察到不可用。
+        # 2. 撤销本 activation 身份使新调用接纳关闭，并同步关闭所有子孙 Fiber 的新调用接纳，
+        #    避免父 Fiber 排空期间或排空超时后全新调用继续进入旧代子服务（#2118）。
         self._activation_token = None
         self.state = FiberState.UNLOADING
         self._admission_closed.set()
+        self._close_child_admissions()
         await self.root._owner_became_inactive(self)
         # 后台循环由 Fiber 停止；先取消并等待，避免排空等待它自己长期持有的许可。
         tasks = tuple(self._tasks)
@@ -1400,9 +1374,19 @@ class Fiber:
             await _await_critical(asyncio.create_task(join_tasks()))
 
         # 3. 依赖方先退出；本 owner 已接纳的实际调用结束后再释放资源。
-        #    取消等待不等于资源已退出；超时与拒绝策略由调用方负责。
+        #    超时只结束卸载，仍保留在途许可和资源供显式重试。
         if self._in_flight_calls:
-            await _await_critical(asyncio.ensure_future(self._calls_idle.wait()))
+            timeout = _drain_timeout()
+            try:
+                await _await_critical(asyncio.create_task(asyncio.wait_for(
+                    self._calls_idle.wait(), timeout,
+                )))
+            except TimeoutError as error:
+                raise CompositionError(
+                    "OWNER_CALL_DRAIN_TIMEOUT",
+                    f"{self.name} 的在途调用超过 {timeout:g} 秒仍未结束；"
+                    "卸载失败，资源和调用保留，请在调用结束后显式重试清理",
+                ) from error
 
         # 4. 子作用域失败时保留父资源；无关子分支仍尝试关闭。
         errors: list[BaseException] = []
@@ -1751,18 +1735,6 @@ class CompositionRoot:
             listeners=listeners,
         )
 
-    def topology_identity(self) -> str:
-        return self.topology_view().identity
-
-    def active_plugin_ids(self) -> frozenset[str]:
-        """返回此 Root 实际挂载的顶层插件身份，不解释业务启用状态。"""
-
-        return frozenset(
-            runtime.plugin_id
-            for fiber in self.root_fiber.children
-            if (runtime := fiber.runtime) is not None
-        )
-
     def fibers(self, *, plugin_id: str | None = None, generation_id: str | None = None) -> tuple[Fiber, ...]:
         """查询实际登记的 Fiber，可限定准确插件和 generation。"""
         return tuple(
@@ -1792,6 +1764,22 @@ class CompositionRoot:
                     changed = True
         return tuple(fiber for fiber in self._fibers.values() if fiber in affected - initial)
 
+    # 上游闭包：owner 固定持有的提供方及其父作用域；它们卸载时要等这些 owner 先关闭。
+    def providers(self, owners: Iterable[Fiber]) -> tuple[Fiber, ...]:
+        initial = set(owners)
+        affected = set(initial)
+        queue = list(initial)
+        while queue:
+            fiber = queue.pop()
+            linked = [provider.owner for provider in fiber.dependency_store.values()]
+            if fiber.parent is not None:
+                linked.append(fiber.parent)
+            for candidate in linked:
+                if candidate not in affected and candidate.state != FiberState.DISPOSED:
+                    affected.add(candidate)
+                    queue.append(candidate)
+        return tuple(fiber for fiber in self._fibers.values() if fiber in affected - initial)
+
     def require_ready(self, fibers: Iterable[Fiber]) -> None:
         """核对实际登记的必需 Fiber 与其 health；可选分支不扩大就绪边界。"""
         for candidate in set(fibers):
@@ -1805,21 +1793,6 @@ class CompositionRoot:
                              if entry.owner is candidate and entry.required and entry.reason is not None)
             if degraded:
                 raise RuntimeError(f"目标依赖 required health 失败: {candidate.path}:{','.join(degraded)}")
-
-    def plugin_runtime(self, plugin_id: str) -> PluginRuntime:
-        """返回顶层插件 Fiber 使用的 Core-owned runtime。"""
-
-        matches = tuple(
-            runtime
-            for fiber in self.root_fiber.children
-            if (runtime := fiber.runtime) is not None and runtime.plugin_id == plugin_id
-        )
-        if len(matches) != 1:
-            raise CompositionError(
-                "PLUGIN_RUNTIME_UNAVAILABLE",
-                f"Root 中没有唯一插件 runtime: {plugin_id}",
-            )
-        return matches[0]
 
     def service_value(
         self,
@@ -1900,14 +1873,6 @@ class CompositionRoot:
             if not provider.revoking
             if (runtime := provider.owner.runtime) is not None
         }
-
-    def plugin_dependencies(self) -> Mapping[str, frozenset[ServiceKey[Any]]]:
-        """收集各插件及子 Fiber 声明的服务依赖。"""
-        dependencies: dict[str, set[ServiceKey[Any]]] = {}
-        for fiber in self._fibers.values():
-            if fiber.runtime is not None:
-                dependencies.setdefault(fiber.runtime.plugin_id, set()).update(fiber.dependencies)
-        return {owner: frozenset(keys) for owner, keys in dependencies.items()}
 
     async def _mount(
         self,
@@ -2118,7 +2083,7 @@ class CompositionRoot:
         keys = tuple(
             key for key, provider in self._providers.items() if provider.owner is owner
         )
-        await self._reconcile_dependents(keys, exclude=owner)
+        await self._reconcile_dependents(keys, exclude=owner, isolate=True)
 
     async def _notify_provider_registered(self, registration: _Provider) -> None:
         """Reconcile only the exact live registration after ACTIVE publication."""
@@ -2132,6 +2097,7 @@ class CompositionRoot:
         await self._reconcile_dependents(
             (registration.key,),
             exclude=registration.owner,
+            isolate=True,
         )
 
     async def _owner_became_inactive(self, owner: Fiber) -> None:
@@ -2289,25 +2255,39 @@ class CompositionRoot:
                     f"{fiber.name} 的 Service {operation}不能等待该任务借用的生命周期",
                 )
 
+    # 服务变化只重新协调实际消费者。isolate=True 用于服务刚就绪的方向：
+    # 消费者自己激活失败（含清理失败而保留资源）只留在它自己的 Fiber 上，
+    # 不回滚已经就绪的提供方；服务撤销方向仍须等消费者放手，失败照常上抛。
     async def _reconcile_dependents(
         self,
         keys: tuple[ServiceKey[Any], ...],
         *,
         exclude: Fiber,
+        isolate: bool = False,
     ) -> None:
-        """服务变化只重新协调实际消费者。"""
-
         if not keys:
             return
         affected = self._dependent_fibers(keys, exclude=exclude)
-        if affected:
-            results = await asyncio.gather(
-                *(fiber.reconcile() for fiber in affected),
-                return_exceptions=True,
-            )
-            errors = [result for result in results if isinstance(result, BaseException)]
-            if errors:
-                raise BaseExceptionGroup("依赖 Fiber 协调失败", errors)
+        if not affected:
+            return
+        results = await asyncio.gather(
+            *(fiber.reconcile() for fiber in affected),
+            return_exceptions=True,
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if not errors:
+            return
+        if not isolate:
+            raise BaseExceptionGroup("依赖 Fiber 协调失败", errors)
+        # 1. 取消不属于任何一个消费者，照常传播。
+        for error in errors:
+            if not isinstance(error, Exception):
+                raise error
+        # 2. 每个消费者的失败记在它自己身上；_load 已记录的同一错误不重复上报。
+        for fiber, result in zip(affected, results):
+            if isinstance(result, Exception) and fiber.error is not result:
+                fiber.error = result
+                self._record_error(fiber, result)
 
     def _new_health_entry(
         self,

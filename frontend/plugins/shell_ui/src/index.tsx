@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
-import { akashicBrandIcon } from "./brand";
-import { PluginInventory } from "./plugin-inventory";
+import { akashicBrandIcon, markup } from "./brand";
+import { PluginInventory, inventoryResource, type InventoryResource } from "./plugin-inventory";
+import { SystemVersion } from "./system-version";
 import type {
   WebEntry,
   WebHostContextV1,
@@ -31,6 +32,11 @@ const SETTINGS_PLUGINS_MOUNT = "shell.settings-plugins.v1";
 const SETTINGS_PLUGINS_ORDER = 40;
 const SETTINGS_PLUGINS_LABEL = "插件";
 const SETTINGS_PLUGINS_ROUTE = "plugins";
+/** “版本与更新”展示当前运行提交、上次更新时间与最近部署记录，位置在新手引导（90）之前。 */
+const SETTINGS_VERSION_ORDER = 80;
+const SETTINGS_VERSION_LABEL = "版本与更新";
+const SETTINGS_VERSION_ROUTE = "version";
+const SETTINGS_VERSION_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
 const CHEVRON_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>';
 const BACK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>';
 const CLOSE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
@@ -40,14 +46,16 @@ const SETTINGS_PLUGINS_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="24
 
 const SETTINGS_ICON = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>';
 
-/** 设置工作区的当前位置：顶层分节、插件列表（memberId 为 null），或某个插件的详情页。 */
+/** 设置工作区的当前位置：顶层分节、插件列表（memberId 为 null）、插件详情页，或系统版本与更新页。 */
 type SettingsTarget =
   | { kind: "section"; id: string }
-  | { kind: "plugins"; memberId: string | null };
+  | { kind: "plugins"; memberId: string | null }
+  | { kind: "version" };
 
 type SettingsNavItem =
   | { kind: "section"; entry: ShellSettingsSection }
-  | { kind: "plugins" };
+  | { kind: "plugins" }
+  | { kind: "version" };
 
 /** 插件列表里的一张卡片：单个成员，或 ≥2 个成员声明同一 family 合成的组合卡。 */
 type PluginCard = { id: string; label: string; description: string; entries: ShellSettingsPlugin[] };
@@ -86,7 +94,10 @@ function settingsTargetForRoute(
   const member = plugins.find((entry) => entry.route === route);
   if (member) return { kind: "plugins", memberId: member.id };
   if (route === SETTINGS_PLUGINS_ROUTE) return { kind: "plugins", memberId: null };
-  return undefined;
+  if (route === SETTINGS_VERSION_ROUTE) return { kind: "version" };
+  // 带子路径的深链（#plugin-settings/<插件 ID>）落到所属的插件配置分节。
+  const slash = route.indexOf("/");
+  return slash > 0 ? settingsTargetForRoute(sections, plugins, route.slice(0, slash)) : undefined;
 }
 
 /** 对话框留在 Shell 组件内；底栏动作与快捷键经这个模块级入口打开它。 */
@@ -94,6 +105,7 @@ const settingsLauncher = { open: () => {} };
 
 /** Register the ordinary Shell plugin as the only owner of the outer frame. */
 export function activate(ctx: WebHostContextV1): WebUiDisposer {
+  const inventory = inventoryResource(ctx);
   const disposers = [
     ctx.ui.inject("web.root.v1", (mount) => mount.register({
       id: "shell",
@@ -111,6 +123,7 @@ export function activate(ctx: WebHostContextV1): WebUiDisposer {
           settings={view.child(SETTINGS_MOUNT)}
           settingsPlugins={view.child(SETTINGS_PLUGINS_MOUNT)}
           http={ctx.http}
+          inventory={inventory}
         />);
         return () => root.unmount();
       },
@@ -128,12 +141,13 @@ export function activate(ctx: WebHostContextV1): WebUiDisposer {
   };
 }
 
-function Shell({ pages, railActions, settings, settingsPlugins, http }: {
+function Shell({ pages, railActions, settings, settingsPlugins, http, inventory }: {
   pages: WebMountView;
   railActions: WebMountView;
   settings: WebMountView;
   settingsPlugins: WebMountView;
   http: WebHostContextV1["http"];
+  inventory: InventoryResource;
 }): React.ReactElement {
   const bandEntries = useMemo(() => checkPages(pages.entries), [pages.entries]);
   const railActionEntries = useMemo(() => checkRailActions(railActions.entries), [railActions.entries]);
@@ -141,17 +155,20 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
   const pluginEntries = useMemo(() => checkSettingsPlugins(settingsPlugins.entries), [settingsPlugins.entries]);
   // 三个目录共用同一个 hash 路由命名空间，跨目录撞 route 是合同错误。
   useMemo(() => {
-    const routes = [...bandEntries, ...sectionEntries, ...pluginEntries].map((entry) => entry.route).concat(SETTINGS_PLUGINS_ROUTE);
+    const routes = [...bandEntries, ...sectionEntries, ...pluginEntries]
+      .map((entry) => entry.route)
+      .concat(SETTINGS_PLUGINS_ROUTE, SETTINGS_VERSION_ROUTE);
     if (new Set(routes).size !== routes.length) throw new Error("Shell 页面与设置分节的 route 不能重复");
   }, [bandEntries, sectionEntries, pluginEntries]);
 
-  // 左栏导航是顶层分节按 order 排列；插件分节常驻，停用全部配置成员后仍要能从列表里启用。
+  // 左栏导航是顶层分节按 order 排列；插件与版本与更新分节常驻。
   const settingsNav = useMemo(() => {
     const items: { order: number; item: SettingsNavItem }[] = sectionEntries.map((entry) => ({
       order: typeof entry.order === "number" ? entry.order : 0,
       item: { kind: "section", entry },
     }));
     items.push({ order: SETTINGS_PLUGINS_ORDER, item: { kind: "plugins" } });
+    items.push({ order: SETTINGS_VERSION_ORDER, item: { kind: "version" } });
     return items.sort((left, right) => left.order - right.order).map(({ item }) => item);
   }, [sectionEntries]);
   const pluginCards = useMemo(() => buildPluginCards(pluginEntries), [pluginEntries]);
@@ -167,6 +184,7 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
   const pageHosts = useRef(new Map<string, HTMLElement>());
   const settingsDialog = useRef<HTMLDialogElement>(null);
   const settingsContent = useRef<HTMLDivElement>(null);
+  const settingsTabsRef = useRef<HTMLDivElement>(null);
   const bandTrack = useRef<HTMLDivElement>(null);
   const focusAfterNavigation = useRef(false);
 
@@ -174,18 +192,39 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
   useLayoutEffect(() => {
     const track = bandTrack.current;
     if (!track) return;
+    const nav = track.parentElement;
+    let lastNavWidth = nav?.clientWidth ?? 0;
+    const ensureActiveVisible = (smooth: boolean) => {
+      const current = track.querySelector<HTMLElement>('[aria-current="page"]');
+      if (!current || !nav || nav.scrollWidth <= nav.clientWidth) return;
+      const left = current.offsetLeft;
+      const right = left + current.offsetWidth;
+      const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      const behavior: ScrollBehavior = smooth && !reduced ? "smooth" : "auto";
+      if (left < nav.scrollLeft) {
+        nav.scrollTo({ left: Math.max(0, left - 12), behavior });
+      } else if (right > nav.scrollLeft + nav.clientWidth) {
+        nav.scrollTo({ left: right - nav.clientWidth + 12, behavior });
+      }
+    };
     const measure = () => {
       const current = track.querySelector<HTMLElement>('[aria-current="page"]');
       if (current) {
         track.style.setProperty("--band-indicator-x", `${current.offsetLeft + 12}px`);
-        track.style.setProperty("--band-indicator-w", `${Math.max(0, current.offsetWidth - 24)}px`);
+        track.style.setProperty("--band-indicator-scale", String(Math.max(0, current.offsetWidth - 24) / 100));
       } else {
-        track.style.setProperty("--band-indicator-w", "0px");
+        track.style.setProperty("--band-indicator-scale", "0");
+      }
+      if (nav && nav.clientWidth !== lastNavWidth) {
+        lastNavWidth = nav.clientWidth;
+        ensureActiveVisible(false);
       }
       requestAnimationFrame(() => { track.dataset.ready = "true"; });
     };
     measure();
+    ensureActiveVisible(true);
     const observer = new ResizeObserver(measure);
+    if (nav) observer.observe(nav);
     observer.observe(track);
     track.querySelectorAll<HTMLElement>("[data-band-item]").forEach((item) => observer.observe(item));
     return () => observer.disconnect();
@@ -195,12 +234,13 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
   const firstTarget = useMemo<SettingsTarget | undefined>(() => {
     const first = settingsNav[0];
     if (!first) return undefined;
-    return first.kind === "section"
-      ? { kind: "section", id: first.entry.id }
-      : { kind: "plugins", memberId: null };
+    if (first.kind === "section") return { kind: "section", id: first.entry.id };
+    if (first.kind === "version") return { kind: "version" };
+    return { kind: "plugins", memberId: null };
   }, [settingsNav]);
   const currentTarget = useMemo<SettingsTarget | undefined>(() => {
     if (settingsTarget?.kind === "section" && sectionEntries.some((entry) => entry.id === settingsTarget.id)) return settingsTarget;
+    if (settingsTarget?.kind === "version") return settingsTarget;
     if (settingsTarget?.kind === "plugins"
       && (settingsTarget.memberId === null || pluginEntries.some((entry) => entry.id === settingsTarget.memberId))) return settingsTarget;
     return firstTarget;
@@ -215,6 +255,39 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
   const [settingsPane, setSettingsPane] = useState<"nav" | "content">("content");
   // 插件分节的两个 tab：插件列表管理启停，插件配置是成员自己的设置表单。
   const [pluginsTab, setPluginsTab] = useState<"list" | "config">("list");
+  // 插件分节 tab 的滑动底线：测量当前选中 tab 的位置与宽度，与顶栏指示器保持同一连续过渡体验。
+  useLayoutEffect(() => {
+    const bar = settingsTabsRef.current;
+    if (!bar) return;
+    let frame = 0;
+    // 对话框未 show 或已关闭时量到 0：不写位置并撤掉 ready，下次可量时直接就位，不从 0 拉伸。
+    const measure = () => {
+      const current = bar.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+      cancelAnimationFrame(frame);
+      if (!current || current.offsetWidth === 0) {
+        delete bar.dataset.ready;
+        return;
+      }
+      bar.style.setProperty("--shell-tabs-x", `${current.offsetLeft}px`);
+      bar.style.setProperty("--shell-tabs-scale", String(current.offsetWidth / 100));
+      if (!bar.dataset.ready) frame = requestAnimationFrame(() => { bar.dataset.ready = "true"; });
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(bar);
+    bar.querySelectorAll<HTMLElement>('[role="tab"]').forEach((tab) => observer.observe(tab));
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [pluginsTab, settingsOpen, currentTarget]);
+  // 插件列表是只读页：首次进入后保活，离开只隐藏，再进不重建也保留搜索与展开状态。
+  const inventoryVisible = settingsOpen && currentTarget?.kind === "plugins" && currentTarget.memberId === null && pluginsTab === "list";
+  const inventoryKept = useRef(false);
+  if (inventoryVisible) inventoryKept.current = true;
+  const versionVisible = settingsOpen && currentTarget?.kind === "version";
+  const versionKept = useRef(false);
+  if (versionVisible) versionKept.current = true;
 
   const openPage = useCallback((entry: ShellPage): void => {
     if (entry.id === activeId) { setWithdrawn(false); setSettingsOpen(false); return; }
@@ -240,7 +313,9 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
     if (!next) return;
     const route = next.kind === "section"
       ? sectionEntries.find((entry) => entry.id === next.id)?.route
-      : next.memberId === null ? SETTINGS_PLUGINS_ROUTE : pluginEntries.find((entry) => entry.id === next.memberId)?.route;
+      : next.kind === "version"
+        ? SETTINGS_VERSION_ROUTE
+        : next.memberId === null ? SETTINGS_PLUGINS_ROUTE : pluginEntries.find((entry) => entry.id === next.memberId)?.route;
     const go = () => {
       setSettingsTarget(next);
       // 窄屏从入口打开先给分节列表；点了具体分节或深链接时直接进内容。
@@ -262,6 +337,7 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
 
   // 分节拿到的 close 保持同一身份，Shell 路由变化不应重挂载正在编辑的分节。
   const closeSettingsRef = useRef(closeSettings);
+  const settingsReturnFocus = useRef<HTMLElement | null>(null);
   closeSettingsRef.current = closeSettings;
 
   useLayoutEffect(() => {
@@ -297,22 +373,54 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
     };
   }, [settingsOpen, openSettings, closeSettings]);
 
-  // React 状态是对话框唯一 owner；原生 Esc 经 onCancel 走 closeSettings 的守卫。
+  // React 状态拥有开关。面板用非模态 show() 加自管遮罩：showModal 把整页置为 inert，开关各触发一次
+  // 全文档样式重算（侧栏加正文约 2000 节点时约 40ms，随页面规模增长）；Esc 与 Tab 在文档层接管。
   useEffect(() => {
     const dialog = settingsDialog.current;
     if (!dialog) return;
     // 打开后焦点落在面板本身而非首个导航项：Tab 仍从导航开始，但不在打开瞬间画出焦点环。
-    if (settingsOpen && !dialog.open) { dialog.showModal(); dialog.focus(); }
-    else if (!settingsOpen && dialog.open) dialog.close();
+    if (settingsOpen && !dialog.open) {
+      settingsReturnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      dialog.show();
+      dialog.focus();
+    } else if (!settingsOpen && dialog.open) {
+      // 非模态 close 只在焦点仍在面板内时归还；焦点已掉到 body 时按原生模态的习惯回到触发处。
+      const lost = document.activeElement === document.body || dialog.contains(document.activeElement);
+      dialog.close();
+      if (lost) settingsReturnFocus.current?.focus();
+      settingsReturnFocus.current = null;
+      // 设置面板盖在页面上，关上时页面并没有离开视口：通知页面重新显示了，好重读在设置里改过的数据。
+      window.dispatchEvent(new CustomEvent("akashic:settings-closed"));
+    }
+    if (!settingsOpen) return;
+    // 焦点可能因内容重渲染落回 body：和原生模态一样在文档层收按键，不要求焦点在面板里。
+    const onKeyDown = (event: globalThis.KeyboardEvent) => onSettingsKeyDown(event, dialog, () => closeSettingsRef.current());
+    // 背后应用里被程序聚焦（如输入框的打字监听）时拉回面板；挂在 body 上的图层与原生模态不归这里管。
+    const background = dialog.parentElement;
+    const onFocusIn = (event: FocusEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element) || !background?.contains(target) || dialog.contains(target) || target.closest("dialog:modal")) return;
+      dialog.focus({ preventScroll: true });
+    };
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("focusin", onFocusIn);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("focusin", onFocusIn);
+    };
   }, [settingsOpen]);
 
   // 设置工作区内的跨目录渲染：初始配置按 route 内嵌任意分节的表单，不关心它属于哪个目录。
+  // route 可带「/后缀」：后缀作为 subroute 交给分节自己解释，比如声明式设置卡只渲染某个插件的表单。
   const renderSettingsRoute = useCallback<RenderSettingsRoute>((route, host, props) => {
     const section = settings.entries.find((entry) => entry.route === route);
     if (section) return settings.render(section.id, host, props);
     const member = settingsPlugins.entries.find((entry) => entry.route === route);
     if (member) return settingsPlugins.render(member.id, host, props);
-    return null;
+    const slash = route.indexOf("/");
+    if (slash <= 0) return null;
+    const base = settingsPlugins.entries.find((entry) => entry.route === route.slice(0, slash));
+    return base ? settingsPlugins.render(base.id, host, { ...(props as object | undefined), subroute: route.slice(slash + 1) }) : null;
   }, [settings, settingsPlugins]);
 
   // 分节内容就地渲染进对话框；关闭或换节即销毁，同一分节不会同时挂载在两处。
@@ -332,7 +440,7 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
       });
       return () => queueMicrotask(() => { dispose(); host.remove(); });
     }
-    if (settingsMembers.length === 0) return;
+    if (currentTarget.kind !== "plugins" || settingsMembers.length === 0) return;
     const mounts = settingsMembers.map((entry) => {
       const wrapper = document.createElement(settingsMembers.length > 1 ? "section" : "div");
       wrapper.className = settingsMembers.length > 1 ? "shell-settings-family-member" : "shell-settings-entry";
@@ -366,8 +474,10 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
     if (!settingsOpen || currentTarget?.kind !== "plugins" || currentTarget.memberId === null || settingsMembers.length < 2) return;
     const memberId = currentTarget.memberId;
     const scroll = () => {
-      const target = settingsContent.current?.querySelector(`[data-settings-member="${CSS.escape(memberId)}"]`);
-      target?.scrollIntoView({ block: "start" });
+      const target = settingsContent.current?.querySelector<HTMLElement>(`[data-settings-member="${CSS.escape(memberId)}"]`);
+      // 只滚分节页自己：scrollIntoView 会连带滚动 overflow:hidden 的对话框，手机上顶部返回和关闭被推出屏幕。
+      const page = target?.closest<HTMLElement>(".shell-settings-page");
+      if (target && page) page.scrollTop += target.getBoundingClientRect().top - page.getBoundingClientRect().top;
     };
     scroll();
     const timer = window.setTimeout(scroll, 800);
@@ -391,7 +501,7 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
     const target = activeId ? pageHosts.current.get(activeId) : undefined;
     if (!target) return;
     const styles = getComputedStyle(target);
-    const duration = Number.parseFloat(styles.getPropertyValue("--ak-sys-duration-short"));
+    const duration = cssDurationMs(styles.getPropertyValue("--ak-sys-duration-short"));
     const easing = styles.getPropertyValue("--ak-sys-motion-standard").trim();
     if (!Number.isFinite(duration) || duration <= 0) return;
     const animation = target.animate(
@@ -445,7 +555,12 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
   // 只有一个页面时没有可去的地方：顶栏整条不渲染，页面占满视口；设置入口由底栏动作与 Ctrl/Cmd+, 承担。
   const showBand = bandEntries.length > 1;
   return <div className={`unified-shell${showBand ? " has-band" : ""}`}>
-    {withdrawn && <p role="status" className="config-hint">所选页面暂不可用，已自动切换至默认页面。可在功能设置中查看已安装功能。</p>}
+    {withdrawn && <div role="status" className="config-hint">
+      <span>所选页面暂不可用，已自动切换至默认页面。可在功能设置中查看已安装功能。</span>
+      <button type="button" className="config-hint-close" aria-label="关闭提示" onClick={() => setWithdrawn(false)}>
+        <span aria-hidden="true" dangerouslySetInnerHTML={markup(CLOSE_ICON)} />
+      </button>
+    </div>}
     {showBand && <header className="product-band" aria-label="Akashic 主导航">
       <div className="product-band__brand" title="Akashic">
         <img src={akashicBrandIcon} alt="" />
@@ -468,7 +583,7 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
             aria-current={activeId === entry.id ? "page" : undefined}
             onClick={() => openPage(entry)}
           >
-            <span className="shell-page-icon" aria-hidden="true" dangerouslySetInnerHTML={{ __html: entry.iconSvg }} />
+            <span className="shell-page-icon" aria-hidden="true" dangerouslySetInnerHTML={markup(entry.iconSvg)} />
             <span>{entry.label}</span>
           </button>)}
           <div className="product-band__indicator" aria-hidden="true" />
@@ -483,46 +598,58 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
         title="功能设置 (Ctrl+,)"
         onClick={() => openSettings()}
       >
-        <span className="shell-page-icon" aria-hidden="true" dangerouslySetInnerHTML={{ __html: SETTINGS_ICON }} />
+        <span className="shell-page-icon" aria-hidden="true" dangerouslySetInnerHTML={markup(SETTINGS_ICON)} />
       </button>}
     </header>}
+    <div className="shell-settings-scrim" hidden={!settingsOpen} aria-hidden="true" />
     <dialog
       ref={settingsDialog}
       className="shell-settings-dialog"
       aria-label="功能设置"
       tabIndex={-1}
       data-pane={settingsPane}
-      onCancel={(event) => { event.preventDefault(); closeSettings(); }}
-      onClose={() => setSettingsOpen(false)}
+      aria-modal="true"
     >
       <nav className="shell-settings-nav" aria-label="设置分节">
         <h2>功能设置</h2>
         {settingsNav.map((item) => {
           const plugins = item.kind === "plugins";
-          const current = plugins ? currentTarget?.kind === "plugins" : currentTarget?.kind === "section" && currentTarget.id === item.entry.id;
+          const version = item.kind === "version";
+          const current = plugins
+            ? currentTarget?.kind === "plugins"
+            : version
+              ? currentTarget?.kind === "version"
+              : currentTarget?.kind === "section" && currentTarget.id === item.entry.id;
+          const nextTarget: SettingsTarget = plugins
+            ? { kind: "plugins", memberId: null }
+            : version
+              ? { kind: "version" }
+              : { kind: "section", id: item.entry.id };
+          const icon = plugins ? SETTINGS_PLUGINS_ICON : version ? SETTINGS_VERSION_ICON : item.entry.iconSvg;
+          const label = plugins ? SETTINGS_PLUGINS_LABEL : version ? SETTINGS_VERSION_LABEL : item.entry.label;
           return <button
-            key={plugins ? "plugins" : item.entry.id}
+            key={plugins ? "plugins" : version ? "version" : item.entry.id}
             type="button"
             aria-current={current ? "true" : undefined}
-            onClick={() => openSettings(plugins ? { kind: "plugins", memberId: null } : { kind: "section", id: item.entry.id })}
+            onClick={() => openSettings(nextTarget)}
           >
-            <span className="shell-page-icon" aria-hidden="true" dangerouslySetInnerHTML={{ __html: plugins ? SETTINGS_PLUGINS_ICON : item.entry.iconSvg }} />
-            <span className="shell-settings-nav-label">{plugins ? SETTINGS_PLUGINS_LABEL : item.entry.label}</span>
-            <span className="shell-settings-nav-chevron" aria-hidden="true" dangerouslySetInnerHTML={{ __html: CHEVRON_ICON }} />
+            <span className="shell-page-icon" aria-hidden="true" dangerouslySetInnerHTML={markup(icon)} />
+            <span className="shell-settings-nav-label">{label}</span>
+            <span className="shell-settings-nav-chevron" aria-hidden="true" dangerouslySetInnerHTML={markup(CHEVRON_ICON)} />
           </button>;
         })}
       </nav>
       <button type="button" className="shell-settings-close" onClick={closeSettings} aria-label="关闭设置" title="关闭 (Esc)">
-        <span aria-hidden="true" dangerouslySetInnerHTML={{ __html: CLOSE_ICON }} />
+        <span aria-hidden="true" dangerouslySetInnerHTML={markup(CLOSE_ICON)} />
       </button>
       <div className="shell-settings-body">
         {/* 窄屏左上返回：插件详情回到插件列表，其余回到分节列表。 */}
         {activeCard
           ? <button type="button" className="shell-settings-back" onClick={() => openSettings({ kind: "plugins", memberId: null })}>
-            <span aria-hidden="true" dangerouslySetInnerHTML={{ __html: BACK_ICON }} />{SETTINGS_PLUGINS_LABEL}
+            <span aria-hidden="true" dangerouslySetInnerHTML={markup(BACK_ICON)} />{SETTINGS_PLUGINS_LABEL}
           </button>
           : <button type="button" className="shell-settings-back" onClick={() => setSettingsPane("nav")}>
-            <span aria-hidden="true" dangerouslySetInnerHTML={{ __html: BACK_ICON }} />功能设置
+            <span aria-hidden="true" dangerouslySetInnerHTML={markup(BACK_ICON)} />功能设置
           </button>}
         <div className="shell-settings-page">
           <SettingsHeading
@@ -532,11 +659,12 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
             back={() => openSettings({ kind: "plugins", memberId: null })}
           />
           {currentTarget?.kind === "plugins" && currentTarget.memberId === null && <>
-            <div className="shell-settings-tabs" role="tablist" aria-label="插件">
+            <div ref={settingsTabsRef} className="shell-settings-tabs" role="tablist" aria-label="插件">
               <button type="button" role="tab" aria-selected={pluginsTab === "list"} onClick={() => setPluginsTab("list")}>插件列表</button>
               <button type="button" role="tab" aria-selected={pluginsTab === "config"} onClick={() => setPluginsTab("config")}>插件配置</button>
+              <div className="shell-settings-tabs__indicator" aria-hidden="true" />
             </div>
-            {pluginsTab === "list" ? <PluginInventory http={http} /> : pluginCards.length === 0
+            {pluginsTab === "list" ? null : pluginCards.length === 0
               ? <p className="shell-inventory-empty">已启用的插件都没有设置项</p> : <PluginCardList
               cards={pluginCards}
               view={settingsPlugins}
@@ -544,6 +672,12 @@ function Shell({ pages, railActions, settings, settingsPlugins, http }: {
               open={(card) => openSettings({ kind: "plugins", memberId: card.entries[0].id })}
             />}
           </>}
+          {inventoryKept.current && <div hidden={!inventoryVisible}>
+            <PluginInventory http={http} inventory={inventory} active={inventoryVisible} />
+          </div>}
+          {versionKept.current && <div hidden={!versionVisible}>
+            <SystemVersion http={http} active={versionVisible} />
+          </div>}
           <div ref={settingsContent} className="shell-settings-mount" />
         </div>
       </div>
@@ -574,13 +708,15 @@ function SettingsHeading({ target, sections, card, back }: {
     const entry = sections.find((item) => item.id === target.id);
     return <header className="shell-settings-heading"><h3>{entry?.label}</h3></header>;
   }
+  if (target.kind === "version") {
+    return <header className="shell-settings-heading"><h3>{SETTINGS_VERSION_LABEL}</h3></header>;
+  }
   if (!card) return <header className="shell-settings-heading"><h3>{SETTINGS_PLUGINS_LABEL}</h3></header>;
   return <header className="shell-settings-heading">
     <button type="button" className="shell-settings-crumb" onClick={back}>
-      <span aria-hidden="true" dangerouslySetInnerHTML={{ __html: BACK_ICON }} />{SETTINGS_PLUGINS_LABEL}
+      <span aria-hidden="true" dangerouslySetInnerHTML={markup(BACK_ICON)} />{SETTINGS_PLUGINS_LABEL}
     </button>
     <div className="shell-settings-detail-head">
-      <span className="shell-plugin-mark" aria-hidden="true" dangerouslySetInnerHTML={{ __html: SETTINGS_PLUGINS_ICON }} />
       <h3>{card.label}</h3>
     </div>
     {card.description && <p>{card.description}</p>}
@@ -609,7 +745,6 @@ function PluginCardList({ cards, view, railActions, open }: {
   return <ul className="shell-plugin-cards">
     {cards.map((card) => <li key={card.id}>
       <button type="button" className="shell-plugin-card" onClick={() => open(card)}>
-        <span className="shell-plugin-mark" aria-hidden="true" dangerouslySetInnerHTML={{ __html: SETTINGS_PLUGINS_ICON }} />
         <span className="shell-plugin-main">
           <strong>{card.label}</strong>
           {card.description && <span className="shell-plugin-desc">{card.description}</span>}
@@ -620,10 +755,18 @@ function PluginCardList({ cards, view, railActions, open }: {
             </span>)}
           </span>
         </span>
-        <span className="shell-plugin-chevron" aria-hidden="true" dangerouslySetInnerHTML={{ __html: CHEVRON_ICON }} />
+        <span className="shell-plugin-chevron" aria-hidden="true" dangerouslySetInnerHTML={markup(CHEVRON_ICON)} />
       </button>
     </li>)}
   </ul>;
+}
+
+// 时长 token 读成毫秒：构建会把 150ms 压成 .15s，直接 parseFloat 会得到 0.15ms。
+function cssDurationMs(value: string): number {
+  const text = value.trim();
+  const amount = Number.parseFloat(text);
+  if (text.endsWith("ms")) return amount;
+  return text.endsWith("s") ? amount * 1000 : amount;
 }
 
 function checkPages(entries: readonly WebEntry[]): ShellPage[] {
@@ -713,4 +856,36 @@ function checkRailActions(entries: readonly WebEntry[]): ShellRailAction[] {
 function pageFromLocation(entries: ShellPage[], fallback: ShellPage | undefined): ShellPage | undefined {
   const route = window.location.hash.slice(1);
   return entries.find((entry) => entry.route === route) ?? fallback;
+}
+
+const SETTINGS_TABBABLE = "a[href], button, input:not([type=hidden]), select, textarea, summary, [tabindex]";
+
+// 非模态设置面板补回模态语义：Esc 关闭（子控件 preventDefault 时让位），Tab 在面板内首尾循环不落回背景。
+function onSettingsKeyDown(event: globalThis.KeyboardEvent, dialog: HTMLDialogElement, close: () => void): void {
+  // 1. 面板内再开的模态表单（如模型选择）自己处理按键。
+  if (event.defaultPrevented || event.isComposing || (event.target instanceof Element && event.target.closest("dialog:modal"))) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    close();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  // 2. 只在越过首尾时接管，面板内部的 Tab 顺序仍交给浏览器。
+  // fieldset 禁用的后代自身没有 disabled 属性：按实际 :disabled 状态与 tabIndex 判断能否聚焦。
+  const items = [...dialog.querySelectorAll<HTMLElement>(SETTINGS_TABBABLE)]
+    .filter((item) => !item.matches(":disabled") && item.tabIndex >= 0 && item.getClientRects().length > 0);
+  const first = items[0];
+  const last = items[items.length - 1];
+  if (!first || !last) return;
+  const active = document.activeElement;
+  if (!active || !dialog.contains(active)) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  } else if (event.shiftKey && (active === first || active === dialog)) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && active === last) {
+    event.preventDefault();
+    first.focus();
+  }
 }

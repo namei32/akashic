@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 import json
 import os
 import secrets
@@ -8,13 +9,17 @@ import subprocess
 import time
 import sys
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping, cast
 
+from agent.plugins.extra_repo import resolve_repo
+from scripts.akashic_release.extra import ExtraOptions, ExtraResult, merge_inputs, prepare_extra_inputs
 from scripts.akashic_release.doctor import read_environment, release_health_timeout, verify_release
 from scripts.akashic_release.manifest import activation_receipt, atomic_write, read_json, write_json
 from scripts.akashic_release.model import ReleasePaths
-from scripts.akashic_release.systemd import install_units, install_operator_entrypoint
+from scripts.akashic_release.snapshot import capture, restore_plugin_state
+from scripts.akashic_release.systemd import install_units, install_operator_entrypoint, require_unit_install
 from scripts.akashic_release.systemd import start_bridge, start_core, stop_runtime
+from scripts.akashic_release.warm import StateCacheWarmer
 from utils.timing import measure
 
 Run = Callable[..., subprocess.CompletedProcess[str]]
@@ -44,32 +49,52 @@ def _verify_selected_runtime(
     status = json.loads(result.stdout)
     if not isinstance(status, dict) or status.get("selection_ref") != root_ref:
         raise RuntimeError("live runtime selection 与已发布的完整 Root 不一致")
+    # preset 启用的行整行缺席时，"选择里的都 ACTIVE" 也会成立，必须单独核对。
+    preset = status.get("preset")
+    if not isinstance(preset, dict) or preset.get("missing") != []:
+        missing = preset.get("missing") if isinstance(preset, dict) else "未报告"
+        raise RuntimeError(f"live runtime 缺少 preset 启用的插件: {missing}")
     plugins = status.get("plugins")
     components = status.get("selection_components")
     if (not isinstance(plugins, list) or not isinstance(components, list)
         or any(not isinstance(ref, str) for ref in components)
         or len(set(components)) != len(components)):
         raise RuntimeError("live runtime 未报告 plugin owner 状态")
+    source_errors = {row["plugin_id"]: row["error_text"] for row in status.get("source_failures", [])
+                     if row["source_type"] == "installed" and row["plugin_id"] is not None}
     active_refs: list[str] = []
+    degraded: dict[str, str] = {}
+    ready = 0
     for item in plugins:
         if not isinstance(item, dict):
             raise RuntimeError("live runtime plugin 状态无效")
         selected = item.get("selected_ref")
         if selected is not None and not isinstance(selected, str):
             raise RuntimeError("live runtime selected_ref 格式无效")
+        plugin_id = item.get("plugin_id")
+        if selected is None and item.get("enabled") and plugin_id in source_errors:
+            degraded[str(plugin_id)] = str(source_errors[plugin_id])
         if selected is not None and (
             item.get("input_ref") != selected or item.get("state") != "active"
             or item.get("fiber_state") != "active"
         ):
-            raise RuntimeError(f"selected plugin 尚未 ACTIVE: {item.get('plugin_id')}")
+            # 外置插件坏掉只降级它自己；Core 与内置插件仍须全部就绪，否则 Agent 无法自救。
+            if item.get("selected_distribution_source") is not None:
+                raise RuntimeError(f"selected plugin 尚未 ACTIVE: {item.get('plugin_id')}")
+            degraded[str(item.get("plugin_id"))] = str(item.get("load_error") or item.get("fiber_state") or item.get("state"))
+            print(f"外置插件未就绪，Core 照常启动: {item.get('plugin_id')}", file=sys.stderr, flush=True)
+            ready -= 1
         if isinstance(selected, str):
             active_refs.append(selected)
+            ready += 1
     if len(active_refs) != len(components) or set(active_refs) != set(components):
         raise RuntimeError("live runtime 未加载完整 selection components")
     if ordered_components is not None and tuple(components) != ordered_components:
         raise RuntimeError("live runtime 完整 ordered selection 与发布输入不一致")
     return {"selection_ref": root_ref,
-            "active_selected": len(active_refs),
+            "active_selected": ready,
+            "degraded_external": degraded,
+            "preset_retired": preset.get("retired", []),
             "optional_health": "unverified"}
 
 
@@ -136,6 +161,9 @@ def release_environment(
     token = ensure_bridge_token(paths)
     bridge_python = paths.bridge_venv(commit) / "bin/python"
     values = dict(current)
+    # 拆仓期间（ADR 0148 撤回）写入的制品库路径：宿主桥接会按它加载旧发行版里的插件，发行版只认镜像内的。
+    for key in ("AKASHIC_PLUGIN_DISTRIBUTION", "AKASHIC_PLUGIN_STORE"):
+        values.pop(key, None)
     values.update(
         {
             "AKASHIC_BRIDGE_PYTHON": str(bridge_python),
@@ -193,9 +221,46 @@ def render_environment(values: Mapping[str, str]) -> str:
     return "".join(f"{key}={values[key]}\n" for key in sorted(values))
 
 
+# 子进程输出逐行透传到终端（不缓冲到结束才出）；注入的假 run（演练驱动）仍按原样一次性返回。
+def _run_streaming(command: list[str], run: Run, progress: Callable[[dict[str, object]], None] | None = None) -> subprocess.CompletedProcess[str]:
+    if run is not subprocess.run:
+        return run(command, check=False, capture_output=True, text=True)
+    from scripts.first_install import relay_line
+
+    lines: list[str] = []
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as process:
+        for line in cast(Iterable[str], process.stdout):
+            lines.append(line)
+            # 进度事件渲染成人话行，其余输出原样透传。
+            if progress is None or not relay_line(line.strip(), progress):
+                print(line, end="", file=sys.stderr, flush=True)
+        returncode = process.wait()
+    return subprocess.CompletedProcess(command, returncode, "".join(lines), "".join(lines))
+
+
+# 首次激活：用目标镜像的 ensure 入口，把已取好的输入离线装进 state（无网络），提交选择；服务随后启动不再联网。
+def _ensure_first_install(*, paths: ReleasePaths, candidate: Mapping[str, str], inputs: Path, run: Run, install_extra: tuple[str, ...],
+                          bundle: str = "base", progress: Callable[[dict[str, object]], None] | None = None) -> None:
+    command = ["docker", "run", "--rm", "--network", "none", "--read-only", "--tmpfs", "/tmp:rw,mode=1777,size=4g",
+               "--mount", f"type=bind,src={paths.state},dst={paths.state}",
+               "--mount", f"type=bind,src={inputs},dst=/opt/akashic/deploy-inputs,readonly"]
+    for key in ("AKASHIC_CONFIG", "AKASHIC_WORKSPACE", "AKASHIC_PLUGIN_HOME", "AKASHIC_RUNTIME_COMMIT", "AKASHIC_RUNTIME_TREE"):
+        command += ["--env", f"{key}={candidate[key]}"]
+    # 预取按哪个 profile 产出 targets，离线 ensure 就按同一个补装（否则两阶段组合不一致）。
+    command += ["--env", f"AKASHIC_PLUGIN_BUNDLE={bundle}"]
+    command += [candidate["AKASHIC_IMAGE"], "ensure", "--extra-inputs", "/opt/akashic/deploy-inputs", "--install-extra", ",".join(install_extra)]
+    if (inputs / "profile.patch.toml").exists():
+        command += ["--profile-patch", "/opt/akashic/deploy-inputs/profile.patch.toml"]
+    with measure("release.first_install"):
+        completed = _run_streaming(command, run, progress)
+        if completed.returncode != 0:
+            raise RuntimeError(f"首次安装扩展包失败（exit={completed.returncode}），服务未启动: {completed.stderr.strip()[-800:]}")
+
+
 def _publish(
     *, paths: ReleasePaths, candidate: Mapping[str, str], plan: Path,
     inputs: Path, digest: str, backup_dir: Path | None, preflight: bool, run: Run,
+    closed_boot: str | None = None,
 ) -> dict[str, object]:
     """让目标镜像检查或执行同一份固定部署清单。"""
 
@@ -210,7 +275,7 @@ def _publish(
     if preflight:
         workspace = Path(candidate["AKASHIC_WORKSPACE"])
         owner = workspace.stat()
-        for name in ("plugin-python-environments",):
+        for name in ("plugin-python-environments", "plugin-resources"):
             cache = workspace / "runtime" / name
             current = paths.state
             for part in cache.relative_to(paths.state).parts:
@@ -229,6 +294,8 @@ def _publish(
         command += ["--env", f"{key}={candidate[key]}"]
     command += [candidate["AKASHIC_IMAGE"], "publish", "--plan", "/opt/akashic/deploy-plan.json",
                 "--inputs", "/opt/akashic/deploy-inputs"]
+    if closed_boot is not None:
+        command += ["--closed-boot", closed_boot]
     if preflight:
         command.append("--preflight-only")
     elif backup_dir is not None:
@@ -347,12 +414,45 @@ def _record_failure(
     write_json(attempt_path, attempt)
 
 
+# 首次激活的扩展包安装。给了离线输入（--extra-inputs）就按它装，不选择、不联网读 index；否则按意图选择、预取、离线安装。
+# patch 与 start 共用同一个"按意图写 patch"：workspace 已初始化（上次失败留下 patch）时直接合并写 workspace 的 patch，
+# 否则写进输入目录，由 ensure 初始化 workspace 后放进去。
+def _first_install_extra(*, paths: ReleasePaths, target: str, current: Mapping[str, str], candidate: Mapping[str, str],
+                         extra: ExtraOptions, inputs_dir: Path, run: Run) -> None:
+    from agent.plugins.absorbed import read_absorbed
+    from scripts.first_install import Progress, choose, clear_intent, preset_extra_rows, write_patch
+
+    mode = current.get("AKASHIC_PLUGIN_BUNDLE", "base")
+    if extra.inputs is not None:
+        _ensure_first_install(paths=paths, candidate=candidate, inputs=extra.inputs.resolve(strict=True), run=run, install_extra=(), bundle=mode,
+                              progress=Progress())
+        return
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    rows = preset_extra_rows(paths.source(target), mode)
+    choice = choose(repo=resolve_repo(extra.repo), home=paths.state / "plugin-home", preset_rows=rows, profile=extra.profile,
+                    groups=list(extra.groups), assume_yes=extra.assume_yes, state=paths.state, reselect=extra.reselect,
+                    absorbed=frozenset(item.partition("@")[0] for item in read_absorbed(paths.source(target))))
+    workspace_patch = paths.state / "workspace/bundle.patch.toml"
+    patch = workspace_patch if workspace_patch.exists() else inputs_dir / "profile.patch.toml"
+    write_patch(choice, rows, patch)
+    found = prepare_extra_inputs(workspace=paths.state / "workspace", plugins_home=paths.state / "plugin-home",
+                             source=paths.source(target), mode=mode, root_ref=None,
+                             options=replace(extra, image=candidate["AKASHIC_IMAGE"], gaps_only=True, record_needs=True,
+                                             install_extra=choice.install, patch_file=patch),
+                             out=inputs_dir, run=run)
+    _ensure_first_install(paths=paths, candidate=candidate, inputs=inputs_dir, run=run, install_extra=choice.install, bundle=mode,
+                          progress=Progress(len(found.targets)))  # N 取预取实际产出的目标数
+    clear_intent(paths.state)
+
+
 def activate_release(
     *, paths: ReleasePaths, manifest_path: Path, environment_file: Path,
     mise: Path, run: Run, plan: Path | None = None,
     inputs: Path | None = None, backup: bool = False,
     unit_root: Path = Path("/etc/systemd/system"), cli_path: Path = Path.home() / ".local/bin/akashic-release",
     self_deploy: dict[str, object] | None = None,
+    warmer: StateCacheWarmer | None = None,
+    extra: ExtraOptions | None = None,
 ) -> str:
     """按部署者清单停机发布；默认只更新 Core/Bridge，不执行待迁移。"""
 
@@ -364,8 +464,11 @@ def activate_release(
     _verify_state_ready(paths)
     candidate = release_environment(paths=paths, manifest=manifest, current=current, mise=mise)
     selection_path = paths.state / "workspace/runtime/plugin-stable.json"
-    root_ref = (_read_selection(paths=paths, candidate=candidate, run=run)["root_ref"]
+    selected = (_read_selection(paths=paths, candidate=candidate, run=run)
                 if selection_path.exists() or previous is not None else None)
+    root_ref = None if selected is None else selected["root_ref"]
+    preflight: dict[str, object] | None = None
+    extra_report: dict[str, object] | None = None
     attempt_path = paths.activation / f"deploy-{secrets.token_hex(12)}.json"
     fixed_plan = attempt_path.with_suffix(".plan.json")
     if root_ref is None:
@@ -373,14 +476,25 @@ def activate_release(
             raise RuntimeError("既有部署或显式清单必须有完整 Root；先修复正式选择")
         if backup:
             raise ValueError("首次初始化的 state 备份请由部署者在安装前完成")
+        # 首次激活也在服务启动之前联网取好 extra 包与 wheel，并在 --network none 的容器里离线装好：
+        # 下载耗时不再落在启动后的健康检查期限内；任何一步失败都在启动前抛错，状态不变、可重跑。
+        if extra is not None and extra.enabled:
+            _first_install_extra(paths=paths, target=target, current=current, candidate=candidate, extra=extra,
+                                 inputs_dir=attempt_path.with_suffix(".inputs"), run=run)
     else:
-        if plan is None:
-            write_json(fixed_plan, {"schema_version": 1, "expected_root_ref": root_ref,
-                                    "targets": []})
-        else:
-            if plan.is_symlink() or not plan.is_file():
-                raise ValueError("部署清单必须是普通文件")
-            atomic_write(fixed_plan, plan.read_text(encoding="utf-8"))
+        if plan is not None and (plan.is_symlink() or not plan.is_file()):
+            raise ValueError("部署清单必须是普通文件")
+        # 停机之前联网求 extra 包；任何一步失败都在这里抛错，旧服务不动。
+        found = (prepare_extra_inputs(workspace=paths.state / "workspace", plugins_home=paths.state / "plugin-home", source=paths.source(target),
+                                      mode=current.get("AKASHIC_PLUGIN_BUNDLE", "base"), root_ref=str(root_ref),
+                                      options=replace(extra, image=candidate["AKASHIC_IMAGE"]), out=attempt_path.with_suffix(".inputs"), run=run)
+                 if extra is not None and extra.enabled else ExtraResult((), ()))
+        plan_text = _merged_plan_text(plan, str(root_ref), found)
+        atomic_write(fixed_plan, plan_text)
+        if found.targets:
+            inputs = merge_inputs(inputs, attempt_path.with_suffix(".inputs"))
+        extra_report = {"targets": [{key: item[key] for key in ("plugin_id", "kind", "target_commit", "upstream")}
+                                    for item in found.targets], "skipped": [list(item) for item in found.skipped]}
         # 清单只含公开发布身份；保留部署者属主，让非 root 容器只读。
         fixed_plan.chmod(0o444)
         if inputs is None:
@@ -389,20 +503,31 @@ def activate_release(
         if not inputs.is_dir():
             raise ValueError("--inputs 必须是目录")
         digest = hashlib.sha256(fixed_plan.read_bytes()).hexdigest()
-        _publish(paths=paths, candidate=candidate, plan=fixed_plan, inputs=inputs,
-                 digest=digest, backup_dir=None, preflight=True, run=run)
+        preflight = _publish(paths=paths, candidate=candidate, plan=fixed_plan, inputs=inputs,
+                             digest=digest, backup_dir=None, preflight=True, run=run)
+        if self_deploy is not None and preflight["migration_ids"]:
+            raise RuntimeError(f"目标版本有待执行迁移，需由运维发布；原服务继续运行: {preflight['migration_ids']}")
+    can_roll_back = bool(previous and preflight is not None and not preflight["migration_ids"])
+    selection_snapshot: str | None = None
+    snapshot_path: Path | None = None
+    require_unit_install(checkout=paths.source(target), run=run, unit_root=unit_root, runtime_env=environment_file)
     backup_dir = paths.backups / attempt_path.stem if backup else None
     attempt = activation_receipt(status="pending", target_commit=target, previous_commit=previous)
     attempt.update(phase="waiting_for_turn" if self_deploy is not None else "stopping", imageId=manifest["imageId"],
                    attemptPath=str(attempt_path), publication=None,
                    backupDir=None if backup_dir is None else str(backup_dir),
-                   planPath=None if root_ref is None else str(fixed_plan),
+                   planPath=None if root_ref is None else str(fixed_plan), extra=extra_report,
+                   rollback="eligible" if can_roll_back else "not_eligible",
                    previousActivationSha256=(hashlib.sha256((paths.activation / "active.json").read_bytes()).hexdigest()
                                              if (paths.activation / "active.json").exists() else None))
     write_json(attempt_path, attempt)
     if self_deploy is not None:
         self_deploy["activationAttempt"] = str(attempt_path)
+        self_deploy["phase"] = "waiting_for_turn"
         write_json(Path(str(self_deploy["recordPath"])), self_deploy)
+    # 预热有界等待放在关闭准入之前：旧服务等它时仍照常接纳工作。
+    if warmer is not None:
+        warmer.wait()
     stop_ack = None
     if self_deploy is not None:
         from scripts.akashic_release.self_deploy import wait_for_stop
@@ -413,15 +538,38 @@ def activate_release(
             attempt.update(status="failed", phase="waiting_for_turn", detail=str(error))
             write_json(attempt_path, attempt)
             raise
-    attempt["phase"] = "stopping"
-    write_json(attempt_path, attempt)
+    try:
+        attempt["phase"] = "stopping"
+        write_json(attempt_path, attempt)
+        if self_deploy is not None:
+            self_deploy["phase"] = "restarting"
+            write_json(Path(str(self_deploy["recordPath"])), self_deploy)
+    except BaseException:
+        if self_deploy is not None and stop_ack is not None:
+            from scripts.akashic_release.self_deploy import cancel_stop
+            try:
+                cancel_stop(self_deploy, current)
+            except Exception:
+                pass
+        raise
     # 2. 从停机开始保留失败现场；安装、迁移、Root CAS 由目标镜像统一执行。
     try:
         with measure("release.stop"):
             stop_runtime(run=run)
+        closed_boot = None
         if stop_ack is not None:
             from scripts.akashic_release.self_deploy import verify_closed
-            verify_closed(stop_ack, current)
+            closed_boot = verify_closed(stop_ack, current)
+        # 旧 Core 排空后才固定恢复点；预检期间的插件换代仍属于旧版本。
+        if root_ref is not None:
+            stopped_selection = selection_path.read_text(encoding="utf-8")
+            if json.loads(stopped_selection)["root_ref"] != root_ref:
+                raise RuntimeError("预检后插件选择已更新，请基于当前选择重新部署")
+            selection_snapshot = stopped_selection
+            # 恢复点落盘：选择、patch、清单涉及插件的 cache 指针；进程崩溃后可用 restore-state 还原。
+            snapshot_path = attempt_path.with_suffix(".snapshot.json")
+            capture(paths, [str(item["plugin_id"]) for item in read_json(fixed_plan)["targets"]], snapshot_path)
+            attempt["snapshotPath"] = str(snapshot_path)
         attempt["phase"] = "publishing"
         write_json(attempt_path, attempt)
         if root_ref is not None:
@@ -430,7 +578,7 @@ def activate_release(
                 atomic_write(backup_dir.with_suffix(".env"), environment_file.read_text(encoding="utf-8"))
             attempt["publication"] = _publish(
                 paths=paths, candidate=candidate, plan=fixed_plan, inputs=inputs,
-                digest=digest, backup_dir=backup_dir, preflight=False, run=run,
+                digest=digest, backup_dir=backup_dir, preflight=False, run=run, closed_boot=closed_boot,
             )
             attempt["phase"] = "published"
             write_json(attempt_path, attempt)
@@ -438,8 +586,121 @@ def activate_release(
                           attempt_path=attempt_path, attempt=attempt, run=run, unit_root=unit_root, cli_path=cli_path)
     except BaseException as error:
         _record_failure(paths=paths, attempt_path=attempt_path, attempt=attempt, error=error, run=run)
-        raise RuntimeError(f"部署未完成，保留现场: {attempt_path}; 原因: {error}") from error
+        if not can_roll_back:
+            raise RuntimeError(f"部署未完成，保留现场: {attempt_path}; 原因: {error}") from error
+        _recover_previous(paths=paths, environment_file=environment_file, previous=current, snapshot=selection_snapshot,
+                          snapshot_path=snapshot_path,
+                          attempt_path=attempt_path, attempt=attempt, error=error, run=run,
+                          unit_root=unit_root, cli_path=cli_path)
     return "activated"
+
+
+# 部署者清单与 extra 目标合并；没有 extra 目标时原样保留清单字节，清单摘要不变。
+def _merged_plan_text(plan: Path | None, root_ref: str, found: ExtraResult) -> str:
+    if plan is None:
+        document: dict[str, object] = {"schema_version": 1, "expected_root_ref": root_ref, "targets": []}
+    else:
+        text = plan.read_text(encoding="utf-8")
+        if not found.targets and not found.retiring:
+            return text
+        document = json.loads(text)
+    targets = document["targets"]
+    assert isinstance(targets, list)
+    taken = {item["plugin_id"] for item in targets}
+    if taken.intersection(item["plugin_id"] for item in found.targets):
+        raise ValueError("部署清单与 extra 目标重复指定同一插件")
+    targets.extend(found.targets)
+    if found.retiring:
+        document["retire"] = sorted({*cast(list[str], document.get("retire", [])), *found.retiring})
+    return json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+# A stopped publisher can fail after the selection CAS and before returning its receipt.
+def _restore_selection(path: Path, snapshot: str, published: object, publishing: bool) -> None:
+    previous = json.loads(snapshot)["root_ref"]
+    selected = json.loads(path.read_text(encoding="utf-8"))
+    current = selected["root_ref"]
+    if current == previous:
+        return
+    transition = selected["transition"]
+    # 发布成功后新实例启动期间可能又提交过一次选择（base 正是已发布的 Root）；回退的目的就是丢弃它。
+    if not ((published is not None and current == published)
+            or (published is not None and transition is not None and transition["base"] == published)
+            or (publishing and transition is not None and transition["base"] == previous)):
+        raise RuntimeError(f"selection 已被其他写入者改变: {current}")
+    atomic_write(path, snapshot)
+
+
+# 部署失败后回到原版本，让自部署失败的 Agent 仍能继续工作；回退本身失败才保留停机现场。
+def _recover_previous(
+    *, paths: ReleasePaths, environment_file: Path, previous: Mapping[str, str],
+    snapshot: str | None, attempt_path: Path, attempt: dict[str, object],
+    error: BaseException, run: Run, unit_root: Path, cli_path: Path, snapshot_path: Path | None = None,
+) -> None:
+    try:
+        _roll_back(paths=paths, environment_file=environment_file, previous=previous, snapshot=snapshot,
+                   snapshot_path=snapshot_path,
+                   publication=attempt.get("publication"), publishing=attempt.get("phase") == "publishing",
+                   run=run, unit_root=unit_root, cli_path=cli_path)
+    except BaseException as rollback_error:
+        attempt["rollbackError"] = str(rollback_error)
+        write_json(attempt_path, attempt)
+        raise RuntimeError(f"部署未完成且回退失败，保留现场: {attempt_path}; "
+                           f"原因: {error}; 回退: {rollback_error}") from error
+    attempt.update(status="rolled_back", phase="rolled_back")
+    write_json(attempt_path, attempt)
+    raise RuntimeError(f"部署未完成，已回到原版本 {previous['AKASHIC_RUNTIME_COMMIT']}: "
+                       f"{attempt_path}; 原因: {error}") from error
+
+
+def _roll_back(
+    *, paths: ReleasePaths, environment_file: Path, previous: Mapping[str, str],
+    snapshot: str | None, publication: object, publishing: bool,
+    run: Run, unit_root: Path, cli_path: Path, snapshot_path: Path | None = None,
+) -> None:
+    # 1. 候选可能已部分启动；先停下，再把选择文件改回停机前的原文。
+    stop_runtime(run=run)
+    published = publication.get("new_root_ref") if isinstance(publication, dict) else None
+    if snapshot is not None:
+        _restore_selection(paths.state / "workspace/runtime/plugin-stable.json", snapshot, published, publishing)
+    # 选择先还原，再还原 patch 与 cache 指针，避免选择引用已被删除的 artifact。
+    if snapshot_path is not None:
+        restore_plugin_state(snapshot_path)
+    # 2. 恢复原单元、CLI 与 runtime.env，再按原版本启动并核对健康。
+    checkout = paths.source(previous["AKASHIC_RUNTIME_COMMIT"])
+    install_units(checkout=checkout, backup_root=None, run=run, unit_root=unit_root, runtime_env=environment_file)
+    install_operator_entrypoint(checkout=checkout, backup_root=None, target=cli_path)
+    atomic_write(environment_file, render_environment(previous))
+    with measure("release.rollback"):
+        start_bridge(run=run)
+        _start_core_after_limit(run=run)
+        verify_release(environment_file)
+
+
+# 候选启动即退出会让单元进入 start-limit-hit，部署用户又不能 reset-failed；在限流窗口内重试原版本启动。
+def _start_core_after_limit(*, run: Run, attempts: int = 18) -> None:
+    for index in range(attempts):
+        try:
+            start_core(run=run)
+            return
+        except subprocess.CalledProcessError:
+            if index == attempts - 1:
+                raise
+            print(f"回退后启动 Core 失败（start-limit），10 秒后重试 {index + 2}/{attempts}", file=sys.stderr, flush=True)
+            time.sleep(10)
+
+
+# 崩溃后的手动还原：按部署回执里的恢复点与发布结果还原选择、patch、指针；调用方先停服务。
+def restore_state(*, paths: ReleasePaths, attempt_path: Path) -> None:
+    from scripts.akashic_release.snapshot import snapshot_selection
+
+    attempt = read_json(attempt_path)
+    snapshot = Path(str(attempt["snapshotPath"]))
+    publication = attempt.get("publication")
+    published = publication.get("new_root_ref") if isinstance(publication, dict) else None
+    _restore_selection(paths.state / "workspace/runtime/plugin-stable.json", snapshot_selection(snapshot),
+                       published, attempt.get("phase") == "publishing")
+    restore_plugin_state(snapshot)
 
 
 def resume_release(
@@ -473,6 +734,7 @@ def resume_release(
         raise RuntimeError("active 已被后续部署更新；禁止恢复过期尝试")
     if current.get("AKASHIC_RUNTIME_COMMIT") not in {attempt["previousCommit"], target}:
         raise RuntimeError("已有后续部署；禁止恢复过期尝试")
+    require_unit_install(checkout=paths.source(target), run=run, unit_root=unit_root, runtime_env=environment_file)
     # 2. 完成同一个启动边界，失败仍保留原发布结果。
     try:
         stop_runtime(run=run)

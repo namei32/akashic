@@ -16,11 +16,16 @@ R7～R8 Core key 只能由 Core 提供；Core 不导入插件合同。
 R9  Core 装配/宿主没有领域标识符或运行时字面量。
 R10 Core 固定为九个中立 key，均由 Core 独占。
 R11 SQLite 只由中立宿主/迁移函数打开；Web 框架只在 web_shell。
+R12 UI 宿主不点名插件：宿主插件只导入基础设施合同，聊天前端与宿主不按插件 ID 取用功能。
+R14 分层：每个插件在 `plugin_boundary.toml` 的 [tiers] 声明 core 或 extra；
+    core 层插件不得 import extra 层插件的任何模块（含 contract）。
+    已迁出 Core 的插件移到 [tiers].external（目录可以不存在，仍按 extra 层约束）；
+    extra 仓库合成树根目录的 `extra_tiers.toml` 只能追加 extra 层（`extra = [...]`）。
 
 比较 Git 基线时，公开模块清单与 Core 字面 key 声明只允许减少；
 不能通过扩大允许清单或登记新角色来绕过已有边界。
 
-R1～R3 的既有欠账记在 `plugin_boundary_baseline.toml` 中，只允许减少。
+R1～R3、R9、R12、R14 的既有欠账记在 `plugin_boundary_baseline.toml` 中，只允许减少。
 R4、R5 没有基线；本门不证明角色归属、原子性或运行时隔离。
 
 用法
@@ -47,6 +52,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 POLICY_PATH = REPO_ROOT / "plugin_boundary.toml"
+EXTRA_TIERS_FILE = "extra_tiers.toml"
 BASELINE_PATH = REPO_ROOT / "plugin_boundary_baseline.toml"
 
 CORE_ROOTS = (
@@ -75,7 +81,6 @@ PLUGIN_ALLOWED_MODULES = frozenset({
     "agent.plugin_composition.effect",
     "agent.plugin_composition.events",
     "agent.plugin_composition.execution",
-    "agent.plugin_composition.executor",
     # Reviewed narrow host fact: docs/design/plugin-boundary-foundation.md §9.37.
     "agent.plugin_composition.host",
     "agent.plugin_composition.model",
@@ -297,6 +302,64 @@ def check_core_imports_plugin(imports: list[Import]) -> list[Import]:
     ]
 
 
+# 读取 [tiers] 的一个名单，值为插件目录名。
+def tier_names(policy: dict[str, object], key: str) -> set[str]:
+    table = policy.get("tiers")
+    names = table.get(key) if isinstance(table, dict) else None
+    return {str(name) for name in names} if isinstance(names, list) else set()
+
+
+# 读取 extra 仓库合成树根目录的 extra_tiers.toml：返回 (追加的 extra 名单, 格式错误)；文件不存在则为空。
+def load_extra_declared() -> tuple[set[str], list[str]]:
+    path = REPO_ROOT / EXTRA_TIERS_FILE
+    if not path.is_file():
+        return set(), []
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    errors = [f"R14: {EXTRA_TIERS_FILE} 只能声明 extra，不允许键: {key}" for key in sorted(data) if key != "extra"]
+    return tier_names({"tiers": data}, "extra"), errors
+
+
+# 读取层级：返回 (core 集合, extra 集合)；extra 含 Core 的 extra、external 与 extra 仓库追加的名单。
+def load_tiers(policy: dict[str, object] | None = None) -> tuple[set[str], set[str]]:
+    policy = policy if policy is not None else load_policy()
+    declared, _ = load_extra_declared()
+    return tier_names(policy, "core"), tier_names(policy, "extra") | tier_names(policy, "external") | declared
+
+
+# R14：core 层插件 import extra 层插件（含 contract），物理迁出 extra 后会 ImportError。
+def check_core_tier_imports_extra(imports: list[Import]) -> list[Import]:
+    core, extra = load_tiers()
+    violations: list[Import] = []
+    for item in imports:
+        own = plugin_package(item.importer)
+        target = module_plugin_package(item.module)
+        if own is None or target is None or own == target:
+            continue
+        if own.split(".")[1] in core and target.split(".")[1] in extra:
+            violations.append(item)
+    return violations
+
+
+# R14：每个插件目录必须且只能声明一个层级；在 Core 的 core/extra 与追加名单里声明的插件必须真实存在，external 可以不存在。
+def check_tier_table(policy: dict[str, object]) -> list[str]:
+    core, listed = tier_names(policy, "core"), tier_names(policy, "extra")
+    external = tier_names(policy, "external")
+    declared, errors = load_extra_declared()
+    present = {
+        path.name for path in (REPO_ROOT / PLUGIN_ROOT).iterdir()
+        if path.is_dir() and not path.name.startswith(("_", "."))
+    }
+    extra = listed | external | declared
+    errors.extend(f"R14: 插件 {name} 同时声明 core 与 extra（{EXTRA_TIERS_FILE} 不能改写 Core 的声明）" for name in sorted(core & extra))
+    errors.extend(
+        f"R14: 插件 {name} 未声明层级（Core 的 plugin_boundary.toml [tiers]，或 extra 仓库的 {EXTRA_TIERS_FILE}）"
+        for name in sorted(present - core - extra)
+    )
+    errors.extend(f"R14: [tiers] 声明了不存在的插件: {name}（已迁出 Core 的请移到 [tiers].external）" for name in sorted((core | listed) - present))
+    errors.extend(f"R14: {EXTRA_TIERS_FILE} 声明了不存在的插件: {name}" for name in sorted(declared - present))
+    return errors
+
+
 def check_plugin_deep_core(imports: list[Import]) -> list[Import]:
     """R2：插件 import core 内部深路径。"""
 
@@ -502,6 +565,7 @@ def import_findings(imports: list[Import]) -> dict[str, list[Import]]:
         "R1": check_core_imports_plugin(imports),
         "R2": check_plugin_deep_core(imports),
         "R3": check_cross_plugin(imports),
+        "R14": check_core_tier_imports_extra(imports),
     }
 
 
@@ -550,11 +614,11 @@ def public_modules(source: str) -> frozenset[str]:
 CORE_KEYS = frozenset({
     "core.host_info", "core.restart_gate.v1", "core.runtime_catalog.v1",
     "core.plugin_config.v1", "core.plugin_updates", "core.credentials",
-    "host.execution.v1", "core.tasks", "executor",
+    "host.execution.v1", "core.tasks",
 })
 # 这里只允许宿主 journal、迁移回执、完整 release 备份；不授予业务表写入权。
 SQLITE_OWNERS = {
-    "agent/plugins/reload_journal.py": {"backup_to", "inspect_existing", "_check_existing_schema", "_connect"},
+    "agent/plugins/reload_journal.py": {"inspect_existing", "_check_existing_schema", "_connect"},
     "agent/migrations/runner.py": {"_read_baseline", "_save_baseline", "_read_applied_ids"},
     "agent/migrations/release_backup.py": {"_copy_db"},
     "migrations/core/20260921_01_plugin_update_input_ref.py": {"_copy_database", "_upgrade"},
@@ -656,6 +720,178 @@ def check_core_ownership(imports: list[Import], sources: dict[str, str], previou
     return errors
 
 
+# 前端以插件身份取用功能的写法：静态 ID 或 *_PLUGIN 常量传给查询/安装判断，或把 ID 存成常量。
+# token 之间允许空白和注释（TS 合法的 trivia），注释隔开调用不能绕过。
+_GAP = r"(?:\s|/\*[\s\S]*?\*/|//[^\n]*\n)*"
+_TARGET = r"([\"'`][^\"'`$]+[\"'`]|[A-Z][A-Z0-9_]*_PLUGIN\b)"
+FRONTEND_NAMING = (
+    re.compile(rf"queryHostPlugin{_GAP}\({_GAP}{_TARGET}"),
+    re.compile(rf"\.{_GAP}installed{_GAP}\({_GAP}{_TARGET}"),
+    re.compile(rf"\b([A-Z][A-Z0-9_]*_PLUGIN){_GAP}={_GAP}[\"'`]"),
+)
+FRONTEND_ROUTE = re.compile(r"[\"'`](/api/[^\"'`$?#\s]*)")
+
+UI_POLICY = "plugin_boundary.toml"
+
+
+def ui_snapshot(base: str | None) -> dict[str, str]:
+    """R12 需要的全部事实：Python 源码、宿主前端源码与策略文件；base 读 Git 快照。"""
+    if base is None:
+        files = {rel: (REPO_ROOT / rel).read_text(encoding="utf-8") for rel in source_python_files()}
+        files[UI_POLICY] = POLICY_PATH.read_text(encoding="utf-8")
+        for path in (REPO_ROOT / "frontend").rglob("*.ts*"):
+            if "node_modules" not in path.parts:
+                files[str(path.relative_to(REPO_ROOT))] = path.read_text(encoding="utf-8")
+        return files
+    files = base_sources(base)
+    commit = subprocess.run(["git", "rev-parse", "--verify", f"{base}^{{commit}}"],
+                            cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.strip()
+    # 基准里没有 frontend/（例如拆仓期间只有 Core 的提交）就没有前端点名可比，只取存在的路径。
+    present = subprocess.run(["git", "ls-tree", "--name-only", commit, "--", UI_POLICY, "frontend"],
+                             cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.split()
+    archive = subprocess.run(["git", "archive", commit, *present],
+                             cwd=REPO_ROOT, capture_output=True, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as snapshot:
+        for member in snapshot:
+            if member.isfile() and (member.name == UI_POLICY or member.name.endswith((".ts", ".tsx"))):
+                handle = snapshot.extractfile(member)
+                assert handle is not None
+                files[member.name] = handle.read().decode("utf-8")
+    return files
+
+
+def ui_policy(files: dict[str, str]) -> dict[str, list[str]]:
+    table = tomllib.loads(files[UI_POLICY]).get("ui_hosts", {})
+    keys = ("plugins", "infrastructure", "frontend", "host_routes")
+    if not isinstance(table, dict):
+        raise ValueError("plugin_boundary.toml ui_hosts 必须是表")
+    policy: dict[str, list[str]] = {}
+    for key in keys:
+        value = table.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError(f"plugin_boundary.toml ui_hosts.{key} 必须是字符串列表")
+        policy[key] = value
+    return policy
+
+
+# 插件身份：目录名与 manifest 名（name = "..."）都算，外置插件改名不能绕过。
+def plugin_identities(files: dict[str, str]) -> set[str]:
+    identities: set[str] = set()
+    for rel, source in files.items():
+        match = re.fullmatch(r"plugins/([a-z_][a-z0-9_]*)/plugin\.py", rel)
+        if match:
+            identities.add(match.group(1))
+            identities.update(re.findall(r'^name\s*=\s*"([^"]+)"', source, re.MULTILINE))
+    return identities
+
+
+# 宿主按身份比较插件：`plugin_id == "x"`、`id.split("@")[0] == "x"`、`plugin_id.startswith("x")`。
+# 只看表达式里带 plugin/id/source 字样的一侧（来源标记同样是插件身份），普通文件名或 kind 比较不算。
+def _names_plugin(node: ast.AST, identities: set[str]) -> str | None:
+    def identity_side(expression: ast.AST) -> bool:
+        return re.search(r"(?i)plugin|(?:^|[._\['\"])(?:id|source)\b", ast.unparse(expression)) is not None
+    if isinstance(node, ast.Compare):
+        sides = (node.left, *node.comparators)
+        for side in sides:
+            if isinstance(side, ast.Constant) and side.value in identities \
+                    and any(other is not side and identity_side(other) for other in sides):
+                return str(side.value)
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "startswith"
+            and node.args and isinstance(node.args[0], ast.Constant) and node.args[0].value in identities
+            and identity_side(node.func.value)):
+        return str(node.args[0].value)
+    return None
+
+
+def ui_host_findings(files: dict[str, str], policy: dict[str, list[str]] | None = None) -> set[str]:
+    """UI 宿主（插件与聊天前端）对具体插件的点名，键为 `文件 -> 插件或路由`。"""
+    policy = ui_policy(files) if policy is None else policy
+    hosts = set(policy["plugins"])
+    identities = plugin_identities(files)
+    findings: set[str] = set()
+    # 1. 宿主插件导入非基础设施插件的合同（含相对导入与普通 import），或按身份比较插件；
+    #    宿主名单只决定扫描范围，不豁免宿主之间的依赖。
+    python = sorted(rel for rel in files if rel.endswith(".py"))
+    for item in collect_imports(python, files):
+        owner = plugin_package(item.importer)
+        match = re.match(r"plugins\.([a-z_][a-z0-9_]*)\.contract\b", item.module)
+        if owner and owner.removeprefix("plugins.") in hosts and match \
+                and match.group(1) not in set(policy["infrastructure"]):
+            findings.add(f"{item.importer} -> {match.group(1)}")
+    for rel in python:
+        owner = plugin_package(rel)
+        if owner is None or owner.removeprefix("plugins.") not in hosts:
+            continue
+        for node in ast.walk(ast.parse(files[rel], filename=rel)):
+            target = _names_plugin(node, identities - set(policy["infrastructure"]) - {owner.removeprefix("plugins.")})
+            if target is not None:
+                findings.add(f"{rel} -> {target}")
+    # 2. 聊天前端以插件身份取用功能，或访问通用宿主路由以外的路由（按完整路径段比较）。
+    routes = tuple(policy["host_routes"])
+    for rel, source in files.items():
+        if not rel.startswith(tuple(f"{root}/" for root in policy["frontend"])) or not rel.endswith((".ts", ".tsx")):
+            continue
+        # 不剥注释：手写词法器追不全 TSX（正则、JSX 文本、模板嵌套），宁可把注释里写明的调用当违规，也不漏掉真实调用。
+        for pattern in FRONTEND_NAMING:
+            findings.update(f"{rel} -> {match.group(1).strip(chr(34) + chr(39) + '`')}" for match in pattern.finditer(source))
+        for match in FRONTEND_ROUTE.finditer(source):
+            path = match.group(1)
+            if not any(path == route or path.startswith(route + "/") for route in routes):
+                findings.add(f"{rel} -> {'/'.join(path.split('/')[:4])}")
+    return findings
+
+
+# 目录已整体搬走的前端根没有可扫描的文件，从策略里删掉它不算放宽。
+def _scanned_roots(roots: list[str], files: dict[str, str]) -> set[str]:
+    return {root for root in roots if any(rel.startswith(f"{root}/") for rel in files)}
+
+
+# R13：前端源码按 DSH 的方式归属——应用和模块都在 frontend/plugins/<插件>/ 下，
+# 共享的只能是 packages/ 里声明了 akashic.kind 的包（合同包另须写明提供它的插件）。
+def check_shared_layout() -> list[str]:
+    listed = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", "frontend", "packages"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    plugins = {path.name for path in (REPO_ROOT / "plugins").iterdir() if path.is_dir()}
+    errors: list[str] = []
+    for owner in sorted({path.split("/")[1] for path in listed if path.startswith("frontend/")}):
+        if owner != "plugins":
+            errors.append(f"R13: frontend/ 下只允许 plugins/<插件名>/: frontend/{owner}")
+    for owner in sorted({path.split("/")[2] for path in listed if path.startswith("frontend/plugins/")}):
+        if owner not in plugins:
+            errors.append(f"R13: 前端目录没有对应的插件: frontend/plugins/{owner}")
+    for package in sorted({path.split("/")[1] for path in listed if path.startswith("packages/")}):
+        manifest = REPO_ROOT / "packages" / package / "package.json"
+        meta = json.loads(manifest.read_text(encoding="utf-8")).get("akashic") if manifest.is_file() else None
+        kind = meta.get("kind") if isinstance(meta, dict) else None
+        if kind not in ("contract", "library"):
+            errors.append(f"R13: packages/{package}/package.json 必须声明 akashic.kind 为 contract 或 library")
+        elif kind == "contract" and isinstance(meta, dict) and meta.get("provider") not in plugins:
+            errors.append(f"R13: 合同包 packages/{package} 的 akashic.provider 不是现有插件")
+    return errors
+
+
+# 基线只许减少：相对 base 不能新增点名，也不能放宽宿主策略来绕过。
+def check_ui_hosts(base: str | None, baseline: set[str]) -> tuple[list[str], int]:
+    current = ui_snapshot(None)
+    findings = ui_host_findings(current)
+    errors = [f"R12: UI 宿主点名插件: {item}" for item in sorted(findings - baseline)]
+    errors.extend(f"baseline-R12: 账本条目已不再是违规，请从 plugin_boundary_baseline.toml 删除: {item}"
+                  for item in sorted(baseline - findings))
+    if base is not None:
+        previous = ui_snapshot(base)
+        policy, now = (ui_policy(previous) if "ui_hosts" in previous[UI_POLICY] else ui_policy(current)), ui_policy(current)
+        errors.extend(f"R12: 相对 {base} 新增点名（写入账本也不能放行）: {item}"
+                      for item in sorted(findings - ui_host_findings(previous, now)))
+        for key, widened in (("infrastructure", set(now["infrastructure"]) - set(policy["infrastructure"])),
+                             ("host_routes", set(now["host_routes"]) - set(policy["host_routes"])),
+                             ("plugins", set(policy["plugins"]) - set(now["plugins"])),
+                             ("frontend", _scanned_roots(policy["frontend"], current) - set(now["frontend"]))):
+            errors.extend(f"R12: 相对 {base} 放宽 ui_hosts.{key}: {item}" for item in sorted(widened))
+    return errors, len(findings)
+
+
 def run_check(base: str | None = None) -> int:
     policy = load_policy()
     baseline = load_baseline()
@@ -688,10 +924,15 @@ def run_check(base: str | None = None) -> int:
             )
 
     errors.extend(check_capability_table(policy))
+    errors.extend(check_tier_table(policy))
     errors.extend(check_shared_contracts())
     errors.extend(check_phantom_names(policy))
     current_sources = {rel: (REPO_ROOT / rel).read_text(encoding="utf-8") for rel in source_python_files()}
     errors.extend(check_core_ownership(imports, current_sources, sources))
+    ui_known = set(baseline.get("R12", []))
+    ui_errors, ui_count = check_ui_hosts(base, ui_known)
+    errors.extend(ui_errors)
+    errors.extend(check_shared_layout())
 
     if errors:
         print("插件边界门未通过：", file=sys.stderr)
@@ -706,7 +947,8 @@ def run_check(base: str | None = None) -> int:
         f"R2={counts['R2']}/{len(baseline.get('R2', []))} "
         f"R3={counts['R3']}/{len(baseline.get('R3', []))} "
         f"R7=0 R8=0 R9={len(core_domain_findings(current_sources))}/{len(baseline.get('R9', []))} "
-        "R10=9 R11=0（静态约束；不替代运行验收）"
+        f"R10=9 R11=0 R12={ui_count}/{len(ui_known)} R13=0 "
+        f"R14={counts['R14']}/{len(baseline.get('R14', []))}（静态约束；不替代运行验收）"
     )
     return 0
 
@@ -722,7 +964,7 @@ def print_baseline() -> int:
         "",
         "[baseline]",
     ]
-    for rule in ("R1", "R2", "R3"):
+    for rule in ("R1", "R2", "R3", "R14"):
         keys = sorted({item.key for item in findings[rule]})
         lines.append(f"{rule} = [")
         lines.extend(f"    {json.dumps(key, ensure_ascii=False)}," for key in keys)
@@ -730,6 +972,9 @@ def print_baseline() -> int:
     current = {rel: (REPO_ROOT / rel).read_text(encoding="utf-8") for rel in source_python_files()}
     lines.append("R9 = [")
     lines.extend(f"    {json.dumps(item, ensure_ascii=False)}," for item in sorted(core_domain_findings(current)))
+    lines.append("]")
+    lines.append("R12 = [")
+    lines.extend(f"    {json.dumps(item, ensure_ascii=False)}," for item in sorted(ui_host_findings(ui_snapshot(None))))
     lines.append("]")
     print("\n".join(lines))
     return 0

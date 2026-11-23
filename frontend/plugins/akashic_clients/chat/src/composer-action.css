@@ -1,0 +1,130 @@
+.composer-action-button {
+  position: relative;
+  display: inline-grid;
+  width: 40px;
+  min-width: 40px;
+  max-width: 40px;
+  height: 40px;
+  min-height: 40px;
+  max-height: 40px;
+  flex: 0 0 40px;
+  box-sizing: border-box;
+  place-items: center;
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--ak-radius-full);
+  padding: 0;
+  /* 发送是一枚墨色实心圆：纸面上唯一的实色，眼睛落点在这里。 */
+  color: var(--ak-paper-editing);
+  background: var(--ak-ink-primary);
+  cursor: pointer;
+  appearance: none;
+  transition-property: scale, color, background-color;
+  /* 按下要立刻、回弹才慢慢来：进出两条时长与两条曲线分开写，索引与 transition-property 对齐。 */
+  transition-duration: 180ms, var(--ak-sys-duration-short), var(--ak-sys-duration-short);
+  transition-timing-function: var(--ak-sys-motion-emphasized), var(--ak-sys-motion-standard), var(--ak-sys-motion-standard);
+}
+
+/* 停止态的细环画死在伪元素上，进出生成只过渡它的 opacity；用 ::before 让它和原来的 inset 阴影一样垫在追逐弧下面。 */
+.composer-action-button::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1.5px color-mix(in oklab, var(--ak-ink-primary) 16%, transparent);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+}
+
+.composer-action-button[data-mode="stop"]::before {
+  opacity: 1;
+}
+
+/* 发送 / 停止两枚图形叠在同一个格子：尺寸由各自 svg 的 width/height 决定，这里只管不参与布局。 */
+.composer-action-button .icon-swap__slot > svg {
+  display: block;
+  flex: none;
+  stroke-width: 2;
+}
+
+/* 箭头的线比停止方块粗一档（改版前由 .composer-action-button[data-mode="send"] > svg 承担）。 */
+.composer-action-button[data-mode="send"] .icon-swap__slot > svg {
+  stroke-width: 2.4;
+  /* 箭杆画在 24 格的 7–21 行，墨迹质心比盒中心低约 0.5px；上提半像素回到圆心。 */
+  translate: 0 -0.5px;
+}
+
+/* 停止退成描边：同一位置、同一尺寸，只把实心换成细环 + 小方块，生成中不抢正文的注意力。 */
+.composer-action-button[data-mode="stop"] {
+  color: var(--ak-ink-primary);
+  background: transparent;
+}
+
+.composer-action-button:hover:not(:disabled, [aria-disabled="true"]) {
+  background: color-mix(in oklab, var(--ak-ink-primary) 86%, var(--ak-paper-editing));
+}
+
+.composer-action-button[data-mode="stop"]:hover:not(:disabled, [aria-disabled="true"]) {
+  background: color-mix(in oklab, var(--ak-ink-primary) 6%, transparent);
+}
+
+.composer-action-button:active:not(:disabled, [aria-disabled="true"]) {
+  scale: 0.96;
+  transition-duration: var(--ak-sys-duration-instant), var(--ak-sys-duration-short), var(--ak-sys-duration-short);
+}
+
+.composer-action-button:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
+}
+
+/* 空输入：浅墨底 + 淡箭头，位置已在，等字写进来才变实。 */
+.composer-action-button:is(:disabled, [aria-disabled="true"]) {
+  color: color-mix(in oklab, var(--ak-ink-primary) 34%, transparent);
+  background: color-mix(in oklab, var(--ak-ink-primary) 7%, transparent);
+  cursor: default;
+}
+
+.composer-action-button[data-mode="stop"][aria-disabled="true"] {
+  color: color-mix(in oklab, var(--ak-ink-primary) 55%, transparent);
+  background: transparent;
+}
+
+/* 生成中：细环上一道慢转的圆头弧线；正在停止时转快一档，表示请求已送达、等本轮收尾。
+   弧线绕圆心匀速走，等价于整枚外层 svg（HTML 盒子）旋转：transform 在合成线程播放，生成期间主线程再忙也不卡。
+   生成以外不撤掉动画、只暂停：回到发送时弧线停在原地淡出，不跳回起点。 */
+.composer-action-button__chase {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  opacity: 0;
+  pointer-events: none;
+  transform-origin: 50% 50%;
+  animation: composer-action-stopping 2.4s linear infinite paused;
+  transition: opacity var(--ak-sys-duration-short) var(--ak-sys-motion-standard);
+}
+
+.composer-action-button[data-mode="stop"] .composer-action-button__chase {
+  opacity: 0.7;
+  animation-play-state: running;
+}
+
+.composer-action-button[data-mode="stop"][aria-disabled="true"] .composer-action-button__chase {
+  animation-duration: 1.1s;
+}
+
+@keyframes composer-action-stopping {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer-action-button:active:not(:disabled, [aria-disabled="true"]) { scale: 1; }
+  .composer-action-button[data-mode="stop"] .composer-action-button__chase { opacity: 0.45; }
+  .composer-action-button__chase { animation: none; }
+  .composer-action-button[data-mode="stop"] .composer-action-button__chase circle { stroke-dasharray: 1 0; }
+}

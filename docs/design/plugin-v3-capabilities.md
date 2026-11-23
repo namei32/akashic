@@ -75,7 +75,6 @@ ToolGrant 和 TurnExecutionScope 也已退役；工具调用由 `CallSource`、`
 | 回复 / 执行 | `reply.execute.v4`、`reply.program.v3`、`react.ordered-start.v2`、`tools.program.v2` |
 | 上下文材料 | `context.materials.v4`；注册必填 `kind`，仅按 `exclude_kinds` 选择 |
 | Delivery | `delivery.guarded-start.v1`；持久准备可等待，`start_guard` 保护首次持久开始 |
-| Drift | `drift.wake.v3`、`drift.delivery.v2`，全部可等待 |
 
 ```text
 ┌────────────────────┐    ┌────────────────────┐    ┌──────────────────┐
@@ -204,9 +203,6 @@ key 的相等比较和哈希，不成为可注入别名，也不改写既有 des
 |---|---|---|
 | `EmitEventKey[P]` / `ctx.emit(key, payload)` | 同步调用 listener | 按注册顺序；listener 必须同步，异常立即向调用者传播；返回 awaitable 是错误 |
 | `SerialEventKey[P, R]` / `await ctx.serial(...)` | 逐个等待 listener | 按注册顺序；`None` 继续，类型正确的 `Bail[R]` 立即短路；异常记录 owner failure 后传播 |
-| `ParallelEventKey[P]` / `await ctx.parallel(...)` | 为全部 listener 建立异步任务并等待 settle | listener 必须返回 awaitable；并发执行，异常聚合为 `BaseExceptionGroup`；调用取消会取消并 drain 子任务 |
-| `TransformEventKey[P]` / `await ctx.transform(...)` | 将当前 payload 依注册顺序交给下一 listener | 每步必须返回声明的同类型 payload；`None`、`Bail`、错误类型和异常都失败 |
-| `ObserveEventKey[P]` / `await ctx.observe(...)` | 调用全部 observer，再等待异步结果 | 全部 observer 都会被调用；普通 listener 失败隔离为 owner Incident，调用者继续；调用取消仍取消并 drain 未完成 observer |
 
 Runtime lifecycle signal 使用同一 typed event 基础：`RUNTIME_STARTING` 在正式接纳开放前准备资源，
 `RUNTIME_STARTED` 在相应 activation 具备启动条件后启动工作，`RUNTIME_STOPPING` 在其停止前收束工作；
@@ -229,8 +225,8 @@ Runtime Service 通过 `inject` 和 `ctx.require(KEY)` 连接；插件能力由�
 | `DELIVERY` / `DELIVERY_READ` | 打开发送 admission 或只读历史 | Delivery 发送、恢复和查询 |
 
 旧 Core `TOOL_CATALOG` 及其注册、冻结和快照装配已删除。旧 `DELIVERIES`、
-`DURABLE_DELIVERIES` ServiceKey 和注入也已退役。旧持久投递记录与恢复实现保留，
-Manager 不扫描这些业务记录来判断业务兼容性；移除检查不会删除记录、结算或重发旧效果。
+`DURABLE_DELIVERIES` ServiceKey 和注入也已退役。旧持久投递的记录与恢复实现已无生产消费者并随之删除；`runtime/deliveries/settlements.sqlite`
+作为历史数据原样保留，没有代码读写，物理删除需单独授权。
 工具消费者通过公共 `agent.plugin_contracts.tools` 中的 key 和结构接口协作，
 不能 import `plugins.tools.api` 或其他兄弟插件实现。工具结果提供 `outcome` 与 `parts`；
 Tools owner 在入口校验。ToolResult Message 是对话调用的持久结果正文。
@@ -269,7 +265,6 @@ Turn 是 `plugins.turn_projection` 从 Message 日志得到的无状态读投影
 | `MCP_SERVERS` | `register(ctx, definition)`、`open(ctx, name)` | 普通 `mcp` provider；每次调用独立会话 |
 | `MANAGED_PROCESSES` | `register(ctx, definition)` | 普通 `managed_processes` provider；返回实际进程句柄 |
 | `WORKLOADS` | `register(ctx, definition)` | 普通 `workloads` provider；取得窄 Controller 管理的容器句柄 |
-| `EXECUTOR_SERVICE` | `parallel_sync(jobs)` | 有界纯同步工作；worker 不取得 Context/Fiber |
 
 资产通过普通 `assets` 插件提供的 `INSTALLED_ASSETS` 注册。贡献方在 `inject` 中声明依赖，
 在 `apply(ctx)` 中调用 `await ctx.require(INSTALLED_ASSETS).register(ctx, "skills", "skills")`。

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Mapping
 from importlib import import_module
+from typing import cast
 
 from agent.plugin_composition import Context
 from plugins.models.contract import EMBEDDINGS
@@ -9,14 +11,18 @@ from plugins.models.contract import (
     MODEL_CATALOG,
     MODEL_DRIVERS,
 )
-from plugins.models.contract import MODEL_CACHE_USAGE, MODEL_CALL_STATS
-from plugins.models.contract import MODEL_USAGE_REPORTS
+from plugins.models.contract import MODEL_CACHE_USAGE, MODEL_CALL_STATS, USAGE_SOURCES
 from plugins.gateway.contract import RpcMethod
-from plugins.ui.contract import UI, UI_SLOTS, PluginUiDefinition, PluginUiRpcInvalidRequest
+from plugins.ui.contract import UI, UI_SLOTS, PluginUiDefinition, hidden_part, part_display_key
+from plugins.conversation.contract import input_part_key
+from plugins.ledger.contract import MESSAGE_CATALOG, MESSAGE_WRITERS, ContentPart, ContentReferences, MessageReader
+from plugins.models.contract import ChatModelSelection, ModelError, ModelUnavailableError
+from plugins.channels.contract import InputPartRejected
 
+from .composition import CompositionLog
 from .content import MODEL_CONTENT, ContentOwner
 from .views import CONTENT_VIEWS, ContentViews
-from .litellm_catalog import LiteLlmCapabilityCatalog
+from .modelsdev_catalog import ModelsDevCapabilityCatalog
 from .model_settings_http import BoundModelControl, rpc_methods
 from .projection import (
     MODEL_CALLS,
@@ -27,12 +33,12 @@ from .projection import (
     ProjectionOwner,
     display_facts,
 )
-from .selection import MODEL_SELECTION, SelectionOwner
+from .chat_ui import ChatUiQueries
+from .selection import MODEL_SELECTION, SAVED_SELECTION_KEYS, SelectionOwner, check_selection, saved_from_part
 from .settings import MODEL_SETTINGS
 from .state import ModelsState
 from .store import ModelsStore
 from .usage import CacheUsage
-from .usage_report import UsageReports
 
 api_version = 3
 name = "models"
@@ -52,6 +58,7 @@ async def apply(ctx: Context) -> None:
         ctx.workspace_file("model-registry.sqlite3"),
         backup_dir=ctx.runtime.workspace / "runtime" / "model-backups",
         writable=True,
+        composition=CompositionLog(ctx.data_root / "composition.sqlite3"),
     )
     store.initialize()
     # 宿主租约在本 Root 退役时最后释放：effect 清理按注册逆序执行，
@@ -60,8 +67,8 @@ async def apply(ctx: Context) -> None:
     state = ModelsState(
         store,
         context=ctx,
-        capability_catalog=LiteLlmCapabilityCatalog(
-            ctx.data_root / "litellm-capabilities.json",
+        capability_catalog=ModelsDevCapabilityCatalog(
+            ctx.data_root / "modelsdev-capabilities.json",
             writable=True,
         ),
     )
@@ -72,10 +79,13 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.provide(MODEL_SETTINGS, state.settings)
     _ = await ctx.provide(MODEL_CALLS, store.read_call)
     _ = await ctx.provide(MODEL_CALL_STATS, store.read_call_stats)
-    _ = await ctx.provide(MODEL_USAGE_REPORTS, UsageReports(store.read_usage_report))
-    usage = CacheUsage(ctx, store)
+    usage = CacheUsage(ctx, store, ctx.data_root / "cache-usage.sqlite3")
     _ = await ctx.provide(MODEL_CACHE_USAGE, usage)
+    _ = await ctx.provide(USAGE_SOURCES, usage)
     _ = await ctx.provide(MODEL_DISPLAY, display_facts)
+    # 自己写入的内部材料不进聊天正文；宿主不维护按插件列举的隐藏名单。
+    for kind in ("model.selection", "tool.selection"):
+        _ = await ctx.provide(part_display_key(kind), hidden_part)
     _ = await ctx.provide(MODEL_PROJECTION, ProjectionOwner())
     _ = await ctx.provide(MODEL_MESSAGE_CHECKS, MessageChecksOwner())
     _ = await ctx.provide(MODEL_CONTENT, ContentOwner())
@@ -103,21 +113,43 @@ async def apply(ctx: Context) -> None:
     _ = await ctx.inject((UI, MODEL_CATALOG, MODEL_CALL_STATS, MODEL_SETTINGS, MODEL_SELECTION, MODEL_CACHE_USAGE),
                          _register_ui, name="ui")
 
-    # 回答尾注只读本插件的用量视图；聊天界面经插件界面插槽查询。
+    _ = await ctx.inject((MESSAGE_WRITERS,), _input_selection(state), name="input-selection")
+
+    # 回答说明行用量与输入框模型胶囊都只读本插件的视图；聊天界面经插件界面插槽查询，选择随消息作为 model.selection 片段回来。
     async def message_ui(child: Context) -> None:
-        async def query(method: str, payload: dict[str, object], *,
-                        session_id: str | None, turn_id: str | None) -> dict[str, object]:
-            message_id = payload.get("message_id")
-            if method != "usage.message" or set(payload) != {"message_id"} or not session_id \
-                    or not isinstance(message_id, str) or not message_id:
-                raise PluginUiRpcInvalidRequest("用量查询需要会话与消息")
-            return {"output_tokens": await usage.message_output_tokens(session_id, message_id)}
-
+        query = ChatUiQueries(catalog=state.read_catalog, selection=state.read_chat_selection, messages=child.require(MESSAGE_CATALOG), call_stats=store.read_call_stats,
+                              usage=usage, icons=state.connection_icons)
         _ = await child.require(UI_SLOTS).register_plugin_ui(
-            child, PluginUiDefinition(module="message_ui.js", stylesheet="message_ui.css",
-                                      slots=("turn.after_answer",)), query=query)
+            child, PluginUiDefinition(module="plugin_ui.js", stylesheet="plugin_ui.css",
+                                      slots=("message.meta", "composer.toolbar", "composer.status", "sidebar.panels")), query=query)
 
-    _ = await ctx.inject((UI_SLOTS,), message_ui, name="message-ui")
+    _ = await ctx.inject((UI_SLOTS, MESSAGE_CATALOG), message_ui, name="message-ui")
+
+
+# 客户端随消息附带的模型选择：校验与会话保存都归本插件，二者随消息写入能力一起出现，没有只校验不保存的窗口。
+def _input_selection(state: ModelsState) -> Callable[[Context], Awaitable[None]]:
+    # 形状不对、模型不可用或强度不支持都是该请求的拒收，回给发送者而不是当程序错误。
+    def check(part: ContentPart, reader: MessageReader) -> ContentReferences:
+        try:
+            references = check_selection(part)
+            value = cast(Mapping[str, str | None], part.value)
+            _ = state.catalog.validate_chat_selection(ChatModelSelection(value["model_id"], value["reasoning_effort"]))
+        except (TypeError, ValueError) as error:
+            raise InputPartRejected(str(error)) from error
+        except RuntimeError as error:
+            unavailable = ModelError.read(error, ModelUnavailableError)
+            if unavailable is None:
+                raise
+            raise InputPartRejected(unavailable.message) from error
+        return references
+
+    async def install(ctx: Context) -> None:
+        _ = await ctx.require(MESSAGE_WRITERS).register_part_metadata(
+            ctx, kind="model.selection", keys=SAVED_SELECTION_KEYS, update=saved_from_part,
+        )
+        _ = await ctx.provide(input_part_key("model.selection"), check)
+
+    return install
 
 
 async def _register_ui(ctx: Context) -> None:

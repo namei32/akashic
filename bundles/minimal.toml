@@ -1,16 +1,20 @@
 # 此层按 row id 整行替换；plugin-stable.json 仍是运行选择。
 schema_version = 1
 
-[rows."companion"]
-plugin = "companion@release"
-disabled = true
-
 [rows."ledger"]
 plugin = "ledger@release"
 disabled = true
 
+[rows."userinformation"]
+plugin = "userinformation@release"
+disabled = true
+
 [rows."timer"]
 plugin = "timer@release"
+disabled = true
+
+[rows."scheduler"]
+plugin = "scheduler@release"
 disabled = true
 
 [rows."channels"]
@@ -41,6 +45,10 @@ disabled = true
 plugin = "mcp@release"
 disabled = true
 
+[rows."goal"]
+plugin = "goal@release"
+disabled = true
+
 [rows."commands"]
 plugin = "commands@release"
 disabled = true
@@ -61,12 +69,12 @@ disabled = true
 plugin = "projects@release"
 disabled = true
 
-[rows."models"]
-plugin = "models@release"
+[rows."main_session"]
+plugin = "main_session@release"
 disabled = true
 
-[rows."model_usage"]
-plugin = "model_usage@release"
+[rows."models"]
+plugin = "models@release"
 disabled = true
 
 [rows."session_title"]
@@ -109,8 +117,36 @@ disabled = true
 plugin = "assets@release"
 disabled = true
 
-[rows."standard_tools"]
-plugin = "standard_tools@release"
+[rows."working_directory"]
+plugin = "working_directory@release"
+disabled = true
+
+[rows."privacy_mask"]
+plugin = "privacy_mask@release"
+disabled = true
+
+[rows."vision"]
+plugin = "vision@release"
+disabled = true
+
+[rows."plugin_settings"]
+plugin = "plugin_settings@release"
+disabled = true
+
+[rows."skills"]
+plugin = "skills@release"
+disabled = true
+
+[rows."plugin_update"]
+plugin = "plugin_update@release"
+disabled = true
+
+[rows."shell"]
+plugin = "shell@release"
+disabled = true
+
+[rows."files"]
+plugin = "files@release"
 disabled = true
 
 [rows."runtime_inspection"]
@@ -153,10 +189,6 @@ disabled = true
 plugin = "akashic_clients@release"
 disabled = true
 
-[rows."eventmail"]
-plugin = "eventmail@release"
-disabled = true
-
 [rows."delivery"]
 plugin = "delivery@release"
 disabled = true
@@ -193,12 +225,8 @@ disabled = true
 plugin = "akasha@release"
 disabled = true
 
-[rows."drift"]
-plugin = "drift@release"
-disabled = true
-
-[rows."wake"]
-plugin = "wake@release"
+[rows."default_memory"]
+plugin = "default_memory@release"
 disabled = true
 
 [rows."watch"]
@@ -215,4 +243,32 @@ disabled = true
 
 [rows."ledger_invariants"]
 plugin = "ledger_invariants@release"
+disabled = true
+
+[rows."design"]
+plugin = "design@release"
+disabled = true
+
+[rows."terminal"]
+plugin = "terminal@release"
+disabled = true
+
+[rows."visuals"]
+plugin = "visuals@release"
+disabled = true
+
+[rows."web-auth"]
+plugin = "web-auth@release"
+disabled = true
+
+[rows."workspace_changes"]
+plugin = "workspace_changes@release"
+disabled = true
+
+[rows."markdown_reader"]
+plugin = "markdown_reader@release"
+disabled = true
+
+[rows."codemode"]
+plugin = "codemode@release"
 disabled = true

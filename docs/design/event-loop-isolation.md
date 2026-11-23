@@ -145,9 +145,9 @@ EventMail 快照与写入仍是同步 API；Drift 的 Wake 消费路径使用下
 持有未提交写事务时验证已提交快照可读，提交后新快照可见，并检查数据库完整性。
 旧代码在读取时报告 database is locked；无需靠 sleep 调度。
 
-## Drift 的 Wake 存储调用（#879）
+## Drift 的 Wake 存储调用（#879，已随 [0146](../decisions/0146-drift-is-retired.md) 移除）
 
-Wake 使用 `drift.wake.v3` 和 `drift.delivery.v2` 等待快照、领取、状态流转和送达结算。
+Wake 使用 `drift.wake.v2` 和 `drift.delivery.v2` 等待快照、领取、状态流转和送达结算。
 Drift provider 把完整同步操作交给已有四名额 `run_file_io`；连接、事务与关闭在同一
 worker 完成，调用方取消仍等待物理退出。Context、Task、程序执行、Message、通知与
 最终 flow pointer 继续由 Wake 在原 Task 操作。没有新增队列、表、状态副本或 executor。
@@ -212,8 +212,8 @@ before-image、草稿、两份文件及其独立 receipt 的顺序不变；已�
 异常路径两个 unlink 仍是同步小操作，本层不宣称消除了全部系统调用阻塞。
 
 URL/DNS 校验、长度上限、hash、最终路径与成功返回时机不变。只删除本次失败下载
-尚未交付的随机路径，不触碰已有附件。`docker/debug/remote_media_io_isolation.py`
-验证真实字节/hash，并在 fsync 屏障内取消，确认文件只在物理工作结束后清理。
+尚未交付的随机路径，不触碰已有附件。`docker/debug/remote_media_io_isolation.py`（已删除：所依赖的 `infra.channels` 已不存在）
+当时验证真实字节/hash，并在 fsync 屏障内取消，确认文件只在物理工作结束后清理。
 
 ## Scheduler 文件事务（#879）
 
@@ -548,9 +548,9 @@ changed 事件仍在原 loop 发出，已提交后取消不丢通知，同身份
 同步 v1 契约与 provider 已退役。[fleet 当前外置集合](hua-home-plugin-runtime-source-of-truth.md#1-维护范围只认-fleet运行事实只认-hua-home)
 中没有 Drift proposal 消费者；非 fleet 的历史仓库不构成保留兼容接口或新增迁移的理由。
 
-`owner_write_io.py` 的真实 SQLite/本地 socket 场景覆盖摘要 CAS、Computer 回执、
+`owner_write_io.py`（已删除：所依赖的 `MCP_SERVERS` 已不存在）的真实 SQLite/本地 socket 场景当时覆盖摘要 CAS、Computer 回执、
 取消排空和原消息完整性；同一提交屏障下旧基线约 1 秒，改后小于 1 毫秒。
-`drift_proposal_io.py` 验证真实 Root 的提案提交、请求快照、取消、重放与 loop 通知。
+`drift_proposal_io.py`（已随 0146 删除）验证真实 Root 的提案提交、请求快照、取消、重放与 loop 通知。
 这些是隔离组件证据，不是生产 P99。外置 Observe、status_commands、proactive_feedback、
 github-watch 与四个 EventMail 来源的源码修复已经交付；正式安装链、选择新 Root 和
 生产完整进程恢复仍未验，#879 在该层验收前保持开放。Akasha 已在线程中的 Recall/Scope
@@ -610,3 +610,23 @@ MessageLog 的单条查询使用 SQLite 隐式读取快照；查询在归还连�
 绑定模型复用当前深冻结消息和工具 schema 的 JSON 编码来计算请求摘要。
 摘要仍使用原字段、排序、UTF-8 和分隔符；同 key 的内容冲突与恢复判断不变。
 每次只保留当前请求引用的编码，历史缩短、模型 scope 结束后释放旧引用。
+
+## Chat 目录与消息页读取（#1522 同款排水）
+
+Chat HTTP API 的目录页、消息尾页、软删标记与会话水位读取一律经 `run_file_io`
+在 worker 内完成：`MessageCatalog.sessions_async`/`snapshot_heads_async` 与
+`MessageReader.read_tail_async`/`deleted_async`/`head_async` 是同步版的异步孪生，
+读取内容、分页、失效语义和逐字节结果与同步版一致；调用线程持有未提交事务时
+`_check_async_operation` 先行拒绝。取消已开始的读取仍先排空物理工作再归还连接。
+
+`MessageCatalog.follow` 的目录筛选与周期核对分支改用 `snapshot_heads_async` 排水，
+每个 websocket 客户端的目录通知不再把全会话水位查询留在事件循环上；
+无筛选订阅复用已提交水位的快路径保持不动（装载后不再跑 SQL）。
+`NavigationFeed` 的目录遍历与消息页、`session_pin_row` 的四项点读合并进同一
+worker 行程；`_reads` 的线程局部性保证 worker 只按所借用连接自己的
+`data_version` 复用每连接缓存，不跨线程共享事务状态。
+
+`scripts/chat_catalog_io_scenario.py` 用 ReadBarrier 断言真实 HTTP 接口的读取
+不在事件循环线程执行且读取前心跳可落地，`--baseline` 在旧码上抓住循环内读取；
+`tests/test_storage_read_execution.py` 与 `tests/test_session_activity.py`
+覆盖孪生等价、取消排空、事务拒绝与 follow 两条分支的排水行为。

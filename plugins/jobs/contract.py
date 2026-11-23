@@ -3,13 +3,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
-from hashlib import sha256
 from typing import Literal, Protocol
 
 from agent.plugin_composition import ServiceKey
 
-JobStatus = Literal["completed", "failed", "timeout", "killed", "unknown"]
-JobSnapshotStatus = Literal["running", "stopping", "completed", "failed", "timeout", "killed", "unknown"]
+JobStatus = Literal["completed", "failed", "timeout", "killed"]
+JobSnapshotStatus = Literal["running", "stopping", "completed", "failed", "timeout", "killed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,14 +31,8 @@ class JobWatch:
     started_at_ms: int | None = None
     # 生产方提供的停止入口，供用户在界面上终止；返回 False 表示任务已不在运行。缺席时界面不提供停止。
     stop: Callable[[], Awaitable[bool]] | None = None
-    # A process handle can be reused after restart. Producers may supply the stable tool-call key.
-    effect_key: str = ""
-    through_seq: int | None = None
-
-    @property
-    def wake_source(self) -> str:
-        suffix = "@" + sha256(self.effect_key.encode()).hexdigest() if self.effect_key else ""
-        return "job:" + self.job_id + suffix
+    # 父会话持久领取并确认通知后的回调；生产方据此安全清除持久待通知标记，避免交接中断漏发（#2129）。
+    acknowledged: Callable[[], Awaitable[None]] | None = None
 
 
 # 前端只读镜像的一行；时间均为 epoch 毫秒。
@@ -63,10 +56,12 @@ class JobSnapshot:
 
 
 class JobNotices(Protocol):
-    def watch(self, job: JobWatch) -> None: ...
+    def watch(self, job: JobWatch) -> None:
+        """Register completion; jobs assigns its source with origin_source at this boundary."""
+        ...
 
     def origin_source(self, session_id: str, source: str) -> str:
-        """当前唤醒可访问登记任务的原来源；其他会话和来源保持原样。"""
+        """有对话输入的会话统一归 conversation；其余会话保留登记任务的原来源。"""
         ...
 
     async def stop_job(self, session_id: str, job_id: str) -> bool:
@@ -80,4 +75,3 @@ class JobNotices(Protocol):
 
 
 JOB_NOTICES = ServiceKey[JobNotices]("jobs.notices.v1")
-JOB_WAITING = ServiceKey[Callable[[str, str], bool]]("jobs.waiting.v1")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import chain
@@ -13,9 +14,12 @@ from plugins.ledger.contract import MessageSnapshot
 from plugins.models.contract import (
     LLMResponse,
     ModelContinuation,
+    ContextCategory,
     ModelRequest,
+    RequestSource,
 )
-from plugins.models.contract import BoundChatModel
+from plugins.models.contract import BoundChatModel, BoundModelDescriptor
+from plugins.ledger.contract import has_partial_text
 from plugins.ledger.contract import (
     CallRef,
     ContentPart,
@@ -30,12 +34,19 @@ from plugins.ledger.contract import (
 )
 from plugins.models.contract import (
     ContentTransform,
-    PrepareContent,
+    BoundPrepareContent,
     RenderedContent,
     MODEL_CALLS as MODEL_CALLS,
     MODEL_CHECKS as MODEL_MESSAGE_CHECKS,  # noqa: F401 - 显式再导出给本插件消费者。
     MODEL_PROJECTION as MODEL_PROJECTION,
+    REJECTED_CALL_NOTICE,
+    REJECTED_INPUT_NOTICE,
+    REJECTED_KEEP_KINDS,
+    REJECTED_OUTPUT_NOTICE,
+    rejected_result_notice,
+    rejected_segments,
 )
+from plugins.ui.contract import ThinkingDisplay
 
 from .store import ModelCallReader
 
@@ -44,6 +55,51 @@ CallReader = Callable[[str], Mapping[str, Any]]
 ContentCheck = Callable[[ContentPart], ContentReferences]
 DisplayRenderer = Callable[[ContentPart], Mapping[str, object]]
 MODEL_DISPLAY = ServiceKey[DisplayRenderer]("message.display:model.facts")
+
+
+# Limit the model view, keeping the full ToolResult at its existing read_content address.
+def _limit_tool_text(
+    message: Message, parts: tuple[tuple[Mapping[str, Any], ...], ...],
+    budget: int, *, can_read: bool,
+) -> tuple[tuple[Mapping[str, Any], ...], bool]:
+    blocks = tuple(chain.from_iterable(parts))
+    size = sum(len(block["text"].encode("utf-8")) for block in blocks if block.get("type") == "text")
+    if size <= budget:
+        return blocks, False
+    # 1. One notice per result keeps many content parts from multiplying the overhead.
+    if can_read:
+        address = json.dumps({"message_id": message.message_id, "part_index": 0},
+                             ensure_ascii=False, separators=(",", ":"))
+        recovery = f"回读位置 read_content({address})；调用时按需调整 part_index，并指定较小的 start/end 字符区间。"
+    else:
+        recovery = "请缩小查询范围；当前工具目录没有 read_content，需获授该工具后才能按原消息回读。"
+    notice = (f"结果已截断：原结果有 {len(parts)} 个内容块、文本共 {size} UTF-8 字节。"
+              f"全文保留在原消息，part_index 从 0 开始。{recovery}"
+              "不要为找回结果重复执行原操作。\n")
+    text = "\n".join(
+        f"[part_index={index}]\n" + "\n".join(block["text"] for block in group if block.get("type") == "text")
+        for index, group in enumerate(parts) if any(block.get("type") == "text" for block in group)
+    ).encode("utf-8")
+    remaining = max(0, budget - len(notice.encode("utf-8")) - len("\n…\n".encode("utf-8")))
+    head = text[:remaining // 2].decode("utf-8", errors="ignore")
+    tail = text[-(remaining - remaining // 2):].decode("utf-8", errors="ignore") if remaining else ""
+    # 2. Preserve non-text blocks and put the bounded preview at the first text position.
+    preview = {"type": "text", "text": notice + head + "\n…\n" + tail}
+    result: list[Mapping[str, Any]] = []
+    inserted = False
+    for block in blocks:
+        if block.get("type") != "text":
+            result.append(block)
+        elif not inserted:
+            result.append(preview)
+            inserted = True
+    return tuple(result), True
+
+
+_PARTIAL_TEXT_HINT = (
+    "上一条回复达到输出长度限制，在此处被截断。请从断点直接接着写，不要重复已写内容；"
+    "如果这之后有新的用户消息，以新消息为准。"
+)
 
 
 def response_facts(
@@ -55,9 +111,8 @@ def response_facts(
     wire_tool_calls: Mapping[str, Mapping[str, object]] = {},
     content_refs: tuple[tuple[str, int], ...] = (),
     content_transformed: bool = False,
-    binding_id: str | None = None,
 ) -> ContentPart:
-    """保存协议重放所需事实，计费数据仍由 ModelsStore 拥有。"""
+    """只保存调用账指针与协议重放所需事实，计费数据仍由 Model store 拥有。"""
     if response.call_record_id is None:
         raise ValueError("模型响应尚未结算调用记录")
     indices = tuple(call_indices)
@@ -89,12 +144,8 @@ def response_facts(
         facts["content_refs"] = content_refs
     if content_transformed:
         facts["content_transformed"] = True
-    if binding_id is not None:
-        facts["replay"] = {
-            "version": 1,
-            "binding_id": binding_id,
-            "provider_metadata": None if content_transformed else response.provider_metadata,
-        }
+    if response.finish_reason in {"length", "malformed_function_call"}:
+        facts["generation_rejection"] = response.finish_reason
     if reminder_input_id is not None:
         if not reminder_input_id:
             raise ValueError("reminder Input 身份不能为空")
@@ -111,7 +162,7 @@ def check_tool_rejection(part: ContentPart) -> ContentReferences:
         not isinstance(value, Mapping)
         or set(value) != {"name", "arguments", "error"}
         or not isinstance(value["name"], str) or not value["name"]
-        or not isinstance(value["arguments"], Mapping)
+        or not isinstance(value["arguments"], (Mapping, str))
         or not isinstance(value["error"], str) or not value["error"]
     ):
         raise ValueError("模型工具协议拒绝字段无效")
@@ -127,29 +178,16 @@ def check_facts(part: ContentPart) -> ContentReferences:
     old_fields = {"call_record_id", "tool_ids", "thinking", "continuation"}
     new_fields = old_fields | {"wire_tool_calls", "reminder"}
     reminder_identity_fields = {"reminder_input_id", "reminder_sha256"}
-    if set(value) - {"content_refs", "content_transformed", "replay"} not in (
-        old_fields, new_fields, new_fields | reminder_identity_fields,
-    ):
+    if set(value) - {"content_refs", "content_transformed", "generation_rejection"} not in (old_fields, new_fields, new_fields | reminder_identity_fields):
         raise ValueError("model.facts 字段无效")
+    if "generation_rejection" in value and value["generation_rejection"] not in ("length", "malformed_function_call"):
+        raise ValueError("模型生成拒绝类型无效")
     if not isinstance(value["call_record_id"], str) or not value["call_record_id"]:
         raise ValueError("model.facts 缺少调用记录")
     if "content_refs" in value:
         _ = ModelRequest.read_content_refs(value["content_refs"])
     if "content_transformed" in value and type(value["content_transformed"]) is not bool:
         raise ValueError("内容投影标记必须是 bool")
-    replay = None
-    if "replay" in value:
-        replay = value["replay"]
-        if (
-            not isinstance(replay, Mapping)
-            or set(replay) != {"version", "binding_id", "provider_metadata"}
-            or type(replay["version"]) is not int
-            or replay["version"] != 1
-            or not isinstance(replay["binding_id"], str)
-            or not replay["binding_id"]
-            or (replay["provider_metadata"] is not None and not isinstance(replay["provider_metadata"], Mapping))
-        ):
-            raise ValueError("模型历史重放数据无效")
     ids = value["tool_ids"]
     if not isinstance(ids, Mapping):
         raise ValueError("模型工具 ID 必须按 Output 位置记录")
@@ -208,16 +246,16 @@ def check_facts(part: ContentPart) -> ContentReferences:
             or not isinstance(continuation["payload"], Mapping)
         ):
             raise ValueError("模型 continuation 无效")
-        if replay is not None and continuation["binding_id"] != replay["binding_id"]:
-            raise ValueError("continuation 不属于记录中的模型")
     return ContentReferences()
 
 
-def display_facts(part: ContentPart) -> dict[str, object]:
-    """页面只取得调用记录与思考文本，不能取得 provider continuation。"""
+def display_facts(part: ContentPart) -> ThinkingDisplay:
+    """页面只取得调用记录与思考文本，不能取得 provider continuation；思考文本按宿主通用的思考行展示。"""
     _ = check_facts(part)
     value = cast(Mapping[str, object], part.value)
-    return {"call_record_id": value["call_record_id"], "thinking": value["thinking"]}
+    thinking = value["thinking"]
+    return ThinkingDisplay(thinking if isinstance(thinking, str) else None,
+                           {"call_record_id": value["call_record_id"], "thinking": thinking})
 
 
 class MessageProjection:
@@ -233,7 +271,7 @@ class MessageProjection:
         read_call: CallReader,
         check_summary: ContentCheck,
         keep_input_ids: tuple[str, ...] = (),
-        prepare_content: PrepareContent | None = None,
+        prepare_content: BoundPrepareContent | None = None,
         tool_names: frozenset[str] = frozenset(),
         dynamic_content_kinds: frozenset[str] | None = frozenset(),
     ):
@@ -247,7 +285,7 @@ class MessageProjection:
         self._prepare_content = prepare_content
         self._tool_names = tool_names
         self._dynamic_content_kinds = dynamic_content_kinds
-        self._last_estimate: tuple[ModelRequest, int] | None = None
+        self._last_estimate: tuple[ModelRequest, int, tuple[int, int] | None] | None = None
         self._facts: dict[str, tuple[Message, Mapping[str, Any] | None]] = {}
         self._view: _RenderView | None = None
         self._fold: _Fold | None = None
@@ -261,12 +299,20 @@ class MessageProjection:
         return self._model.max_tool_schemas
 
     def estimate(self, request: ModelRequest) -> int:
-        # 估算是不可变请求的纯函数；构建链会对同一请求对象重复估算。
+        # 最近同来源、同 binding 的成功调用校准字符估算；换模型不沿用比例。
+        calibration = None if self._fold is None else self._fold.token_calibration
         saved = self._last_estimate
-        if saved is not None and saved[0] is request:
+        if saved is not None and saved[0] is request and saved[2] == calibration:
             return saved[1]
         value = self._model.estimate_context_tokens(request.messages, request.tools)
-        self._last_estimate = (request, value)
+        if calibration is not None:
+            estimated, actual = calibration
+            calibrated = (value * actual + estimated - 1) // estimated
+            # usage 可能异常：校准只负责提前触发压缩，不单独造成本地拒发；窗口的 3/4 高于软水位、
+            # 加输出预留（至多 1/4）也不越窗。provider 是最终裁判，下一次成功会刷新校准。
+            window = self.context_window
+            value = max(value, calibrated if window is None else min(calibrated, window - window // 4))
+        self._last_estimate = (request, value, calibration)
         return value
 
     def facts(
@@ -301,13 +347,7 @@ class MessageProjection:
                     "name": original.name,
                     "arguments": original.arguments,
                 }
-        if response.call_record_id is None:
-            raise ValueError("模型响应尚未结算调用记录")
-        binding_id = self._model.descriptor.binding_id
-        receipt = self._read_call(response.call_record_id)
-        if receipt["state"] != "success" or receipt["binding"]["binding_id"] != binding_id:
-            raise ValueError("模型响应不属于当前已结算调用")
-        return response_facts(
+        facts = response_facts(
             response,
             call_indices,
             reminder=reminder,
@@ -315,14 +355,21 @@ class MessageProjection:
             wire_tool_calls=wire,
             content_refs=content_refs,
             content_transformed=content_transformed,
-            binding_id=binding_id,
         )
+        assert response.call_record_id is not None
+        receipt = self._read_call(response.call_record_id)
+        if receipt["state"] != "success" or (
+            receipt["binding"]["binding_id"] != self._model.descriptor.binding_id
+        ):
+            raise ValueError("模型响应不属于当前已结算调用")
+        return facts
 
     def render(
         self,
         messages: Sequence[Message],
         *,
         after_seq: int,
+        covered_message_ids: frozenset[str] = frozenset(),
         summary_reference: str | None = None,
         fresh: bool = False,
         current_reminder: str | None = None,
@@ -358,7 +405,6 @@ class MessageProjection:
         if len(keep) != len(self._keep_input_ids) or not keep <= fold.inputs:
             raise ValueError("保留输入必须是当前来源的真实 Input，且不能重复")
         latest_input = fold.latest_input
-        history_recovery = any(seq > after_seq or identity in keep for identity, seq in fold.recovery.items())
         current_reminder_identity: tuple[str, str] | None = None
         if current_reminder_input_id is not None:
             if current_reminder_input_id != latest_input:
@@ -375,7 +421,7 @@ class MessageProjection:
         # 摘要明确开启新请求；原 opaque 保存在日志，只续接同一摘要后的响应。
         # 换模型、思考强度或注册表版本后 binding 不同：opaque 只属于原 binding，
         # 按当前完整消息投影开始请求，不把用户的切换变成会话故障。
-        if fresh or history_recovery or continuation_transformed or summary_reference is not None and (
+        if fresh or continuation_transformed or summary_reference is not None and (
             continuation_summary != summary_reference or continuation_seq <= after_seq
         ) or continuation is not None and continuation.binding_id != self._model.descriptor.binding_id:
             continuation = None
@@ -387,16 +433,15 @@ class MessageProjection:
 
         # 2. 渲染读面只重编译变化；失败后丢弃未完成的派生状态，下次仍如实校验。
         try:
-            rows, content_refs, changed_content = self._render_rows(
-                messages, fold, after_seq=after_seq,
+            rows, content_refs, changed_content, sources = self._render_rows(
+                messages, fold, after_seq=after_seq, covered_message_ids=covered_message_ids,
                 current_reminder=current_reminder,
                 current_reminder_identity=current_reminder_identity,
                 current_context=current_context,
             )
             request = ModelRequest(
                 messages=rows, continuation=None if changed_content else continuation,
-                content_refs=content_refs, content_transformed=changed_content,
-                history_recovery=history_recovery,
+                content_refs=content_refs, content_transformed=changed_content, sources=sources,
             )
         except BaseException:
             self._view = None
@@ -406,15 +451,17 @@ class MessageProjection:
 
     def _render_rows(
         self, messages: Sequence[Message], fold: _Fold, *, after_seq: int,
+        covered_message_ids: frozenset[str],
         current_reminder: str | None,
         current_reminder_identity: tuple[str, str] | None,
         current_context: str | None,
-    ) -> tuple[list[Mapping[str, Any]], tuple[tuple[str, int], ...], bool]:
+    ) -> tuple[list[Mapping[str, Any]], tuple[tuple[str, int], ...], bool, tuple[RequestSource, ...]]:
         """维护当前窗口的有序分段；日志变化编译正文，实时材料只在装配时插入。"""
         # 1. 窗口或日志前缀改变时重建同一读面，旧工具结果也重新检查可见调用。
         view = self._view
-        if view is None or view.fold is not fold or view.after_seq != after_seq:
-            view = _RenderView(fold, after_seq)
+        if (view is None or view.fold is not fold or view.after_seq != after_seq
+                or view.covered_message_ids != covered_message_ids):
+            view = _RenderView(fold, after_seq, covered_message_ids)
             self._view = view
         tail = messages[view.count:]
         transform = (None if self._prepare_content is None else self._prepare_content(
@@ -432,7 +479,8 @@ class MessageProjection:
                    for key in sorted(dirty, key=lambda key: view.units[key].index)]
         changed.extend(message for message in tail
                        if isinstance(message.body, (Input, Output))
-                       and (message.seq > after_seq or message.message_id in self._keep_input_ids))
+                       and (message.seq > after_seq and message.message_id not in covered_message_ids
+                            or message.message_id in self._keep_input_ids))
 
         # 2. 冷构建和追加共用编译操作；一份有序单元表拥有冻结行与首个提醒载体。
         for message in changed:
@@ -459,7 +507,8 @@ class MessageProjection:
 
         # 3. 不变窗口中只检查新结果；窗口变化从 count=0 重建，不能漏掉旧结果变孤儿。
         for message in tail:
-            if not isinstance(message.body, ToolResult) or message.seq <= after_seq:
+            if (not isinstance(message.body, ToolResult) or message.seq <= after_seq
+                    or message.message_id in covered_message_ids):
                 continue
             ref = message.body.call_ref
             caller = view.units.get(ref.message_id)
@@ -482,18 +531,28 @@ class MessageProjection:
         carrier = (view.reminders.get(current_reminder_identity)
                    if current_reminder_identity is not None else fold.latest_input)
         context_unit = None if carrier is None else view.units.get(carrier)
+        live: list[Mapping[str, Any]] = []
+        # 本轮提醒已随 Input 存过时在历史单元首行；它仍是本轮材料，由装配方按材料拆分。
+        current = view.reminders.get(current_reminder_identity) if current_reminder_identity is not None else None
+        if current is not None and current in view.units and view.units[current].rows:
+            live.append(view.units[current].rows[0])
         if current_context is not None and context_unit is not None:
             position = 1 if current_reminder_identity is not None else len(context_unit.rows)
             unit_rows = context_unit.rows
-            groups[context_unit.index] = (*unit_rows[:position],
-                {"role": "user", "content": current_context}, *unit_rows[position:])
+            live.append({"role": "user", "content": current_context})
+            groups[context_unit.index] = (*unit_rows[:position], live[-1], *unit_rows[position:])
         rows = list(chain.from_iterable(groups))
         if current_reminder is not None and current_reminder_identity not in view.reminders:
-            rows.append({"role": "user", "content": current_reminder})
+            live.append({"role": "user", "content": current_reminder})
+            rows.append(live[-1])
         if current_context is not None and context_unit is None:
-            rows.append({"role": "user", "content": current_context})
+            live.append({"role": "user", "content": current_context})
+            rows.append(live[-1])
         view.count = len(messages)
-        return rows, tuple(refs), changed_content
+        injected = tuple(index for index, row in enumerate(rows) if any(row is item for item in live))
+        carriers = set(view.reminders.values()) - {current}
+        replayed = [unit.rows[0] for key, unit in view.units.items() if key in carriers and unit.rows]
+        return rows, tuple(refs), changed_content, _history_sources(rows, set(injected), replayed)
 
     def _compile_unit(
         self, message: Message, fold: _Fold, transform: ContentTransform | None, *,
@@ -502,6 +561,11 @@ class MessageProjection:
         """把一条可见消息及其工具观察编译成冻结行；不保存实时上下文。"""
         # 1. 转换器每轮由完整历史准备；首显候选在装配时与持久 seen 求差。
         changed_content = False
+        limited_content = False
+        # A whole batch shares one text budget, including parallel and multi-part results.
+        batch_limit = min(50_000, self.context_window // 4) if self.context_window is not None else 50_000
+        call_count = sum(isinstance(part, ToolCall) for part in message.body.parts) if isinstance(message.body, Output) else 0
+        result_limit = batch_limit // max(1, call_count)
 
         def render(message: Message, index: int,
                    out_refs: list[tuple[str, int]]) -> tuple[Mapping[str, Any], ...]:
@@ -525,6 +589,20 @@ class MessageProjection:
                 out_refs.append((message.message_id, index))
             return rendered.blocks
 
+        def render_result(observation: Message) -> tuple[Mapping[str, Any], ...]:
+            nonlocal limited_content
+            result = cast(ToolResult, observation.body)
+            refs: list[tuple[str, int]] = []
+            parts = tuple(render(observation, index, refs) for index in range(len(result.parts)))
+            blocks, limited = _limit_tool_text(
+                observation, parts, result_limit, can_read="read_content" in self._tool_names,
+            )
+            limited_content |= limited
+            # A preview is not evidence that the model has seen the full content.
+            if not limited:
+                msg_refs.extend(refs)
+            return blocks
+
         def encode_arguments(arguments: Mapping[str, Any]) -> str:
             return json.dumps(json_value(arguments), ensure_ascii=False, separators=(",", ":"))
 
@@ -540,16 +618,36 @@ class MessageProjection:
         blocks: list[Mapping[str, Any]] = []
         calls: list[dict[str, Any]] = []
         observations: list[Mapping[str, Any]] = []
+        attached: list[Mapping[str, Any]] = []
+        unsent: list[Mapping[str, Any]] = []
         if reminder is not None:
             msg_rows.append({"role": "user", "content": reminder})
-        for index, part in enumerate(body.parts):
+        # An abandon after a confirmed rejection hides this content; the ledger keeps it.
+        hidden = message.message_id in fold.rejected
+        hidden_input = hidden and isinstance(body, Input)
+        if hidden_input:
+            blocks.append({"type": "text", "text": REJECTED_INPUT_NOTICE})
+        for index, part in enumerate(() if hidden_input else body.parts):
             if isinstance(part, ContentPart):
                 if part.kind == "model.tool_rejection":
                     _ = check_tool_rejection(part)
                     if model_facts is None:
                         raise ValueError("模型协议拒绝缺少 model.facts")
+                    if hidden:
+                        blocks.append({"type": "text", "text": REJECTED_CALL_NOTICE})
+                        continue
                     identity = model_facts["tool_ids"][str(index)]
                     rejected = cast(Mapping[str, Any], part.value)
+                    arguments = rejected["arguments"]
+                    # 非法参数或工具名进 tool_calls 会让这条历史之后每次请求都被 provider 拒绝。
+                    # 说明放在随后的 user 行：写进 assistant 正文会让重试请求以 assistant 结尾，严格 provider 同样拒绝。
+                    if isinstance(arguments, str) or _WIRE_TOOL_NAME.fullmatch(rejected["name"]) is None:
+                        shown = arguments if isinstance(arguments, str) else encode_arguments(arguments)
+                        unsent.append({"type": "text", "text": (
+                            f"调用未执行：{rejected['name']}；{rejected['error']}\n"
+                            f"原始参数：{shown}"
+                        )})
+                        continue
                     calls.append({
                         "id": identity, "type": "function",
                         "function": {"name": rejected["name"], "arguments": encode_arguments(rejected["arguments"])},
@@ -557,6 +655,13 @@ class MessageProjection:
                     observations.append({"role": "tool", "tool_call_id": identity, "content": [
                         {"type": "text", "text": "调用未执行：" + rejected["error"]},
                     ]})
+                elif hidden and part.kind not in REJECTED_KEEP_KINDS:
+                    if not any(block.get("text") == REJECTED_OUTPUT_NOTICE for block in blocks):
+                        blocks.append({"type": "text", "text": REJECTED_OUTPUT_NOTICE})
+                elif part.kind == "artifact_ref" and isinstance(body, Output):
+                    # 回复里的附件由内容协议解出，不是模型写的字；标签留在 assistant 正文里，
+                    # 模型下一轮会照抄成一段假附件 JSON，所以移到随后的 user 行。
+                    attached.extend(render(message, index, msg_refs))
                 elif part.kind != "model.facts":
                     blocks.extend(render(message, index, msg_refs))
                 continue
@@ -564,6 +669,7 @@ class MessageProjection:
             if ref in abandoned_calls:
                 # 放弃前缀的调用不进入 wire 协议；已有耐久回执时如实保留
                 # 真实状态与内容，只有无回执时才说明效果未知。
+                # 确定性拒绝后的放弃只隐藏内容，状态与效果说明照旧保留。
                 observation = results.get(ref)
                 if observation is not None:
                     msg_used.append(observation.message_id)
@@ -573,20 +679,20 @@ class MessageProjection:
                             "一次工具调用随来源前缀放弃，结算为 denied："
                             "工具未启动，未产生外部效果。"
                         )})
+                    elif hidden:
+                        blocks.append({"type": "text", "text": rejected_result_notice(settled.outcome)})
                     elif settled.outcome == "success":
                         blocks.append({"type": "text", "text": (
                             "一次工具调用在放弃前已完成，真实结果如下；"
                             "外部效果已经发生。"
                         )})
-                        for item_index, _item in enumerate(settled.parts):
-                            blocks.extend(render(observation, item_index, msg_refs))
+                        blocks.extend(render_result(observation))
                     else:
                         blocks.append({"type": "text", "text": (
                             f"一次工具调用随来源前缀放弃，结算为 {settled.outcome}："
                             "外部效果可能已经发生，不能据此重跑。"
                         )})
-                        for item_index, _item in enumerate(settled.parts):
-                            blocks.extend(render(observation, item_index, msg_refs))
+                        blocks.extend(render_result(observation))
                 else:
                     blocks.append({"type": "text", "text": (
                         "一次工具调用随来源前缀放弃而中断；外部效果未结算，状态未知，"
@@ -619,7 +725,8 @@ class MessageProjection:
             })
             observation = results.get(ref)
             if observation is None:
-                raise ValueError("模型请求包含未结算的工具调用")
+                raise ValueError("模型请求包含未结算的工具调用。外部效果可能已经发生，请先检查状态。"
+                                 "确认放弃本轮后再继续；对话可用 /abandon，程序可用 programmatic/message/abandon")
             if observation.seq <= message.seq:
                 raise ValueError("工具结果不能早于调用")
             result = cast(ToolResult, observation.body)
@@ -629,21 +736,11 @@ class MessageProjection:
                 if result.outcome in {"error", "interrupted"}:
                     status += "。原调用可能已经产生效果；先检查当前状态，再决定下一步，不要直接重复执行原操作。"
                 result_blocks.append({"type": "text", "text": status})
-            for item_index, _item in enumerate(result.parts):
-                result_blocks.extend(render(observation, item_index, msg_refs))
+            result_blocks.extend(render_result(observation))
             observations.append(
                 {"role": "tool", "tool_call_id": identity, "content": result_blocks}
             )
             msg_used.append(observation.message_id)
-        if message.message_id in fold.recovery:
-            blocks.append({"type": "text", "text": "历史模型调用回执不可用。以下是已保存的工具调用和结果，仅作为历史记录。"})
-            for call, observation_row in zip(calls, observations, strict=True):
-                blocks.append({"type": "text", "text": "历史工具调用 " + json.dumps(
-                    call["function"], ensure_ascii=False, separators=(",", ":"),
-                )})
-                blocks.extend(observation_row["content"])
-            calls.clear()
-            observations.clear()
         if blocks or calls:
             row: dict[str, Any] = {
                 "role": "user" if isinstance(body, Input) else "assistant",
@@ -651,13 +748,29 @@ class MessageProjection:
             }
             if calls:
                 row["tool_calls"] = calls
-            if (message.message_id in response_metadata and model_facts is not None
+            if (message.message_id in response_metadata and model_facts is not None and not hidden
                     and len(calls) == len(model_facts["tool_ids"])):
                 row["provider_metadata"] = response_metadata[message.message_id]
-            if model_facts is not None and model_facts["thinking"] is not None:
+            # 思考内容属于产出它的模型：换模型后严格 provider 会拒收未知字段；需要该字段的 driver 自己回填空值。
+            if (model_facts is not None and model_facts["thinking"] is not None and not hidden
+                    and _same_model(self._fold_receipt(fold, model_facts["call_record_id"])["binding"],
+                                    self._model.descriptor)):
                 row["reasoning_content"] = model_facts["thinking"]
             msg_rows.append(row)
             msg_rows.extend(observations)
+        if unsent:
+            msg_rows.append({"role": "user", "content": [
+                {"type": "text", "text": "宿主说明：你上一步的工具调用没有执行，原因如下；请修正后继续。"},
+                *unsent,
+            ]})
+        if attached:
+            msg_rows.append({"role": "user", "content": [
+                {"type": "text", "text": "宿主随上面这条 Agent 回复发出的附件（由回复里的内容标记生成，不是回复文字，不要在回复里写出）："},
+                *attached,
+            ]})
+        # 提示只从本行派生，不进账本；历史重放逐字相同，所以缓存前缀稳定。放弃之后不再有断点可接。
+        if has_partial_text(body) and not hidden and message.message_id not in fold.abandoned:
+            msg_rows.append({"role": "user", "content": [{"type": "text", "text": _PARTIAL_TEXT_HINT}]})
 
         # 3. 行在此冻结；动态 kind、外部引用与实际转换命中均保留逐轮重算。
         dynamic_kinds = self._dynamic_content_kinds
@@ -674,7 +787,8 @@ class MessageProjection:
         return _RenderedMessage(
             message, position, reminder,
             cast(tuple[Mapping[str, Any], ...], freeze_json(msg_rows)),
-            tuple(msg_refs), tuple(msg_used), changed_content, dynamic,
+            # The fixed model and immutable batch keep a limited plain-text view cacheable.
+            tuple(msg_refs), tuple(msg_used), changed_content or limited_content, dynamic,
         )
 
     def _fold_rebuild(
@@ -685,6 +799,7 @@ class MessageProjection:
     ) -> None:
         """预扫描的全量形式；与原逐轮三趟扫描逐行等价。"""
         # 放弃结算与 meta/facts 互不依赖，同一趟完成；调用账仍需在 main 之前取齐。
+        fold.rejected = rejected_segments(messages)
         pending: dict[str, list[Message]] = {}
         for message in messages:
             body = message.body
@@ -710,11 +825,9 @@ class MessageProjection:
         # 调用账 owner 批量读取窄字段；插件自带 reader 保持原调用合同。
         read_call = self._read_call
         if isinstance(read_call, ModelCallReader):
-            ids = tuple(dict.fromkeys(value["call_record_id"] for value in fold.recorded.values()
-                                      if "replay" not in value))
-            if ids:
-                receipts = read_call.replay(ids)
-                fold.receipts.update((call_id, receipts.get(call_id)) for call_id in ids)
+            fold.receipts.update(read_call.replay(
+                tuple(value["call_record_id"] for value in fold.recorded.values())
+            ))
         for message in messages:
             self._fold_main(fold, message, inherited)
         fold.count = len(messages)
@@ -767,21 +880,17 @@ class MessageProjection:
                 for ref in value.get("content_refs", ()):
                     fold.content_refs.add(tuple(ref))
 
-    def _fold_receipt(self, fold: _Fold, call_id: str) -> Mapping[str, Any] | None:
-        """查询已提交历史的回执；缺行由投影恢复，SQL 和编码错误照常报告。"""
-        if call_id not in fold.receipts:
+    def _fold_receipt(self, fold: _Fold, call_id: str) -> Mapping[str, Any]:
+        """成功结算的回执不可变，每条记录在折叠生命周期内只读一次。"""
+        receipt = fold.receipts.get(call_id)
+        if receipt is None:
             read_call = self._read_call
             if isinstance(read_call, ModelCallReader):
-                receipt = read_call.replay((call_id,)).get(call_id)
+                receipt = read_call.replay((call_id,))[call_id]
             else:
-                try:
-                    receipt = read_call(call_id)
-                except KeyError as error:
-                    if error.args != (call_id,):
-                        raise
-                    receipt = None
+                receipt = read_call(call_id)
             fold.receipts[call_id] = receipt
-        return fold.receipts[call_id]
+        return receipt
 
     def _fold_main(
         self,
@@ -802,21 +911,23 @@ class MessageProjection:
         value = fold.recorded.get(message.message_id)
         if value is None:
             return
-        replay = value.get("replay")
-        binding_id, metadata = None, None
-        if replay is not None:
-            binding_id, metadata = replay["binding_id"], replay["provider_metadata"]
-        else:
-            receipt = self._fold_receipt(fold, value["call_record_id"])
-            if receipt is None or receipt["state"] == "started":
-                fold.recovery[message.message_id] = message.seq
-            else:
-                if receipt["state"] != "success":
-                    raise ValueError("已提交模型事实必须引用成功结算的真实调用")
-                binding_id = receipt["binding"]["binding_id"]
-                metadata = receipt.get("provider_metadata")
-        if (metadata is not None and binding_id == self._model.descriptor.binding_id
-                and not value.get("content_transformed", False)):
+        receipt = self._fold_receipt(fold, value["call_record_id"])
+        if receipt["state"] != "success":
+            raise ValueError("已提交模型事实必须引用成功结算的真实调用")
+        if receipt["binding"]["binding_id"] == self._model.descriptor.binding_id:
+            estimated = receipt.get("estimated_input_tokens")
+            usage = receipt.get("usage")
+            actual = None if usage is None else usage["input_tokens"]
+            if message.source == self._source and estimated is not None and actual is not None:
+                if type(estimated) is not int or estimated <= 0 or type(actual) is not int or actual < 0:
+                    raise ValueError("模型 token 校准记录损坏")
+                # 字符估算最多差约 3 倍（1 字符 1 token）。远超它的 usage 与请求大小无关：压缩后比例只会更离谱，
+                # 用它校准会让每条输入都付一次摘要费。这里不看窗口，静默超窗（200 + 超窗 usage）仍能触发压缩。
+                fold.token_calibration = None if actual > estimated * _MAX_USAGE_RATIO else (estimated, actual)
+        # 原生部件（Gemini thoughtSignature）属于产出它的模型，不随重启或保存设置失效；校准仍跟实例走。
+        metadata = receipt.get("provider_metadata")
+        # Input transforms clear opaque continuation, not this new response's native parts.
+        if metadata is not None and _same_model(receipt["binding"], self._model.descriptor):
             fold.response_metadata[message.message_id] = metadata
         previous = inherited.get(message.message_id)
         if previous is None or previous[0] is not message:
@@ -830,12 +941,12 @@ class MessageProjection:
         state = value["continuation"]
         message_continuation = (
             None
-            if state is None or message.message_id in fold.recovery
+            if state is None
             else ModelContinuation(state["binding_id"], state["payload"])
         )
         if (
             message_continuation is not None
-            and message_continuation.binding_id != binding_id
+            and message_continuation.binding_id != receipt["binding"]["binding_id"]
         ):
             raise ValueError("continuation 不属于记录中的模型")
         if message.source == self._source and message.message_id not in fold.abandoned:
@@ -854,10 +965,22 @@ class MessageProjection:
 
 
 _EXTERNAL_PART_KINDS = frozenset({"artifact_ref", "reply_ref"})
+# OpenAI 公开的工具名规则；不符合的名字进 tool_calls 时严格 provider 会拒绝整个请求。
+_WIRE_TOOL_NAME = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+
+
+# binding_id 含进程实例和注册表版本，重启或保存任一设置都会变；这里只看调用落到哪个模型。
+def _same_model(binding: Mapping[str, Any], descriptor: BoundModelDescriptor) -> bool:
+    return (binding.get("driver_id"), binding.get("connection_id"), binding.get("model")) == (
+        descriptor.driver_id, descriptor.connection_id, descriptor.model,
+    )
 
 
 class _FoldStale(Exception):
     """追加尾部出现 abandon：编排折叠失效，回退全量重建。"""
+
+
+_MAX_USAGE_RATIO = 8
 
 
 class _Fold:
@@ -865,8 +988,8 @@ class _Fold:
 
     __slots__ = (
         "count", "prefix", "inputs", "latest_input",
-        "abandoned", "abandoned_calls", "facts", "recorded", "results",
-        "receipts", "recovery", "response_metadata", "content_refs",
+        "abandoned", "abandoned_calls", "rejected", "facts", "recorded", "results",
+        "receipts", "response_metadata", "content_refs", "token_calibration",
         "continuation", "cont_summary", "cont_seq", "cont_transformed",
     )
 
@@ -877,13 +1000,14 @@ class _Fold:
         self.latest_input: str | None = None
         self.abandoned: set[str] = set()
         self.abandoned_calls: set[CallRef] = set()
+        self.rejected: frozenset[str] = frozenset()
         self.facts: dict[str, tuple[Message, Mapping[str, Any] | None]] = {}
         self.recorded: dict[str, Mapping[str, Any]] = {}
         self.results: dict[CallRef, Message] = {}
-        self.receipts: dict[str, Mapping[str, Any] | None] = {}
-        self.recovery: dict[str, int] = {}
+        self.receipts: dict[str, Mapping[str, Any]] = {}
         self.response_metadata: dict[str, Mapping[str, Any]] = {}
         self.content_refs: set[tuple[str, int]] = set()
+        self.token_calibration: tuple[int, int] | None = None
         self.continuation: ModelContinuation | None = None
         self.cont_summary: str | None = None
         self.cont_seq = -1
@@ -917,12 +1041,35 @@ class _RenderedMessage:
     dynamic: bool
 
 
+# 历史行按出处归类：回放的旧提醒单列，工具结果按工具名分；本轮实时材料由装配方按材料拆分，这里跳过。
+def _history_sources(rows: Sequence[Mapping[str, Any]], live: set[int],
+                     replayed: Sequence[Mapping[str, Any]]) -> tuple[RequestSource, ...]:
+    names: dict[str, str] = {}
+    for row in rows:
+        for call in row.get("tool_calls") or ():
+            names[str(call.get("id"))] = str(call.get("function", {}).get("name") or "")
+    groups: dict[tuple[ContextCategory, str], list[Mapping[str, Any]]] = {}
+    # 按身份判断历史提醒；逐行线性比对会让长会话每次请求做行数×提醒数次比较。
+    replayed_ids = {id(item) for item in replayed}
+    for index, row in enumerate(rows):
+        if index in live:
+            continue
+        role = row.get("role")
+        key: tuple[ContextCategory, str] = (
+            ("injected", "历史提醒") if id(row) in replayed_ids
+            else ("tool_results", names.get(str(row.get("tool_call_id")), "")) if role == "tool"
+            else ("assistant", "") if role == "assistant" else ("user", ""))
+        groups.setdefault(key, []).append(row)
+    return tuple(RequestSource(category, label, tuple(items)) for (category, label), items in groups.items())
+
+
 class _RenderView:
     """当前窗口的有序编译结果；只随追加推进，日志或窗口变化时重建。"""
 
-    def __init__(self, fold: _Fold, after_seq: int):
+    def __init__(self, fold: _Fold, after_seq: int, covered_message_ids: frozenset[str]):
         self.fold = fold
         self.after_seq = after_seq
+        self.covered_message_ids = covered_message_ids
         self.count = 0
         self.units: dict[str, _RenderedMessage] = {}
         self.reminders: dict[tuple[str, str], str] = {}

@@ -10,7 +10,7 @@ from typing import cast
 from .contract import Reference, TextSource
 from plugins.turn_projection.contract import PostCommitEffect, post_commit_effect
 from plugins.ledger.contract import check_artifact_id
-from plugins.ledger.contract import ContentPart, ContentReferences, Control, Input, Message
+from plugins.ledger.contract import ContentPart, ContentReferences, Control, Message
 
 
 def _history_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -86,22 +86,6 @@ def legacy_post_commit_effect(message: Message) -> PostCommitEffect | None:
     return post_commit_effect(extra)
 
 
-def is_user_input(message: Message) -> bool:
-    """从当前作者或已校验的迁移出处确认用户 Input，不改写历史身份。"""
-    if not isinstance(message.body, Input):
-        return False
-    if message.author == "user":
-        return True
-    if message.source != "legacy-unattributed":
-        return False
-    _ = legacy_post_commit_effect(message)
-    return any(
-        isinstance(part, ContentPart) and part.kind == "history.provenance"
-        and cast(Mapping[str, object], part.value)["role"] == "user"
-        for part in message.body.parts
-    )
-
-
 ReferenceData = Mapping[str, object]
 
 
@@ -125,17 +109,6 @@ def decode_reference(value: object) -> Reference:
     resolved = cast(str | None, resolved_value)
     retrieval = cast(str | None, retrieval_value)
     return Reference(ref, resolved_ref=resolved, retrieval_ref=retrieval)
-
-
-def reference_data(reference: Reference) -> Mapping[str, object]:
-    """把已校验的 Reference 投影为 provider 可交换的普通映射。"""
-    if not isinstance(reference, Reference):
-        raise TypeError("reference 必须是已校验的 Reference")
-    return {
-        "ref": reference.ref,
-        "resolved_ref": reference.resolved_ref,
-        "retrieval_ref": reference.retrieval_ref,
-    }
 
 
 @dataclass(frozen=True, slots=True)

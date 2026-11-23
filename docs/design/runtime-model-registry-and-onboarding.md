@@ -103,21 +103,19 @@ Supervisor 在启动任何 Gateway 之前先取得 `2236`，并在整个进程�
 
 ## 5. 模型能力注册表
 
-固定 `litellm==1.95.0` 不接管请求 transport、重试、fallback 或错误类型。Provider 目录决定账号有哪些模型；用户创建连接或再次同步时，`models` 插件从 LiteLLM 官方公开 JSON 目录精确补全 Provider 未声明的图片输入能力。启动、目录读取和 Turn 执行均不联网。远端刷新经过固定 HTTPS 地址、短超时、禁止跳转、响应大小、条目数、JSON 与摘要校验，成功后在插件 data root 原子保存完整快照。
+能力目录是 [models.dev](https://models.dev) 的公开 `api.json`（ADR 0054），不引入任何 Python 依赖，也不接管请求 transport、重试、fallback 或错误类型。Provider 目录决定账号有哪些模型；用户创建连接或再次同步时，`models` 插件从 models.dev 补全 Provider 未声明的图片输入、上下文、输出上限与推理档位。启动、目录读取和 Turn 执行均不联网。远端刷新经过固定 HTTPS 地址、短超时、禁止跳转、响应大小、服务商数、JSON 与摘要校验，裁剪成只含所需字段的子集后在插件 data root 原子保存。
 
-远端不可用时依次使用最近一次通过校验的远端快照、固定 wheel 随包目录和 unknown。一次失败不阻止 Provider 模型提交，也不把已知能力降回 unknown。重复同步会再次刷新，使已有连接可以吸收 LiteLLM 后来新增或修正的能力。依赖版本仍精确固定并走供应链评审；远端目录是经过边界校验的非执行数据，不能增加 Provider 未返回的模型或改变 wire transport。
-
-LiteLLM 曾发生 `1.82.7`、`1.82.8` PyPI 供应链事故，因此这两个版本明确禁止。当前依赖精确固定到带 GitHub tag 的 `1.95.0`；升级 Gate 必须同时核对 release tag、wheel 版本、registry contract tests 和依赖安全报告，不能改成范围版本。
+远端不可用时依次使用最近一次通过校验的远端快照、随包 gzip 快照（`plugins/models/modelsdev_snapshot.json.gz`）和 unknown。一次失败不阻止 Provider 模型提交，也不把已知能力降回 unknown。远端目录是经过边界校验的非执行数据，不能增加 Provider 未返回的模型或改变 wire transport。
 
 字段级来源优先级：
 
 1. 手工创建的模型整行由用户拥有；
 2. Codex/OpenCode 或目标 provider 的权威字段；
-3. 当前或最近可信的 LiteLLM 公开能力快照；
-4. 固定版本 LiteLLM 随包目录；
+3. 当前或最近可信的 models.dev 公开能力快照；
+4. 随包 models.dev 快照；
 5. unknown。
 
-Usage 归一化可以按 Base URL 使用 `genai-prices` 的 provider API 规则；模型能力不从 URL 猜测，只使用连接模板或用户显式填写的 `catalog_provider_id` 加精确 model key。无法确定 provider/model 时保持 unknown。Unknown runtime 的 `context_window=0`、`max_output_tokens=0`、文本输入基线只代表当前请求形状，不声明模型没有其他能力；UI 显示“能力未知”，Core 关闭主动压缩和硬预算，让 provider 错误保持原义。任意自建网关可隐藏或改名上游模型，不能仅凭 Base URL 保证识别；这种情况不得猜测。
+目录条目按“连接 Base URL 落在 models.dev 某服务商 `api` 之下（取最长）→ 连接模板或用户填写的 `catalog_provider_id` → 裸模型 ID 在所有服务商里逐字段取多数”匹配；都没有命中时保持 unknown。Unknown runtime 的 `context_window=0`、`max_output_tokens=0`、文本输入基线只代表当前请求形状，不声明模型没有其他能力；UI 显示“能力未知”，Core 关闭主动压缩和硬预算，让 provider 错误保持原义。任意自建网关可隐藏或改名上游模型，不能仅凭 Base URL 保证识别；这种情况不得猜测。
 
 模型注册表中的 `context_window`、`max_output_tokens` 和各自字段级 source 是运行时预算
 owner 的 capability snapshot。`model_definitions` 遗留的
@@ -206,7 +204,7 @@ Memoh 的可复用部分是 owner 模型，不是整页复制：一套登录或 
 
 设置 API 需要从当前“按 Provider 类型派生固定 runtime ID”升级成具名 runtime 的 create/update 操作。每项至少持有稳定 `runtime_id`、用户可读 `source_name`、transport/provider、credential 引用、Base URL、model name、默认 reasoning effort 与能力快照。列表和 Chat 都以 `model name：source name` 显示，身份和提交仍使用稳定 runtime ID，不能用显示文字做主键。
 
-API Key 是 write-only：读取状态只返回掩码和凭据状态，空值保存表示保留原 secret；替换 key 必须显式输入新值。Codex 和 OpenCode 使用同一来源实例外壳，但表单切换成登录动作，不伪装成 API Key 字段。新增来源成功后显示非阻塞 Toast；表单使用 Portal 到 `document.body` 的模态层，支持 Escape、焦点圈定和焦点恢复。遮罩只表达模态边界，不用模糊或装饰性渐变制造层级。
+API Key 是 write-only：读取状态只返回掩码和凭据状态，空值保存表示保留原 secret；替换 key 必须显式输入新值。编辑已有连接时，连接名称与已保存的 Base URL 会自动回填到表单，仅修改名称或保持原地址不变时不会重复触发不必要的新地址覆盖。Codex 使用同一来源实例外壳，但表单切换成登录动作，不伪装成 API Key 字段。新增来源成功后显示非阻塞 Toast；编辑器在卡片或添加面板内就地展开，支持关闭守卫与焦点恢复。
 
 ### 7.3 五个等权交互候选
 

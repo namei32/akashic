@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import math
 import re
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import datetime
 from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias, cast
 
 from plugins.ledger.contract import Message
 from plugins.ledger.contract import (
@@ -22,57 +21,11 @@ from plugins.ledger.contract import (
 
 from agent.plugin_composition.context import Context
 from agent.plugin_composition.requests import RequestContext
-from agent.plugin_composition.credentials import CredentialRef, ProviderClient, ProviderClientFactory
+from agent.plugin_composition.credentials import CredentialRef
 from agent.plugin_composition.model import ServiceKey
 
 
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-
-
-def channel_config_revision(projection: Mapping[str, object]) -> str:
-    """Hash a redacted config projection without exposing credential bytes."""
-
-    payload = _canonical_channel_config_value(projection)
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _canonical_channel_config_value(value: object) -> object:
-    """Convert TOML values and CredentialRef into deterministic JSON."""
-
-    if isinstance(value, CredentialRef):
-        return {"$credential_ref": list(value.path)}
-    if isinstance(value, Mapping):
-        result: dict[str, object] = {}
-        for key in sorted(value):
-            if not isinstance(key, str):
-                raise TypeError("channel config projection key 必须是字符串")
-            result[key] = _canonical_channel_config_value(value[key])
-        return result
-    if isinstance(value, (list, tuple)):
-        return [_canonical_channel_config_value(item) for item in value]
-    if value is None or isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        if math.isnan(value):
-            return {"$float": "nan"}
-        if math.isinf(value):
-            return {"$float": "inf" if value > 0 else "-inf"}
-        return {"$float": value.hex()}
-    if isinstance(value, (datetime, date, time)):
-        return {
-            "$toml_type": type(value).__name__,
-            "value": value.isoformat(),
-        }
-    raise TypeError(
-        "channel config projection 包含不受支持的值: "
-        f"{type(value).__name__}"
-    )
 
 
 class ChannelCapability(StrEnum):
@@ -81,19 +34,6 @@ class ChannelCapability(StrEnum):
     OUTBOUND = "outbound"
     CONTROL = "control"
     TURN_STREAM = "turn_stream"
-
-
-class PrivateTargetVerifier(Protocol):
-    """The channel owner checks an exact destination and holds its provider lifetime."""
-
-    def guard(self, recipient: str, session_id: str) -> AbstractAsyncContextManager[bool]: ...
-
-
-def private_target_key(channel: str) -> ServiceKey[PrivateTargetVerifier]:
-    """Unknown channels have no proof; callers must not infer one from an address."""
-    if not isinstance(channel, str) or _NAME.fullmatch(channel) is None:
-        raise ValueError("channel name 无效")
-    return ServiceKey[PrivateTargetVerifier](f"channel.private-target.{channel}.v1")
 
 
 class InboundIdentity(StrEnum):
@@ -165,11 +105,66 @@ class ChannelInboundMessage:
         )
 
 
+class InputPartRejected(ValueError):
+    """客户端附带的片段被拒收；渠道把它作为该请求的错误回给发送者。"""
+
+
+INPUT_PARTS_MAX_ITEMS = 8
+INPUT_PARTS_MAX_BYTES = 16 * 1024
+_INPUT_PART_KIND = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
+
+
+# metadata.input_parts 的统一形状：每个渠道与接纳它的来源都用同一份数量、kind 与字节上限。
+# 入站 metadata 已被冻结为只读映射与元组；片段值还原成普通 JSON 结构后再编码，交给 owner 的也是普通值。
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in cast(Mapping[object, object], value).items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_json(item) for item in cast(Sequence[object], value)]
+    return value
+
+
+def read_input_parts(value: object) -> tuple[tuple[str, object], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or len(value) > INPUT_PARTS_MAX_ITEMS:
+        raise InputPartRejected(f"parts 必须是至多 {INPUT_PARTS_MAX_ITEMS} 项的数组")
+    items: list[tuple[str, object]] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"kind", "value"}:
+            raise InputPartRejected("parts 每项必须是 {kind, value}")
+        kind = item["kind"]
+        if not isinstance(kind, str) or not _INPUT_PART_KIND.match(kind) or any(other == kind for other, _ in items):
+            raise InputPartRejected("parts 的 kind 无效或重复")
+        items.append((kind, _thaw_json(item["value"])))
+    # 序列化与 UTF-8 编码同属输入校验：未配对的代理字符等编码失败也是该请求的拒收。
+    try:
+        encoded = json.dumps([{"kind": kind, "value": part} for kind, part in items], ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise InputPartRejected("parts 必须是可编码为 UTF-8 的 JSON 值") from error
+    if len(encoded) > INPUT_PARTS_MAX_BYTES:
+        raise InputPartRejected(f"parts 合计不能超过 {INPUT_PARTS_MAX_BYTES // 1024} KiB")
+    return tuple(items)
+
+
 # 来源插件接纳已验证的传输输入；不获得 Channel lease 或发送权。
 
 CHANNEL_INPUT_V2 = ServiceKey[
     Callable[[str, str, ChannelInboundMessage], Awaitable[Message]]
 ]("channel.input.v2")
+
+
+class ChannelSteer(Protocol):
+    """生成中的插话：先暂存，回复在下一步模型请求之前写入；回合结束仍未写入的转成普通输入。"""
+
+    # 有可接纳插话的回复在进行时暂存并返回 True；否则返回 False，由渠道按普通输入发送。
+    async def stage(self, session_id: str, message_id: str, message: ChannelInboundMessage) -> bool: ...
+
+    # 撤回尚未写入的插话；已经交给模型的返回 False。
+    def withdraw(self, session_id: str, message_id: str) -> bool: ...
+
+
+CHANNEL_STEER = ServiceKey[ChannelSteer]("channel.steer.v1")
 
 
 class ChannelBindingLease(Protocol):
@@ -817,16 +812,6 @@ class ChannelAdapter(Protocol):
     async def stop(self) -> StopReceipt: ...
 
 
-class ChannelRuntimeAdapter(ChannelAdapter, Protocol):
-    """Optional lifecycle seam for provider callbacks owned by a formal binding."""
-
-    def attach_runtime(self, ports: ChannelRuntimePorts) -> None: ...
-
-    def open_admission(self) -> None: ...
-
-    def close_admission(self) -> None: ...
-
-
 @dataclass(frozen=True, slots=True)
 class ChannelDefinition:
     """Describe one plugin-owned channel factory without opening it."""
@@ -1040,6 +1025,8 @@ __all__ = [
     "ChannelTerminalStatus",
     "ChannelPresentationPorts",
     "ChannelInboundMessage",
+    "ChannelSteer",
+    "CHANNEL_STEER",
     "AttachmentKind",
     "AttachmentReadLease",
     "AttachmentRef",

@@ -41,9 +41,14 @@ mkdir -p \
   /data/profile \
   /data/state
 
+# Lifecycle guarantees no previous runtime owner remains before --runtime starts;
+# clean up host-named Chromium singleton links if an earlier runtime took SIGKILL.
+rm -f \
+  /data/profile/SingletonCookie \
+  /data/profile/SingletonLock \
+  /data/profile/SingletonSocket
 
-cleanup() {
-  trap - TERM INT EXIT
+cleanup_children() {
   kill -TERM "${browser_pid:-}" 2>/dev/null || true
   wait "${browser_pid:-}" 2>/dev/null || true
   # 编码服务先释放 XShm 和输入连接，X server 仍在时才能完成清理。
@@ -53,7 +58,19 @@ cleanup() {
   kill -TERM "${xvnc_pid:-}" 2>/dev/null || true
   wait 2>/dev/null || true
 }
-trap cleanup TERM INT EXIT
+on_signal() {
+  trap - TERM INT EXIT
+  cleanup_children
+  exit 0
+}
+cleanup() {
+  rc=$?
+  trap - TERM INT EXIT
+  cleanup_children
+  exit "$rc"
+}
+trap on_signal TERM INT
+trap cleanup EXIT
 
 # 屏幕尺寸跟随观看面板（selkies 按 RandR 调整），这里只是还没人看时的初始值。
 rm -f /tmp/.X11-unix/X99 /tmp/.X99-lock
@@ -77,8 +94,16 @@ while [ ! -S /tmp/.X11-unix/X99 ]; do
 done
 
 # 有人看才编码：60fps、恒定质量，静止时补一帧高质量画面让文字清晰；光标由观看端本地绘制。
+# 默认 WebSocket；Dashboard 按连接切到 WebRTC（媒体走 UDP 30000，Workload 按原端口号发布到宿主）。
+# ICE 服务器只来自网关写入的文件，默认为空：只用本机候选，宿主地址由 Dashboard 补进候选；
+# 不用 selkies 自带的公网 STUN 列表，容器里连不上时每次建连要等 5 秒超时。
+# 接口都要令牌，主令牌由网关生成；输入权限由 Dashboard 按 Agent 是否在用切换。
+mkdir -p -m 700 "$(dirname "$COMPUTER_RTC_FILE")"
+[ -f "$COMPUTER_RTC_FILE" ] || (umask 077 && echo '{"iceServers": []}' > "$COMPUTER_RTC_FILE")
 /opt/computer/stream-venv/bin/python -m selkies \
   --addr 0.0.0.0 --port 6081 --mode websockets \
+  --master-token="$COMPUTER_STREAM_TOKEN" \
+  --webrtc-udp-mux-port 30000 --rtc-config-json "$COMPUTER_RTC_FILE" \
   --web-root /opt/computer/stream-web \
   --encoder h264enc --gpu-id=-1 \
   --framerate 60,15-60 --rate-control-mode crf --video-crf 25,18-35 \
@@ -95,10 +120,19 @@ stream_pid=$!
 matchbox-window-manager -use_titlebar no -use_cursor no &
 wm_pid=$!
 
+# 宿主出口：Controller 挂入 Host Bridge 的 socket 时，浏览器的连接都经宿主发起，localhost 就是宿主本机；
+# 只有容器里的 OpenCLI 守护进程（19825）留在本机直连。网关把 socket 转成 127.0.0.1:1080。
+proxy_args=""
+if [ -d /run/akashic/host-egress ]; then
+  proxy_args="--proxy-server=socks5://127.0.0.1:1080 --proxy-bypass-list=<-loopback>;127.0.0.1:19825;localhost:19825"
+fi
+
 # kiosk 不画标签条和地址栏，那些由观看面板本地绘制。
 # 每个 Agent 标签是独立窗口，被挡住的窗口和后台标签也照常渲染、计时。
 # 关掉最后一个窗口时浏览器不退出，由 driver 补开空白页；OpenCLI 扩展调试时不弹提示条占画面。
-chromium \
+# 关掉往返缓存：OpenCLI 用完把标签切回空白页，旧站点页面不再在后台留一个渲染进程。
+# shellcheck disable=SC2086
+chromium $proxy_args \
   --user-data-dir=/data/profile \
   --password-store=basic \
   --load-extension=/opt/opencli-extension \
@@ -115,6 +149,7 @@ chromium \
   --disable-dev-shm-usage \
   --disable-gpu \
   --disable-quic \
+  --disable-features=BackForwardCache \
   --hide-crash-restore-bubble \
   --no-first-run \
   --no-default-browser-check \

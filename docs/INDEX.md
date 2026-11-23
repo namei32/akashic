@@ -5,7 +5,7 @@
 ## 1. 固定入口
 
 1. 每个任务必读 [设计原则](projectneed.md#设计原则每个任务必读)，先理解项目允许改变什么。
-2. 修改任务读 [WORKFLOW.md](WORKFLOW.md)，先核对其中的[本仓库开发约定](WORKFLOW.md#本仓库的开发约定)；非简单任务读 [NOW.md](NOW.md)，只带入相关未完成事项。
+2. 修改任务读 [WORKFLOW.md](WORKFLOW.md)；非简单任务读 [NOW.md](NOW.md)，只带入相关未完成事项。
 3. 按下表选择相关需求与设计，并在 [决策索引](decisions/README.md) 按行为、数据对象和 owner 查找决定。读取命中的记录，跟随勘误和替代关系；不能只按准备修改的文件名选择材料。
 4. 核对真实调用路径、状态读写和消费者。改动跨 owner 时展开所有受影响边界；不因命中多行而机械读取全部历史。
 
@@ -29,40 +29,33 @@
 
 ## 3. 按行为选择阅读路径
 
-主动联系的现行入口是 [0144 · Watch 接管主动联系](decisions/0144-watch-scoped-contact.md)；
-下表的 Wake、Drift、EventMail 入口仍描述各自保留的持久数据与授权、投递合同。
-
 下表给出当前入口；继续沿需求和决定中的相关链接展开，不把所有旧任务合同当作开工清单。
 
 | 涉及的行为或状态 | 需求与设计入口 | 真实实现入口 |
 |---|---|---|
-| 窗口、摘要、裁切、历史加载、重试 | CTX、SES-005 → [0002](decisions/0002-context-reduction-is-a-nondestructive-projection.md) → [0030](decisions/0030-session-context-compaction-ledger.md)、[0095 安全批次](decisions/0095-context-compaction-uses-settled-batches.md)、[上下文设计](design/session-context-compaction-ledger.md) | `plugins/context/`、`plugins/compaction/`、`plugins/ledger/` |
-| Prompt 人格、提醒与主动消息上下文 | CTX、PRM → [0096 稳定提醒位置](decisions/0096-context-reminders-keep-their-first-position.md)、[人格设计](design/veda-persona.md)、[Wake 最近送达](design/wake-recent-delivery-context.md) | `plugins/context/`、`plugins/models/`、`plugins/prompt/`、`plugins/wake/` |
+| 窗口、摘要、裁切、历史加载、重试 | CTX、SES-005 → [0002](decisions/0002-context-reduction-is-a-nondestructive-projection.md) → [0030](decisions/0030-session-context-compaction-ledger.md)、[0095 安全批次](decisions/0095-context-compaction-uses-settled-batches.md)、[0157 后台空闲摘要](decisions/0157-background-idle-compaction.md)、[0134 精确覆盖](decisions/0134-compaction-covers-message-identities.md)、[上下文设计](design/session-context-compaction-ledger.md) | `plugins/context/`、`plugins/compaction/`、`plugins/ledger/` |
+| Prompt 人格、提醒与主动消息上下文 | CTX、PRM → [0096 稳定提醒位置](decisions/0096-context-reminders-keep-their-first-position.md)、[人格设计](design/veda-persona.md) | `plugins/context/`、`plugins/models/`、`plugins/prompt/`、extra 仓库 `plugins/watch/` |
 | 工具结果全文、旧回读 | CTX-008 → [0090](decisions/0090-tool-results-stay-visible.md) | `plugins/content_view/`、`plugins/models/` |
-| Message、Turn、来源、回复和送达 | SES、OUT → [消息设计](design/0902-reviewed-v4.md)、[故障恢复](design/interrupt-and-fault-model.md)、[生成恢复与重试上限](decisions/0092-model-generation-recovers-until-output.md)、[0129 循环耗尽后续额](decisions/0129-exhausted-react-budget-renews-on-new-input.md)、[0132 显式步数上限](decisions/0132-step-limits-are-explicit.md)、[0097 请求增量](decisions/0097-request-deltas-belong-to-one-react-run.md)、[回复预算与截断](decisions/0089-reply-output-budget-includes-reasoning.md) | `plugins/ledger/`、`plugins/sources/`、`plugins/react/`、`plugins/reply/`、`plugins/delivery/` |
+| Message、Turn、来源、回复和送达 | SES、OUT → [消息设计](design/0902-reviewed-v4.md)、[故障恢复](design/interrupt-and-fault-model.md)、[生成恢复与重试上限](decisions/0092-model-generation-recovers-until-output.md)、[0097 请求增量](decisions/0097-request-deltas-belong-to-one-react-run.md)、[回复预算与截断](decisions/0089-reply-output-budget-includes-reasoning.md) | `plugins/ledger/`、`plugins/sources/`、`plugins/reply/`、`plugins/delivery/` |
 | 同 Turn 输入、打断、撤销 | SES、CTRL → [0025](decisions/0025-codex-style-same-turn-input.md)、[同 Turn 设计](design/codex-style-same-turn-input.md) | `plugins/conversation/`、`plugins/turn_projection/` |
-| 后台任务、异步回调与完成通知 | SES、OUT → [0113](decisions/0113-background-job-notices.md) | `plugins/jobs/`、`plugins/standard_tools/shell.py`、`plugins/host_execution/process_runtime.py` |
-| 会话标题、自动命名和手动改名 | SES-012 → [0087](decisions/0087-session-title-override.md)、[0101](decisions/0101-first-message-session-title.md) | `plugins/session_title/`、`plugins/ledger/log.py` |
+| 后台任务、异步回调与完成通知 | SES、OUT → [0113](decisions/0113-background-job-notices.md) | `plugins/jobs/`、`plugins/shell/shell.py`、`plugins/host_execution/process_runtime.py` |
+| 会话标题、自动命名和手动改名 | SES-012 → [0087](decisions/0087-session-title-override.md)、[0101](decisions/0101-first-message-session-title.md) | extra 仓库 `plugins/session_title/`、`plugins/ledger/log.py` |
 | 元数据与旧执行恢复 | SES-009 → [0060](decisions/0060-message-plugin-metadata.md)、[0061](decisions/0061-archive-stopped-legacy-executions.md) | `plugins/ledger/contract.py`、`agent/migrations/` |
-| Akasha、Project scope、学习与重建 | MEM、SES-010 → [0073](decisions/0073-session-scope-routes-akasha-graphs.md)、[在线与重放](design/akasha-v2-runtime-migration.md)、[成本优化](design/akasha-memory-cost.md) | `plugins/akasha/`、`plugins/projects/` |
-| Markdown 记忆与 consolidation | MEM → [0052](decisions/0052-compaction-and-markdown-memory-are-ordinary-plugins.md)、[0116 超额剪枝](decisions/0116-markdown-budget-pruning.md)、[插件化设计](design/compaction-markdown-memory-plugin-task-contract.md) | `plugins/markdown_memory/`、`plugins/compaction/` |
+| Akasha、Project scope、学习与重建 | MEM、SES-010 → [0073](decisions/0073-session-scope-routes-akasha-graphs.md)、[在线与重放](design/akasha-v2-runtime-migration.md)、[成本优化](design/akasha-memory-cost.md) | extra 仓库 `plugins/akasha/`、extra 仓库 `plugins/projects/` |
+| Markdown 记忆与 consolidation | MEM → [0052](decisions/0052-compaction-and-markdown-memory-are-ordinary-plugins.md)、[0116 超额剪枝](decisions/0116-markdown-budget-pruning.md)、[插件化设计](design/compaction-markdown-memory-plugin-task-contract.md) | extra 仓库 `plugins/markdown_memory/`、`plugins/compaction/` |
 | 插件安装、卸载、热更新、generation | PLG → [0072](decisions/0072-single-graph-local-plugin-updates.md)、[单图设计](design/issue-750-plugin-publication-simplification.md) | `agent/plugins/`、`agent/plugin_composition/` |
 | 能力、owner、Core 与插件边界 | PLG、CAP → [0065](decisions/0065-plugin-boundary-checks-do-not-grant-core-ownership.md)、[能力手册](design/plugin-v3-capabilities.md)、[Issue 766](design/issue-766-orthogonal-capabilities.md)、[0102 插件服务与合同](decisions/0102-plugin-owned-services-and-public-contracts.md)、[0104 公共编码](decisions/0104-public-codecs-without-ui-runtime.md) | `agent/plugin_contracts/`、`agent/plugin_composition/`、`plugin_boundary.toml` |
-| Skill、Drift skill、MCP、进程和 Workload | PLG-017 → [0094](decisions/0094-plugin-runtime-uses-installed-files.md)、[普通资源 provider](design/plugin-resource-providers.md)、[0053](decisions/0053-plugins-declare-managed-workloads.md) | 插件源码与正式安装链；`agent/plugin_composition/` |
-| Wake、Drift、Scheduler、Subagent | PRO、SCH、SES → [0039](decisions/0039-react-core-atoms-keep-sources-unprivileged.md)、[0126 任务会话](decisions/0126-task-destination-sessions.md)、[Drift 主动意图](design/drift-initiative.md)、[Drift 与 Default Memory 提议](design/drift-default-memory.md)、[React Core 设计](design/react-core-scheduler-subagent.md)、[Content/Wake](design/content-wake-existing-atoms-first-stage.md) | `plugins/wake/`、`plugins/drift/`、`plugins/scheduler/`、`plugins/subagent/` |
-| EventMail、alert、内容消费 | PRO → [0048](decisions/0048-eventmail-keeps-three-mail-lifecycles.md)、[分层合同](design/content-wake-proactive-migration-task-contract.md) | `plugins/eventmail/`、`plugins/wake/` |
-| Codex 桌面回合通知与 WSL 桥接 | [0128](decisions/0128-codex-notifications-use-local-gateway.md)、[插件说明](../plugins/codex_notifications/README.md) | `plugins/codex_notifications/`、`integrations/codex_notifications/` |
-| 从 Akashic 指挥 Windows Codex CLI、发送图片 | [0131](decisions/0131-codex-control-uses-shared-desktop-backend.md)、[插件说明](../plugins/codex_control/README.md) | `plugins/codex_control/`、`integrations/codex_control/` |
-| 英雄联盟战绩与日报会话 | [0127](decisions/0127-lol-reports-own-destination.md)、[插件说明](../plugins/lol_tracker/README.md) | `plugins/lol_tracker/`、`frontend/plugins/lol_tracker/src/` |
+| Skill、MCP、进程和 Workload | PLG-017 → [0094](decisions/0094-plugin-runtime-uses-installed-files.md)、[普通资源 provider](design/plugin-resource-providers.md)、[0053](decisions/0053-plugins-declare-managed-workloads.md) | 插件源码与正式安装链；`agent/plugin_composition/` |
+| 值班、Scheduler、Subagent | PRO、SCH、SES → [0039](decisions/0039-react-core-atoms-keep-sources-unprivileged.md)、[React Core 设计](design/react-core-scheduler-subagent.md)、[0149 值班取代 Wake](decisions/0149-watch-replaces-wake.md) | extra 仓库 `plugins/watch/`、`plugins/drift/`、extra 仓库 `plugins/scheduler/`、extra 仓库 `plugins/subagent/` |
+| 事件来源、值班 | PRO → [0149](decisions/0149-watch-replaces-wake.md)、[0150](decisions/0150-sources-have-one-event-entry.md)、[0151](decisions/0151-watch-closes-every-loop.md)、[0152](decisions/0152-watch-speaks-at-the-right-moment.md)、[0153](decisions/0153-watch-panel.md)、[0154](decisions/0154-watch-reshapes-its-own-sources.md) | extra 仓库 `plugins/watch/` |
 | Channel、持久接纳、Host boot 身份 | RUN-003、AKC → [Channel 归属](design/channel-resource-ownership.md)、[durable inbound](design/plugin-v3-durable-inbound-host-contract.md) | `plugins/ledger/`、`plugins/channels/` |
-| 模型配置、选择、凭据、onboarding | RUN-005～RUN-012、ONB → [0078](decisions/0078-plugin-config-and-onboarding-ownership.md)、[引导设计](design/plugin-onboarding-projection.md)、[模型选择](design/model-user-disable.md)、[Gemini 原生接口](../plugins/gemini/README.md) | `plugins/models/`、`plugins/onboarding/`、Provider 插件 |
-| 模型用量、速度、调用明细 | RUN-012、[0102](decisions/0102-plugin-owned-services-and-public-contracts.md) → [统计口径与只读边界](../plugins/model_usage/README.md) | `plugins/models/usage_report.py`、`plugins/model_usage/`、`frontend/plugins/model_usage/src/` |
-| Web 或插件 UI、Android Shell | WEBUI、MOB、AKC → [frontend/design.md](../frontend/design.md)（修改前必读）、[0076](decisions/0076-android-shell-retires-legacy-mobile-stack.md)、[Shell 合同](design/android-shell-experiment.md) | `frontend/**/src`、`plugins/akashic_clients/`；不编辑生成 bundle |
-| 聊天交互图、可视化附件 | WEBUI、SES-006、PLG → [0117](decisions/0117-visuals-are-message-attachments.md)、[Visuals](../plugins/visuals/README.md) | `plugins/visuals/`、`frontend/plugins/visuals/src` |
-| Web 窄屏、布局、导航和插件组合 | WEBUI → [窄屏设计](design/web-narrow-reading.md)、[Web 组合](design/web-ui-plugin-composition.md)、[纸张品牌](design/akashic-paper-brand-system.md) | `frontend/**/src`、`plugins/conversation_ui/` |
+| 模型配置、选择、凭据、onboarding | RUN-005～RUN-012、ONB → [0078](decisions/0078-plugin-config-and-onboarding-ownership.md)、[引导设计](design/plugin-onboarding-projection.md)、[模型选择](design/model-user-disable.md)、[Gemini 原生接口](https://github.com/kachofugetsu09/akashic-plugins/blob/main/plugins/gemini/README.md) | `plugins/models/`、`plugins/onboarding/`、Provider 插件 |
+| Web 或插件 UI、Android Shell | WEBUI、MOB、AKC → [packages/akashic-theme/design.md](../packages/akashic-theme/design.md)（修改前必读）、[0076](decisions/0076-android-shell-retires-legacy-mobile-stack.md)、[Shell 合同](design/android-shell-experiment.md) | `frontend/**/src`、`plugins/akashic_clients/`；不编辑生成 bundle |
+| 聊天交互图、可视化附件 | WEBUI、SES-006、PLG → [0117](decisions/0117-visuals-are-message-attachments.md)、[Visuals](https://github.com/kachofugetsu09/akashic-plugins/blob/main/plugins/visuals/README.md) | extra 仓库 `plugins/visuals/`、`frontend/plugins/visuals/src` |
+| Web 窄屏、布局、导航和插件组合 | WEBUI → [窄屏设计](design/web-narrow-reading.md)、[Web 组合](design/web-ui-plugin-composition.md)、[纸张品牌](design/akashic-paper-brand-system.md)、[信息密度判定](design/information-density.md)、[0142 配色选择](decisions/0142-theme-families-and-palette-rules.md) → [0144 纸感替换](decisions/0144-paper-uses-the-corrected-palette.md) | `frontend/**/src`、`plugins/conversation_ui/` |
 | 启动、停止、自重启 | RUN-001～RUN-004 → [Supervisor 设计](design/linux-supervisor-safe-self-restart.md)、[产品启动](design/product-startup.md) | `main.py`、`agent/supervisor.py`、`agent/restart.py` |
-| Project 目录、Session cwd、AGENTS | SES-011、SH-004、CTX-009 → [0085](decisions/0085-project-default-and-session-working-directory.md)、[目录设计](design/project-working-directory.md) | `plugins/projects/`、`plugins/standard_tools/`、`plugins/ledger/contract.py` |
-| Shell、PTY、进程续接 | SH → [0014](decisions/0014-shell-uses-unified-execution.md)、[Shell 设计](design/unified-shell-execution.md) | `plugins/standard_tools/`、`agent/tools/unified_exec.py` |
+| Project 目录、Session cwd、AGENTS | SES-011、SH-004、CTX-009 → [0085](decisions/0085-project-default-and-session-working-directory.md)、[目录设计](design/project-working-directory.md) | extra 仓库 `plugins/projects/`、`plugins/working_directory/`、`plugins/ledger/contract.py` |
+| Shell、PTY、进程续接 | SH → [0014](decisions/0014-shell-uses-unified-execution.md)、[Shell 设计](design/unified-shell-execution.md) | `plugins/shell/`、`plugins/host_execution/process_runtime.py` |
 | 容器、Host Bridge、Computer | RUN-013～RUN-016、PLG-017 → [0084](decisions/0084-computer-keeps-identity-without-an-idle-desktop.md)、[0088](decisions/0088-computer-streams-h264-over-dashboard-websocket.md) → [0092](decisions/0092-computer-viewing-and-control.md) → [0123](decisions/0123-computer-is-one-browser.md)、[一个浏览器](design/computer-one-browser.md) → [显示验收](design/computer-h264-display.md)、[0075](decisions/0075-host-bridge-runtime-recovery.md)、[Bridge 协议](design/host-bridge-protocol-v2.md)、[低延迟传输](decisions/0098-host-bridge-reuses-protobuf-socket.md)、[Computer 合同](design/computer-plugin-workload-task-contract.md) | `docker/`、`agent/plugin_composition/`、正式 Controller |
 | 部署、升级、备份、恢复 | MIG、BAK → [0082](decisions/0082-distribution-owned-plugin-composition.md)、[0091](decisions/0091-shell-self-deployment.md)、[部署手册](design/operator-deployment.md)、[hua-home 事实入口](design/hua-home-plugin-runtime-source-of-truth.md) | `scripts/install-akashic.sh`、`scripts/akashic_release/` |
 | Workspace、配置、迁移与数据清理 | STA、WSP、MIG → [状态地图](design/persistence-state-map.md)、[0066](decisions/0066-yoyo-current-baseline.md)、[Yoyo 手册](design/git-migration-authoring.md) | 相应状态 owner、`migrations/`、`bootstrap/init_workspace.py` |
@@ -72,7 +65,6 @@
 | 新产品方向 | [路线草案](design/akashic-future-roadmap-issue-drafts.md) → 对应现行需求；草案不是实现授权 | 按已批准范围定位 |
 
 Session 与 Models 提交的故障保证见 [0099 WAL NORMAL](decisions/0099-ledger-commits-use-wal-normal.md)；工具与送达恢复仍沿原 owner 协议。
-模型历史回放与缺失调用账恢复见 [0143](decisions/0143-model-output-carries-replay-facts.md)。
 默认消息工具调用与 ReAct 重启恢复按 [0100](decisions/0100-message-tool-calls-recover-at-turn-granularity.md)：未结工具报告未知，模型使用当前材料发新请求。
 
 派生向量拆分见 [0106](decisions/0106-derived-vectors-use-separate-storage.md)，丢库补算见 [0107](decisions/0107-restore-missing-vectors-before-reading-memory.md)。
@@ -89,9 +81,10 @@ Issue 1179 的当前实现与重大决定见 [边界②③审查入口](design/p
 兼容读取退役前先看 [hua-home 数据盘点与截止方案](design/compatibility-cutoff-inventory.md)，
 按实际状态区分结构转换、不可变历史读取与当前恢复协议。
 
-[Default Memory 当前插件与历史保全迁移](design/default-memory-current-plugin.md) 说明结构化记忆替换、完整历史补学与回退。
-
-[切换到新版 Akasha](design/akasha-engine-switch.md) 说明定向移植、历史保全、Drift 适配与切换验收。
+临时验收脚本清理后，历史设计和决策中的 `docker/debug/`、一次性 scenario /
+E2E 路径仅作证据定位，可用 `git show dc5be63d2:<路径>` 回溯，不能作为当前
+checkout 的可执行入口。当前 CI 入口以 WORKFLOW 和工作流源码为准；
+历史验收通过不代表当前版本或正式部署已验证。
 
 ## 4. 数据任务的额外入口
 

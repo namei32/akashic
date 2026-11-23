@@ -1,29 +1,28 @@
-"""Private Web navigation preferences; Session and Projects remain the fact owners."""
+"""Private Web navigation preferences; Session and scope dimension owners remain the fact owners."""
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Mapping
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from plugins.ledger.contract import OwnerStore, OwnerTransaction
-from plugins.ledger.contract import ContentPart, Control
-from .services import MessageCatalogPort, PluginUiProvider
+from plugins.ui.contract import session_preview
+from .services import MessageCatalogPort
 
 _KEY = "navigation:pins"
 
 
+# kind 为 "session" 时 id 是会话；否则 kind 是会话维度名、id 是该维度的值，由维度 owner 判定是否可用。
 class PinReference(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
-    kind: Literal["project", "session"]
+    kind: str = Field(pattern=r"^[a-z][a-z0-9_]{0,31}$")
     id: str = Field(min_length=1, max_length=512)
 
     @model_validator(mode="after")
     def check_identity(self) -> PinReference:
-        if self.kind == "project":
-            if re.fullmatch(r"p_[0-9a-f]{32}", self.id) is None:
-                raise ValueError("项目 ID 无效")
+        if self.kind != "session":
+            if self.id != self.id.strip() or self.id == "default" or len(self.id) > 128:
+                raise ValueError("维度值无效")
         elif not self.id.startswith("akashic:") or not self.id.removeprefix("akashic:").strip() or self.id != self.id.strip():
             raise ValueError("需要完整的 Akashic 会话 ID")
         return self
@@ -73,39 +72,21 @@ class NavigationPreferences:
         self._open_store().transact(save)
 
 
-def session_pin_row(catalog: MessageCatalogPort, session_id: str) -> dict[str, object] | None:
-    """Point-read the real scope and first Message, independent of recent paging."""
+async def session_pin_row(catalog: MessageCatalogPort, session_id: str) -> dict[str, object] | None:
+    """Point-read the real scope and first Message, independent of recent paging.
+
+    四项点读合并进一次可排空 worker 行程，不占用事件循环；结果与同快照的
+    同步逐项读取一致。
+    """
     reader = catalog.reader(session_id)
     try:
-        first_page = reader.read_page(limit=1)
+        first_page, attributes, deleted, title = await reader.read_async(
+            lambda row: (row.read_page(limit=1), row.attributes, row.deleted, row.title))
     except KeyError:
         return None
-    attributes = reader.attributes
-    if reader.deleted or attributes.visibility != "listed" or any(name == "project" for name, _ in attributes.scope):
+    # 带会话维度（如项目）的会话也可置顶：前端把它排在所在分组内，scope 随行返回。
+    if deleted or attributes.visibility != "listed":
         return None
-    first = first_page.messages[0] if first_page.messages else None
-    text = "" if first is None or isinstance(first.body, Control) else "\n".join(
-        str(part.value) for part in first.body.parts if isinstance(part, ContentPart) and part.kind == "text"
-    )
+    text = session_preview(first_page.messages[0] if first_page.messages else None)
     return {"key": session_id, "first_message_content": text, "scope": dict(attributes.scope),
-            "title": reader.title}
-
-
-async def check_project_pin(provider: PluginUiProvider, project_id: str) -> None:
-    """Ask the current Projects owner, without importing or copying its storage."""
-    catalog = await provider.catalog()
-    items = catalog.get("items")
-    if not isinstance(items, list):
-        raise ValueError("插件目录无效")
-    projects = [item for item in items if isinstance(item, dict)
-                and isinstance(item.get("id"), str) and item["id"].split("@")[0] == "projects"]
-    if len(projects) != 1:
-        raise ValueError("项目服务暂不可用")
-    project = projects[0]
-    result = await provider.query(str(project["id"]), str(project["revision"]), "project.list", {},
-                                  session_id=None, turn_id=None)
-    rows = result.get("items")
-    if not isinstance(rows, list):
-        raise ValueError("项目目录无效")
-    if not any(isinstance(row, dict) and row.get("id") == project_id and row.get("archived") is False for row in rows):
-        raise ValueError("只能置顶当前可用的项目")
+            "title": title}

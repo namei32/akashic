@@ -2,6 +2,54 @@
 
 本文档记录 `refactor/code-clean` 系列重构的决策依据、能力变化、性能数据和测试调整。每个被接受的提交都必须补充一条记录；没有测量或调用链证据的“优化”不得合并。
 
+## 2026-11-04 模型驱动与设置契约收敛：对齐 DSH 收敛 4 个模型驱动插件公共协议与 14 个重复 dashboard.py
+
+- 基线：`48706fa2`（`refactor/shield-cancellation-primitive` 头），分支 `refactor/model-driver-and-settings-contracts`。
+- 重构对象（49 个文件，删除 14 个 8 行样板 `dashboard.py` 文件，消除 `openai_compatible` / `opencode_go` / `codex` / `gemini` 后端与前端的 3～4 次复制粘贴）：
+  - 在 `plugins/models/contract.py`（模型能力的唯一 Owner 公共契约）中收敛 `register_connection_type_ui`、`check_credential_scope`、`check_bound_model`、`credential_bearer_token`、`normalize_http_base_url`、`positive_float_config`、`optional_non_negative_int`、`required_non_empty_string`、`response_json_object`、`mark_unsent_error`、`StreamReadError`、`StreamCallbackError`、`raise_http_status`、`http_status_error`、`map_driver_error`、`is_driver_retryable`、`merge_stream_tool_deltas`、`build_stream_tool_calls`、`parse_tool_arguments`、`parse_openai_usage`；
+  - `plugins/openai_compatible/driver.py`、`plugins/opencode_go/driver.py`、`plugins/codex/{driver,responses,plugin}.py`、`plugins/gemini/plugin.py` 统一消费 `plugins.models.contract`，仅在插件内保留各自特有的协议差异（如 `opencode_go` 的模型家族 reasoning profile 与本地登录态导入、`openai_compatible` 的 `<think>` 标签流式切分与 Embeddings）；
+  - 在 `packages/akashic-plugin-kit/src/connection-form.js` 收敛 4 个连接类型前端模块（`openai_compatible`、`gemini`、`opencode_go`、`codex`）重复的 `htmlNode`、`escapeHtml`、`requireConnectionProps`、`toDiscoveredModelInput`，并重新构建 4 个插件的独立 `web_module.js`；
+  - 在 `plugins/ui/{contract,dashboard,plugin}.py` 中让 `mount_settings` 与 `UI.register(configuration_key=...)` 原生绑定 `/api/dashboard/<plugin>/config`，直接删除 `akasha`、`compaction`、`markdown_memory`、`reply`、`session_title`、`shell`、`standard_web`、`subagent`、`telegram_channel`、`telegram_sender`、`vision`、`web_fetch_http`、`web_search_exa`、`web_search_searxng` 共 14 个一模一样的 8 行 `dashboard.py` 样板文件。
+- 依据（三次原则 + ADR 0102 + DSH `@deepseek-ai/dsh-llm` / `@deepseek-ai/dsh-settings`）：跨 3 个以上插件重复的协议映射与声明式配置路由下沉至对应领域 Owner 的 `contract.py`，不跨插件直接 import 实现。
+- Gate：`pyright` 全仓与 26 个改动模块均为 `0 errors`；`python3 scripts/plugin_boundary.py check --base origin/main` 通过（R1=0/0 R2=0/0 R3=0/0）；`python3 scripts/check_model_retry.py` 38 个场景与 `subagent_delegation_workflow_scenario.py` 全量通过；关联 pytest 10 passed；`git diff --check` 干净。
+
+## 2026-11-04 异步不可中断收尾原语收敛：提炼 shield_until_done 与 drain_uninterruptible
+
+- 基线：`91d19f2c`（`refactor/unify-tool-result-boundaries` 头），分支 `refactor/shield-cancellation-primitive`。
+- 重构对象（16 个文件）：
+  - 在已列入 `PLUGIN_ALLOWED_MODULES` 的中立基础库 `core/common/file_io.py` 中提炼 `shield_until_done(work, *, ignore_task_cancel=False)` 与 `drain_uninterruptible(work)` 两个标准异步取消保护原语；
+  - 统一替换 `agent/plugin_composition/{effect,events,executor}.py`、`agent/plugins/scope.py`、`plugins/akasha/{application/consumer,runtime}.py`、`plugins/akashic_clients/web_chat.py`、`plugins/channels/provider.py`、`plugins/host_execution/controller.py`、`plugins/ledger/{custody,durable_deliveries}.py`、`plugins/managed_processes/host.py`、`plugins/mcp/host.py`、`plugins/models/contract.py`、`plugins/workloads/host.py` 共 17 处重复手写的 `while not task.done(): await asyncio.shield(task)` 循环。
+- 依据（三次原则 + R2 中立底座）：该模式在全仓跨 15 个模块重复出现 17+ 次，且属于领域无关的 asyncio 取消排空机制。下沉至 `core.common.file_io` 后，所有插件与 Core 使用同一实现。等待期间的调用方取消与子任务取消分开处理，避免清理完成同拍发生的调用方取消被吞掉；入站 envelope 的关闭标记随 lease 物理释放完成更新。
+- Gate：`pyright` 全仓与 16 个改动模块均为 `0 errors`；`python3 scripts/plugin_boundary.py check --base origin/main` 通过（R1=0/0 R2=0/0 R3=0/0）；生命周期与排空回归 pytest 27 passed；`git diff --check` 干净。
+
+## 2026-11-04 工具契约收敛：消除 14 个插件重复定义的 ToolResultValue/Result 与 7 个 _tool_boundary.py
+
+- 基线：`71bdf42b`（`refactor/reclaim-code-entropy` 头），分支 `refactor/unify-tool-result-boundaries`。
+- 重构对象（28 个文件，净删减 257 行，删除 7 个文件）：
+  - 删除 `plugins/{files,shell,skills,standard_web,tool_search,vision,working_directory}/_tool_boundary.py` 共 7 个一字不差的过渡跳板文件；
+  - 将上述 7 个插件及 `akasha/_boundaries.py`、`wake/_boundary.py`、`message_push/boundary.py`、`computer/inputs.py`、`plugin_update/inputs.py`、`scheduler/inputs.py`、`subagent/inputs.py` 中各自重复定义的 14 份 `ToolResultValue` / `ToolResult` / `Result` / `ToolOutcome` / `BoundTool` 统一收敛到 `plugins.tools.contract` 的公开契约 `Result`、`Outcome`、`BoundTool`。
+- 依据（三次原则 + ADR 0102 + DSH `@deepseek-ai/dsh-tools`）：`plugins/tools/contract.py` 作为工具能力的唯一 Owner 已公开 `Outcome`、`Result`、`BoundTool`，遵循 R3（插件仅依赖兄弟插件的 `contract.py`），不再在 14 个消费方插件中各自维护一套镜像结构定义。
+- Gate：`pyright` 全仓与 21 个修改模块均为 `0 errors`；`python3 scripts/plugin_boundary.py check --base origin/main` 通过（R1=0/0 R2=0/0 R3=0/0）；工具链关联 pytest 30 passed；`git diff --check` 干净。
+
+## 2026-11-04 熵清理：按 reclaim-code-entropy 回收跨插件与 Core 的无消费者残留面及 Web 旧附件死链路
+
+- 基线：`bed19054`（`main` 头），分支 `refactor/reclaim-code-entropy`。只改独立 worktree，未操作正式 workspace、服务、数据库、安装 cache 或 Git refs。
+- 删除对象（19 个生产文件）：
+  - `plugins/akashic_clients/` 旧上传死链路：`plugins/akashic_clients/attachments.py` 整文件、`services.py` `AttachmentStorePort`、`web_chat.py` 的 `_attachments` / `bind_attachment_store` / `_upload_result` / `upload_roots` / `has_media` / `_media_paths` 与非 artifact 上传 fallback、`chat_api.py` 的 `/api/chat/media` 路由与 `_can_read_media`、`channel.py` 的 `_upload_store`（Web 上传与读取早已全面走 Core `ARTIFACT_IMPORT` / `ARTIFACT_READ` 与 `/api/chat/artifacts/{artifact_id}`，旧路径裸读链路已无任何真实消费者）；
+  - `plugins/akasha/domain/diffusion.py` `IndexedMaxHeap`（#347 将 `residual_push` 切换为 `heapq` 惰性堆 + C 扩展后遗留的 88 行旧索引堆实现，全仓零消费者）；
+  - `plugins/akasha/config.py` `load_akasha_config` 及随之闲置的 `tomllib` import（Akasha 配置已统一走 `PLUGIN_CONFIG.load(ctx, Settings)` + `Settings.settings()`，独立 TOML 文件加载器已无任何消费者）；
+  - `plugins/channels/contract.py` `channel_config_revision`、`_canonical_channel_config_value`、`ChannelRuntimeAdapter` 及闲置的 `hashlib`、`date`、`time` import（Channel 配置指纹现由 `agent/plugins/config_updates.py` 统一计算，生命周期方法已在 `WebNativeChannelAdapter` 等各自实现内闭环）；
+  - `plugins/turn_projection/contract.py` `set_post_commit_effect`、`suppresses_post_commit` 及闲置的 `MutableMapping` import（Turn 后置效果现作为 `Message` 元数据随 `append` 一次性封入，只读 `post_commit_effect()` 为唯一消费者入口）；
+  - `plugins/models/store.py` `ModelsStore.record_first_token`（首字耗时现由 `plugins/models/state.py` 在流式生成中内存计时并在 `finish_call(..., first_token_ms=...)` 一次性写入 SQLite，不再在流式首 token 触发单独的 SQLite 写事务）；
+  - `agent/supervisor.py` `_SettingsRestartBridge.request_and_wait`（模型与插件配置热更新已迁移至单图运行时 `PLUGIN_CONFIG` CAS，Supervisor 设置重启桥的请求发起端已无调用方）；
+  - `agent/plugin_composition/context.py` `CompositionRoot.topology_identity` 与 `CompositionRoot.active_plugin_ids`（调用方统一通过 `topology_view()` 与 `fibers()` 读取）；
+  - `plugins/mcp/host.py` `McpGenerationHost.route_for`、`plugins/mcp/definitions.py` `McpServerBinding.is_live`、`plugins/mcp/client.py` `McpClient.wait_fatal_failure` 及 `_fatal_event`（MCP 路由已收敛至 `McpServerHandle.route()`，存活与故障统一走 `is_owned()` 与 `_fatal_failure` 同步健康门）；
+  - `plugins/ledger/log.py` `MessageLog.warm_prefix`、`plugins/ledger/attachment_import.py` `ChannelOutboundAttachmentImporter.import_media`、`plugins/ledger/base.py` `MessageDeduper`（及闲置 `deque` import）；
+  - `plugins/goal/state.py` `pause_for_usage_uncertainty` 与 `completed_text`（#1812 已由 `settle_round` 内联处理用量不确定暂停与终态文案，这两个顶层函数零调用）；
+- 可达性证据：保留项外的候选在 `main`（`bed19054`）与 `akashic-fleet` 外部插件仓库逐一核验，并检查 hua-home 当前选择的外置插件源码；未发现动态 `getattr`、字符串路由或 `__all__` 消费者。部署前检查发现实际安装的 `meme@github` 仍导入 `SpanData`，因此保留该公共类型与 `TypedDict` import。同时保留有设计契约或诊断职责的候选项（`ExecutorService.parallel_sync`、`EventMailStore.rebuild_mail_projections`、`ChannelAttachmentArtifactStore.validate_filesystem_integrity` / `incomplete_attachment_imports`、`PluginDurableDeliveries`）。
+- 能力不变：语义、公开协议、持久化 schema、迁移与运行时生命周期均不变。
+- Gate：`pyright` 全仓与改动文件均为 `0 errors`；`python3 scripts/plugin_boundary.py check --base origin/main` 通过；`python3 scripts/check_yoyo_migrations.py --base origin/main` 通过；`python3 scripts/chat_artifact_read_scenario.py` 通过；关联 pytest 51 passed；`git diff --check` 干净。
+
 ## 2026-10-05 熵清理第 4 层：删除 bus/session/scripts 的旧迁移残片
 
 - 基线：`a19f0e23`（`refactor/entropy-pr3-plugin-dead-helpers` 头），分支 `refactor/entropy-pr4-bus-session-legacy`，stacked 清理系列第 4 层，base = 第 3 层 PR 分支。生产 source set 580 文件 / Python 98,229 SLOC；候选 580 文件 / 98,098 SLOC（-0 文件、-131 SLOC；`scripts/` 不在计量口径内，`scripts/build_fts_idf.py` 101 行另计）。恢复点为本 PR 单提交 revert；只改独立 worktree，未操作正式 workspace、服务、数据库、安装 cache 或 Git refs。
@@ -122,7 +170,7 @@ SLOC 是有内容的源码行：Python 使用 AST 标出完整 docstring 表达�
 - Python SLOC：`78,896`
 - TypeScript/TSX SLOC：`8,644`
 - total production SLOC：`87,540`；30% 参考量是净减少 `26,262` SLOC，但安全停止条件优先。
-- source-root 明细：`agent 28,876`、`bootstrap 6,309`、`bus 926`、`core 2,052`、`frontend/chat/src 5,934`、`frontend/dashboard/src 2,471`、`infra 11,394`、`main.py 621`、`memory2 4,884`、`migrations 296`、`plugin_packages 422`、`plugins 17,262`、`proactive_v2 2,777`、`prompts 465`、`sdk/python/src 318`、`session 2,529`、`utils 4`。
+- source-root 明细：`agent 28,876`、`bootstrap 6,309`、`bus 926`、`core 2,052`、`frontend/plugins/akashic_clients/chat/src 5,934`、`frontend/plugins/ui/dashboard/src 2,471`、`infra 11,394`、`main.py 621`、`memory2 4,884`、`migrations 296`、`plugin_packages 422`、`plugins 17,262`、`proactive_v2 2,777`、`prompts 465`、`sdk/python/src 318`、`session 2,529`、`utils 4`。
 
 ### PR0 `chore(refactor): 建立 less-is-more 计量与门禁`
 
@@ -257,12 +305,12 @@ SLOC 是有内容的源码行：Python 使用 AST 标出完整 docstring 表达�
 ### `PR6` `refactor(chat): remove dead command adapters`
 
 - base：PR5 commit `650ddf0ac0a61ff352d0a0569197684bb567453e`，分支 `refactor/less-is-more-pr6-chat-dead-command-adapters`。
-- allowed_paths：`frontend/chat/src/components/ai-elements/prompt-input.tsx`、`frontend/chat/src/components/ui/command.tsx`（删除）、`docs/refactor/clean-code-ledger.md`；`capability_owner`：chat composer UI；core-only，mobile client 保持现有独立仓库与固定快照。
+- allowed_paths：`frontend/plugins/akashic_clients/chat/src/components/ai-elements/prompt-input.tsx`、`frontend/plugins/akashic_clients/chat/src/components/ui/command.tsx`（删除）、`docs/refactor/clean-code-ledger.md`；`capability_owner`：chat composer UI；core-only，mobile client 保持现有独立仓库与固定快照。
 - 范围：删除 `prompt-input.tsx` 对已无消费者的 `Command` import 和七个 `PromptInputCommand*` 转接包装器，并删除只被该 import 引用的 `ui/command.tsx`（`cmdk`/Dialog/Search 封装）；未修改现有 PromptInput/Attachments/Menu/Body/Footer/Submit/Textarea/Tools、`styles.css`、package dependency、移动端仓库、生成 bundle 或命令协议。
-- 历史与调用链：`frontend/chat/index.html → src/main.tsx → 现有 PromptInput` 是当前 Vite 入口；静态、AST、字符串、动态导出、CSS/HTML 与 mobile repo 搜索确认 `command.tsx` 仅由该 prompt import 到达，`PromptInputCommand*` 仅有定义、零消费者，删除不切断任何当前调用链。`cmdk` 依赖及 composer 的 incidental CSS selector 保留，避免把依赖治理混入本 PR。
+- 历史与调用链：`frontend/plugins/akashic_clients/chat/index.html → src/main.tsx → 现有 PromptInput` 是当前 Vite 入口；静态、AST、字符串、动态导出、CSS/HTML 与 mobile repo 搜索确认 `command.tsx` 仅由该 prompt import 到达，`PromptInputCommand*` 仅有定义、零消费者，删除不切断任何当前调用链。`cmdk` 依赖及 composer 的 incidental CSS selector 保留，避免把依赖治理混入本 PR。
 - 语义与状态核对：`semantic_delta: none`；现有 composer DOM、可访问性属性、键盘/鼠标事件、网络请求、stream/提交顺序、storage、持久化和 write set 均不变；删除只减少不可达定义和 import，不新增 fallback、兼容层或运行时检查。mobile-specific interaction 仍由客户端 owner 持有，本 PR 没有 core runtime/mobile 协议改动。
 - baseline：source-set digest `6586123102dce5eb3f460c0b90d12c82990bf4ea1b323dcf5fc7ee53ae4b4ba6`，文件数 `385`，Python SLOC `78,736`，TypeScript/TSX SLOC `8,644`，total production SLOC `87,380`。
-- candidate：source-set digest `57450e582acc0b3ac1076049a19c0c341e2b8960a2fd68c702256d4ba8c04c78`，文件数 `384`，Python SLOC `78,736`，TypeScript/TSX SLOC `8,451`，`frontend/chat/src` 从 `5,934` 降至 `5,741`，total production SLOC `87,187`。
+- candidate：source-set digest `57450e582acc0b3ac1076049a19c0c341e2b8960a2fd68c702256d4ba8c04c78`，文件数 `384`，Python SLOC `78,736`，TypeScript/TSX SLOC `8,451`，`frontend/plugins/akashic_clients/chat/src` 从 `5,934` 降至 `5,741`，total production SLOC `87,187`。
 - 目标与实际 SLOC 变化：production 净减少 `193` 行；raw diff 为 `223 deletions`（prompt adapter 72 行、command source 151 行），达到并超过本 PR 的净减少目标。未改变可达 composer 运行路径，不宣称额外端到端性能收益。
 - 构建对账：同一 `npm run build:chat -- --outDir` workload，base `367` files / raw `14,163,499` bytes / per-file `gzip -c` sum `3,171,311` bytes / entry `index-Dk9_Leak.js` `587,613` bytes / build digest `01eabe523427335ab7c02e6b6adf6752eac99321f90ebdf99b616129e750957a`；candidate `367` files / raw `14,147,448` bytes / gzip `3,167,344` bytes / entry `index-DV8aJw6_.js` `573,145` bytes / build digest `293c6b1eab1572e4d22598af1fcf69a9d01de021bc69dce37ac0faac305d57d0`。差异来自删除不可达 chat module，未改 CSS 或 dependency；Vite 仅保留既有大 chunk warning。
 - 测试与真实验证：`npm run typecheck` exit 0；`npm run lint` exit 0（本次无新增 lint 输出）；`npm run build:chat -- --outDir /tmp/less-is-more-pr6-chat-build-vnZnam` exit 0（Vite 5160 modules transformed）；legacy import/wrapper/source path 在 ledger 外零残留；`git diff --check`、migration append-only 和 Gate 需按下述 base 在提交前完成。
@@ -276,7 +324,7 @@ SLOC 是有内容的源码行：Python 使用 AST 标出完整 docstring 表达�
 
 - base：PR6 commit `631fc199c6e8fe2ce7d1b3d4f2b9152efe4ca1fb`，分支 `refactor/less-is-more-pr7-remove-unused-cmdk`。
 - allowed_paths：`package.json`、`docs/refactor/clean-code-ledger.md`；`capability_owner`：core chat dependency manifest；根包为 private 且无 exports，未修改 lockfile、CSS、source、mobile repo 或生成 bundle。
-- 范围：删除根 `package.json` dependencies 中唯一的 `"cmdk": "^1.1.1"` 声明。PR6 后 core source 已无 `cmdk` import、command module 或 `PromptInputCommand` consumer；`frontend/chat/src/styles.css` 的 incidental `[cmdk-root]` selector 保留，因为它不是 package consumer。plugins 无 manifest consumer；mobile stable 是独立仓库，保留其自身 source/lock 与依赖边界。
+- 范围：删除根 `package.json` dependencies 中唯一的 `"cmdk": "^1.1.1"` 声明。PR6 后 core source 已无 `cmdk` import、command module 或 `PromptInputCommand` consumer；`frontend/plugins/akashic_clients/chat/src/styles.css` 的 incidental `[cmdk-root]` selector 保留，因为它不是 package consumer。plugins 无 manifest consumer；mobile stable 是独立仓库，保留其自身 source/lock 与依赖边界。
 - 语义与状态核对：`change_type: dependency cleanup`，`semantic_delta: none`；运行时模块解析、DOM/a11y、事件、网络、storage、stream 顺序、持久化 write set、CSS 和输出 bundle 均保持不变。此次只改变根包 install graph，不新增 fallback 或兼容层；共享 Radix 依赖仍由其他包使用。
 - baseline/candidate：production source-set 与 PR6 完全相同，文件数 `384`，Python SLOC `78,736`，TypeScript/TSX SLOC `8,451`，total production SLOC `87,187`，source-set digest `57450e582acc0b3ac1076049a19c0c341e2b8960a2fd68c702256d4ba8c04c78`；production SLOC 净变化 `0`。Git tracked 中无 package-lock/pnpm-lock/yarn.lock，未宣称精确 clean-install bytes delta。
 - footprint 观察：当前主 repo 已安装 `node_modules/cmdk` 的 `du -sB1` 观察值为 `126,976` bytes、`13` files；该值仅说明本机现有安装 footprint，不等同于无 lock/floating range 下的可复现 clean-install 节省量。
@@ -1094,7 +1142,7 @@ SLOC 是有内容的源码行：Python 使用 AST 标出完整 docstring 表达�
 - Python 测试：`1484 passed`，耗时 22.55 秒
 - Pyright：`0 errors, 3119 warnings`
 - 前端 TypeScript：`npm run typecheck` 通过
-- 前端 ESLint：`0 errors, 3 warnings`，均为 `frontend/dashboard/src/main.tsx` 的既有 React Hook 依赖警告
+- 前端 ESLint：`0 errors, 3 warnings`，均为 `frontend/plugins/ui/dashboard/src/main.tsx` 的既有 React Hook 依赖警告
 - 工作区：除本地 `.codegraph/` 外无未提交代码
 - 关键历史约束：PR #105 全能力热重载、PR #109 事件流唤醒、PR #90 主动发送串行、PR #89 shell 超时取消、PR #75 memory fail-stop
 

@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from itertools import islice
@@ -194,9 +194,11 @@ class Message:
             raise type(error)(
                 f"Session {self.session_id} Message {self.message_id} metadata 损坏: {error}"
             ) from error
-        if not all(
-            isinstance(value, str) and value
-            for value in (self.message_id, self.session_id, self.author, self.source)
+        if not (
+            isinstance(self.message_id, str) and self.message_id
+            and isinstance(self.session_id, str) and self.session_id
+            and isinstance(self.author, str) and self.author
+            and isinstance(self.source, str) and self.source
         ):
             raise ValueError("消息身份、Session、作者和来源不能为空")
         if type(self.seq) is not int or self.seq < 0:
@@ -268,7 +270,12 @@ def encode_body(body: Body, *, allow_legacy: bool = True) -> str:
     )
 
 
-def _object(value: object, fields: set[str]) -> dict[str, object]:
+_CALL_REF_FIELDS = frozenset({"message_id", "part_index"})
+_PART_CONTENT_FIELDS = frozenset({"kind", "value"})
+_PART_TOOL_CALL_FIELDS = frozenset({"kind", "binding_id", "arguments"})
+
+
+def _object(value: object, fields: AbstractSet[str]) -> dict[str, object]:
     if not isinstance(value, dict) or set(cast(dict[object, object], value)) != fields:
         raise ValueError(f"消息对象字段必须为 {sorted(fields)}")
     return cast(dict[str, object], value)
@@ -279,11 +286,11 @@ def _part(value: object) -> Part:
         raise ValueError("消息 part 必须是对象")
     raw = cast(dict[str, object], value)
     if raw.get("kind") == "tool_call":
-        data = _object(raw, {"kind", "binding_id", "arguments"})
+        data = _object(raw, _PART_TOOL_CALL_FIELDS)
         return ToolCall(
             cast(str, data["binding_id"]), cast(Mapping[str, object], data["arguments"])
         )
-    data = _object(raw, {"kind", "value"})
+    data = _object(raw, _PART_CONTENT_FIELDS)
     return ContentPart(cast(str, data["kind"]), data["value"])
 
 
@@ -296,28 +303,34 @@ def _unique_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+_BODY_JSON = json.JSONDecoder(object_pairs_hook=_unique_fields)
+
+_CONTROL_FIELDS = frozenset({"kind", "action", "through_seq", "reason"})
+_BODY_FIELDS = {
+    "input": frozenset({"kind", "parts"}),
+    "output": frozenset({"kind", "parts", "finish"}),
+    "tool_result": frozenset({"kind", "parts", "call_ref", "outcome"}),
+}
+
+
 def decode_body(payload: str) -> Body:
     """在持久化边界拒绝未知结构；值域与不变量归消息构造函数。"""
-    raw: object = json.loads(payload, object_pairs_hook=_unique_fields)
+    # 共享 decoder 不持有解析状态；长会话整段恢复时避免逐条重建。
+    raw: object = _BODY_JSON.decode(payload)
     if not isinstance(raw, dict):
         raise ValueError("消息 body 必须是对象")
     data = cast(dict[str, object], raw)
     kind = data.get("kind")
     if kind == "control":
-        row = _object(data, {"kind", "action", "through_seq", "reason"})
+        row = _object(data, _CONTROL_FIELDS)
         return Control(
             cast(Literal["pause", "resume", "abandon", "failure"], row["action"]),
             cast(int, row["through_seq"]),
             cast(str | None, row["reason"]),
         )
-    fields = {
-        "input": {"kind", "parts"},
-        "output": {"kind", "parts", "finish"},
-        "tool_result": {"kind", "parts", "call_ref", "outcome"},
-    }
-    if not isinstance(kind, str) or kind not in fields:
+    if not isinstance(kind, str) or kind not in _BODY_FIELDS:
         raise ValueError("消息 body kind 无效")
-    row = _object(data, fields[kind])
+    row = _object(data, _BODY_FIELDS[kind])
     raw_parts = row["parts"]
     if not isinstance(raw_parts, list):
         raise ValueError("消息 parts 必须是数组")
@@ -329,7 +342,7 @@ def decode_body(payload: str) -> Body:
             parts,
             cast(Literal["continue", "complete", "quiet"], row["finish"]),
         )
-    call = _object(row["call_ref"], {"message_id", "part_index"})
+    call = _object(row["call_ref"], _CALL_REF_FIELDS)
     result = ToolResult(
         CallRef(cast(str, call["message_id"]), cast(int, call["part_index"])),
         cast(Literal["success", "denied", "error", "interrupted"],
@@ -451,10 +464,30 @@ class AppendChecks(Protocol):
         ...
 
 
+class UserInputs(Protocol):
+    """用户输入写入授权：唯一持有者（来源注册表）代已登记的来源绑定 author=user 的 Input 写入器。"""
+
+    def bind(
+        self, ctx: Context, *, source: str,
+        content: Mapping[str, Callable[[ContentPart], ContentReferences]],
+        part_metadata: bool = False,
+    ) -> Callable[..., MessageWriter]: ...
+
+
 class MessageWriters(Protocol):
+    # author=user 不经 bind 开放；唯一持有者领取授权后代来源绑定，持有者卸载时授权随之释放。
+    async def claim_user_inputs(self, ctx: Context) -> UserInputs: ...
+
     async def register_metadata(
         self, ctx: Context, *, keys: frozenset[str],
         update: Callable[[Body], Mapping[str, object | None]],
+    ) -> Effect: ...
+
+    # 片段 owner 登记由自己 kind 的片段派生的会话元数据；只有 bind 时声明 part_metadata 的写入者，
+    # 写入含该片段的 Input 时才在同一事务里应用。投影只能写登记的键，且不能与其他 owner 的键重叠。
+    async def register_part_metadata(
+        self, ctx: Context, *, kind: str, keys: frozenset[str],
+        update: Callable[[ContentPart], Mapping[str, object | None]],
     ) -> Effect: ...
 
     def bind(
@@ -468,7 +501,11 @@ class MessageWriters(Protocol):
         check_call: Callable[[ToolCall], None] | None = None,
         update_metadata: Callable[[Body], Mapping[str, object | None]] | None = None,
         check_metadata: Callable[[Mapping[str, object]], None] | None = None,
-    ) -> Callable[..., MessageWriter]: ...
+        part_metadata: bool = False,
+        update_activity: bool = True,
+    ) -> Callable[..., MessageWriter]:
+        """默认推进会话活跃时间；纯诊断来源可关闭，消息仍正常追加与通知。"""
+        ...
 
 
 class OwnerState(Protocol):
@@ -496,6 +533,9 @@ class SessionAdmission(Protocol):
     ) -> Effect: ...
 
     def ensure(self, ctx: Context, session_id: str, attributes: SessionAttributes) -> SessionAttributes: ...
+
+    # 外部引用一个 scope 值（如置顶）前，用维度 owner 的接纳判定确认它当前可用；没有 owner 抛 PermissionError。
+    def check_scope(self, dimension: str, value: str) -> None: ...
 
     async def ensure_async(self, ctx: Context, session_id: str, attributes: SessionAttributes) -> SessionAttributes: ...
 
@@ -586,6 +626,30 @@ class MessagePage:
     has_more: bool
 
 
+@dataclass(frozen=True, slots=True)
+class TextHit:
+    """一条正文含查询词的消息：命中数与第一处前后的摘要。"""
+
+    message_id: str
+    seq: int
+    kind: str
+    timestamp: str
+    count: int
+    before: str
+    match: str
+    after: str
+
+
+@dataclass(frozen=True, slots=True)
+class TextSearch:
+    """会话内正文查找结果：按 seq 升序的最新若干条命中消息，total 是命中消息总数。"""
+
+    hits: tuple[TextHit, ...]
+    total: int
+    capped: bool
+    through_seq: int
+
+
 class InvalidPage(ValueError):
     """调用者的分页范围或游标无效；与持久记录损坏区分。"""
 
@@ -607,8 +671,11 @@ class MessageSnapshot(Sequence[Message]):
     """固定消息读面；只提供消息和前缀关系，不持有数据库或写入能力。"""
 
     _prefix: _MessagePrefix
-    _count: int
+    _end: int
     through_seq: int
+    # 窗口读面：共享前缀中 seq > after_seq 的部分从 _start 开始；完整读面为 -1 与 0。
+    after_seq: int = -1
+    _start: int = 0
 
     @property
     def session_id(self) -> str:
@@ -619,14 +686,15 @@ class MessageSnapshot(Sequence[Message]):
         return self._prefix.revision
 
     def extends(self, previous: MessageSnapshot) -> bool:
-        """相同存储读面只追加；截短或前缀变化不能复用旧投影。"""
-        return self._prefix is previous._prefix and self._count >= previous._count
+        """相同存储读面与窗口起点只追加；截短、换窗口或前缀变化不能复用旧投影。"""
+        return (self._prefix is previous._prefix and self._start == previous._start
+                and self._end >= previous._end)
 
     def __len__(self) -> int:
-        return self._count
+        return self._end - self._start
 
     def __iter__(self) -> Iterator[Message]:
-        return islice(self._prefix.messages, self._count)
+        return islice(self._prefix.messages, self._start, self._end)
 
     @overload
     def __getitem__(self, index: int) -> Message: ...
@@ -635,12 +703,13 @@ class MessageSnapshot(Sequence[Message]):
     def __getitem__(self, index: slice) -> tuple[Message, ...]: ...
 
     def __getitem__(self, index: int | slice) -> Message | tuple[Message, ...]:
+        messages = self._prefix.messages
         if isinstance(index, slice):
-            return tuple(self._prefix.messages[i] for i in range(*index.indices(self._count)))
-        position = index + self._count if index < 0 else index
-        if not 0 <= position < self._count:
+            return tuple(messages[self._start + i] for i in range(*index.indices(len(self))))
+        position = index + len(self) if index < 0 else index
+        if not 0 <= position < len(self):
             raise IndexError(index)
-        return self._prefix.messages[position]
+        return messages[self._start + position]
 
 
 @dataclass(frozen=True, slots=True, weakref_slot=True)
@@ -663,9 +732,11 @@ class MessageCatalog(Protocol):
         self, *, prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
     ) -> Mapping[str, int]: ...
 
+    def reader(self, session_id: str) -> MessageReader: ...
+
     def prefix_revision(self) -> int | None: ...
 
-    def reader(self, session_id: str) -> MessageReader: ...
+    async def open_input_sources_async(self) -> frozenset[tuple[str, str]]: ...
 
     def attributes(self, session_id: str) -> SessionAttributes: ...
 
@@ -676,9 +747,17 @@ class MessageCatalog(Protocol):
         after: tuple[str, str] | None = None, limit: int = 50,
     ) -> SessionPage: ...
 
+    async def sessions_async(
+        self, *, prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
+        after: tuple[str, str] | None = None, limit: int = 50,
+    ) -> SessionPage: ...
+
     def snapshot_attributes(self) -> Mapping[str, SessionAttributes]: ...
 
-    def follow_metadata(self) -> AsyncGenerator[None, None]: ...
+    @property
+    def metadata_epoch(self) -> str: ...
+
+    def follow_metadata(self) -> AsyncGenerator[str, None]: ...
 
     def follow(
         self, *, poll_interval: float | None = None, wake_on: type[Body] | tuple[type[Body], ...] | None = None,
@@ -686,13 +765,33 @@ class MessageCatalog(Protocol):
     ) -> AsyncGenerator[Mapping[str, int]]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class HistoryWindow:
+    """摘要连续覆盖前缀之后的读取起点；只在签发它的账本前缀版本上成立。"""
+
+    after_seq: int
+    revision: int | None
+
+
 @runtime_checkable
 class MessageReader(Protocol):
     def incremental(self) -> MessageReader: ...
 
-    def committed_snapshot(self, *, through_seq: int | None = None) -> MessageSnapshot: ...
+    def committed_snapshot(self, *, through_seq: int | None = None, after_seq: int = -1) -> MessageSnapshot: ...
 
-    async def committed_snapshot_async(self, *, through_seq: int | None = None) -> MessageSnapshot: ...
+    async def committed_snapshot_async(
+        self, *, through_seq: int | None = None, after_seq: int = -1,
+    ) -> MessageSnapshot: ...
+
+    def committed_window(self, window: HistoryWindow | None, *, through_seq: int | None = None) -> MessageSnapshot: ...
+
+    async def committed_window_async(
+        self, window: HistoryWindow | None, *, through_seq: int | None = None,
+    ) -> MessageSnapshot: ...
+
+    def covered_window(self, message_ids: Sequence[str]) -> HistoryWindow: ...
+
+    def message_ids(self) -> tuple[str, ...]: ...
 
     async def read_async(self, consume: Callable[[MessageReader], _T]) -> _T: ...
 
@@ -712,6 +811,8 @@ class MessageReader(Protocol):
 
     @property
     def deleted(self) -> bool: ...
+
+    async def deleted_async(self) -> bool: ...
 
     @property
     def title(self) -> str | None: ...
@@ -735,6 +836,8 @@ class MessageReader(Protocol):
         self, source: str, *, after_seq: int, through_seq: int,
     ) -> int | None: ...
 
+    def result_committed(self, call: CallRef) -> bool: ...
+
     def scan_controls(
         self, consume: Callable[[Iterable[tuple[int, Control]]], _T], *,
         source: str, after_seq: int, through_seq: int,
@@ -757,13 +860,21 @@ class MessageReader(Protocol):
         self, *, before_seq: int | None = None, through_seq: int | None = None, limit: int = 50,
     ) -> MessagePage: ...
 
+    async def read_tail_async(
+        self, *, before_seq: int | None = None, through_seq: int | None = None, limit: int = 50,
+    ) -> MessagePage: ...
+
     def get(self, message_id: str) -> Message | None: ...
+
+    async def find_text_async(self, query: str, *, limit: int = 200) -> TextSearch: ...
 
     def attachments(self, message_id: str) -> tuple[AttachmentRef, ...]: ...
 
     def attachments_for(self, message_ids: tuple[str, ...]) -> tuple[AttachmentRef, ...]: ...
 
     def head(self, *, source: str | None = None) -> int: ...
+
+    async def head_async(self, *, source: str | None = None) -> int: ...
 
     def follow_heads(self) -> AsyncGenerator[int, None]: ...
 
@@ -829,6 +940,8 @@ class OwnerTransaction(Protocol):
         self, key: str, value: Mapping[str, object], *, expected_version: int | None
     ) -> OwnerRecord: ...
 
+    def delete(self, key: str, *, expected_version: int) -> None: ...
+
     def append(
         self,
         writer: MessageWriter,
@@ -887,6 +1000,10 @@ class ArtifactRead(Protocol):
     """只授予有界读取，不暴露附件路径或 repository。"""
 
     async def acquire(self, ref: AttachmentRef) -> AttachmentReadLease: ...
+
+
+class AttachmentImportError(ValueError):
+    """附件来源无法读取；调用者可修正输入，权威存储故障不属于此类。"""
 
 
 class ArtifactImport(Protocol):
@@ -973,8 +1090,12 @@ def detect_supported_image_mime(head: bytes) -> str | None:
     return None
 
 
-# 已接纳消息的主体判定来自上游 ADR 0145；这里只解释出处，不获得消息写入权限。
+# ---- Message 出处：作者身份在写入器绑定时固定，读取方只调用这里的判定（ADR 0145）。 ----
+
+
 class Actor(StrEnum):
+    """写出一条消息的主体种类；插件不再各自比较作者字符串。"""
+
     USER = "user"
     MODEL = "model"
     TOOL = "tool"
@@ -982,24 +1103,31 @@ class Actor(StrEnum):
     AUTOMATION = "automation"
 
 
+# 保留作者只表达主体种类；其余作者是写入插件自选的稳定名字，表示该插件自动产生的消息。
+# user 是经任一渠道（Web、Telegram、QQ、程序调用……）从外部进入的输入；渠道背后是谁由会话属性约束，不再细分。
 RESERVED_AUTHORS: Mapping[str, Actor] = {
-    "user": Actor.USER, "assistant": Actor.MODEL,
-    "tool": Actor.TOOL, "app": Actor.HOST,
+    "user": Actor.USER,
+    "assistant": Actor.MODEL,
+    "tool": Actor.TOOL,
+    "app": Actor.HOST,
 }
 LEGACY_SOURCE = "legacy-unattributed"
 LEGACY_AUTHOR = "legacy-attribution-unknown"
+# 对话 lane：经渠道进入的对话，以及无法再细分的迁移历史；学习与对话上下文默认只读它们。
 DIALOGUE_SOURCES: tuple[str, ...] = ("conversation", "programmatic", LEGACY_SOURCE)
 _LEGACY_ROLES: Mapping[str, Actor] = {"user": Actor.USER, "assistant": Actor.MODEL}
 
 
 @dataclass(frozen=True, slots=True)
 class Origin:
+    """一条消息的出处：主体种类与实际写入它的插件或主体名。"""
+
     actor: Actor
     producer: str
 
 
+# 解释任一已接纳消息的出处；迁移历史按保全的原始角色派生，不改写存储的作者。
 def origin(message: Message) -> Origin:
-    """迁移历史按保全的原始角色派生主体，不改写存储的作者。"""
     author = message.author
     actor = RESERVED_AUTHORS.get(author)
     if actor is not None:
@@ -1009,10 +1137,80 @@ def origin(message: Message) -> Origin:
     return Origin(Actor.AUTOMATION, author)
 
 
+# 用户输入：召回、用户事实证据与回合起点只认它，插件自动产生的输入不冒充用户发言。
+# 长度拒绝没有可保留正文时写入的提示（工具调用被截断、零正文）；历史行也是这段文字，改动要兼容旧行。
+def length_rejection_hint(budget: int) -> str:
+    return (
+        f"上次模型生成达到长度限制（输出预算 {budget} tokens，含推理）；"
+        "回复未完成，全部工具调用均未执行。请减少推理和单次输出，分段完成任务。"
+    )
+
+
+_LENGTH_REJECTION_HINT = re.compile(re.escape(length_rejection_hint(0)).replace("0", r"\d+", 1))
+# 回答到顶时写在结局里、并显示给用户的同一句话。
+LENGTH_CUT_NOTICE = "回答达到长度上限，已在此中断"
+
+
+# 被长度截断、等待续写的正文：从 generation_rejection 加正文派生，不落专门字段，回滚后旧版仍能读。
+def has_partial_text(body: Body) -> bool:
+    if not isinstance(body, Output) or body.finish != "continue":
+        return False
+    facts = next((part.value for part in body.parts
+                  if isinstance(part, ContentPart) and part.kind == "model.facts"), None)
+    if not isinstance(facts, Mapping) or facts.get("generation_rejection") != "length":
+        return False
+    text = _body_text(body)
+    return bool(text.strip()) and _LENGTH_REJECTION_HINT.fullmatch(text) is None
+
+
+def _body_text(body: Output) -> str:
+    return "".join(cast(str, part.value) for part in body.parts
+                   if isinstance(part, ContentPart) and part.kind == "text")
+
+
+# 续写段以已有正文开头说明模型重写了一遍，只取新段；否则从断点直接接上。
+def _join_segment(text: str, segment: str) -> str:
+    return segment.lstrip() if segment.lstrip().startswith(text.strip()) else text + segment
+
+
+# 最终回复只含断点之后的部分；所有要整段回答的读者（渠道、子任务、通知、程序调用、会话回读）都走这里，
+# 把同一轮的截断正文接回开头。中间隔着工具步时不是断点续写，用空行分开。
+def with_truncated_head(reader: MessageReader, message: Message) -> Message:
+    body = message.body
+    if not isinstance(body, Output) or body.finish != "complete":
+        return message
+
+    def collect(rows: Iterable[Message]) -> str:
+        head, gap = "", False
+        for row in rows:
+            if has_partial_text(row.body):
+                head = _join_segment(head + ("\n\n" if gap and head else ""), _body_text(cast(Output, row.body)))
+                gap = False
+            elif isinstance(row.body, Output):
+                gap = True
+            elif isinstance(row.body, Control) and row.body.action == "abandon":
+                head, gap = "", False
+        return head + ("\n\n" if gap and head else "")
+
+    latest_input = reader.latest_input_seq(message.source, through_seq=message.seq)
+    head = reader.scan(collect, source=message.source, through_seq=message.seq - 1,
+                       after_seq=-1 if latest_input is None else latest_input)
+    if not head:
+        return message
+    index = next((i for i, part in enumerate(body.parts)
+                  if isinstance(part, ContentPart) and part.kind == "text"), None)
+    if index is None:
+        return replace(message, body=replace(body, parts=(ContentPart("text", head.rstrip()), *body.parts)))
+    tail = cast(str, cast(ContentPart, body.parts[index]).value)
+    joined = ContentPart("text", _join_segment(head, tail))
+    return replace(message, body=replace(body, parts=(*body.parts[:index], joined, *body.parts[index + 1:])))
+
+
 def is_user_input(message: Message) -> bool:
     return isinstance(message.body, Input) and origin(message).actor is Actor.USER
 
 
+# 迁移消息只认一份已知格式的出处；格式不符说明迁移数据损坏，不能猜成某种主体。
 def _legacy_actor(message: Message) -> Actor:
     body = message.body
     if isinstance(body, Control):
@@ -1020,6 +1218,7 @@ def _legacy_actor(message: Message) -> Actor:
     parts = [part for part in body.parts
              if isinstance(part, ContentPart) and part.kind == "history.provenance"]
     if not parts:
+        # 1. 没有原始角色时只按消息用途派生；无出处的 Input 不能被当作用户发言。
         return Actor.MODEL if isinstance(body, Output) else Actor.TOOL if isinstance(body, ToolResult) else Actor.AUTOMATION
     if len(parts) != 1 or not isinstance(parts[0].value, Mapping):
         raise ValueError("历史消息必须只有一个 provenance 对象")
@@ -1028,3 +1227,27 @@ def _legacy_actor(message: Message) -> Actor:
     if value.get("schema") != "sessions.messages.v0" or not isinstance(role, str) or role not in _LEGACY_ROLES:
         raise ValueError("历史 provenance 格式未知")
     return _LEGACY_ROLES[role]
+
+
+# 本进程内由 Ledger 实际 INSERT 过、且仍有未结算 ToolCall 的 Output 映射（message_id → 未结算 part_index 集合）。
+# 公共合同模块不随插件实现热更新；工具恢复凭此区分“本进程新发调用”与“上个进程遗留调用”，
+# 避免依赖可能回拨的墙钟（ADR-0100 / #2112），并在全部回执提交后回收，避免长期进程无限增长（#2119）。
+PROCESS_CALL_OUTPUTS: dict[str, set[int]] = {}
+
+
+def mark_process_call_output(message_id: str, part_indexes: Sequence[int]) -> None:
+    if part_indexes:
+        PROCESS_CALL_OUTPUTS[message_id] = set(part_indexes)
+
+
+def resolve_process_call_output(message_id: str, part_index: int) -> None:
+    pending = PROCESS_CALL_OUTPUTS.get(message_id)
+    if pending is None:
+        return
+    pending.discard(part_index)
+    if not pending:
+        PROCESS_CALL_OUTPUTS.pop(message_id, None)
+
+
+def is_process_call_output(message_id: str) -> bool:
+    return message_id in PROCESS_CALL_OUTPUTS

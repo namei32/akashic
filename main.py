@@ -114,6 +114,7 @@ def _run_lightweight_command() -> bool:
     args = sys.argv[1:]
     if not args or args[0] not in {
         "plugin-install-trusted-batch",
+        "pkg",
     }:
         return False
     command = args[0]
@@ -131,6 +132,16 @@ def _run_lightweight_command() -> bool:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+
+    if command == "pkg":
+        from agent.plugins.packages import pkg_main
+
+        pkg_args = list(args[1:])
+        for flag in ("--config", "--workspace"):
+            while flag in pkg_args:
+                index = pkg_args.index(flag)
+                del pkg_args[index:index + 2]
+        raise SystemExit(pkg_main(pkg_args, workspace=workspace, config_path=Path(config_path)))
 
     if command == "plugin-install-trusted-batch":
         from agent.plugins.trusted_install import install_trusted_plugin_batch
@@ -297,7 +308,6 @@ def _prepare_startup_migrations(
 
 
 async def inspect_modules(config_path: str, workspace: Path) -> None:
-    import logging
     from bootstrap.cleanup import run_cleanup_steps
     from bootstrap.tools import build_core_runtime
     from core.net.http import SharedHttpResources
@@ -319,6 +329,32 @@ async def inspect_modules(config_path: str, workspace: Path) -> None:
         )
 
 
+_GIL_SWITCH_INTERVAL = 0.001
+
+
+# 停机收尾分段计时：serve 返回到事件循环关闭（默认线程池、异步生成器），再到解释器等完非守护线程。
+def _serve_gateway(config_path: str, workspace: Path) -> int:
+    import atexit
+    import time
+    from utils.timing import report
+
+    returned: list[float] = []
+
+    async def run() -> int:
+        try:
+            return await serve(config_path, workspace)
+        finally:
+            returned.append(time.monotonic())
+
+    code = asyncio.run(run())
+    closed = time.monotonic()
+    if returned:
+        report("gateway.loop_close", closed - returned[0])
+    # 解释器先 join 非守护线程再执行 atexit，所以这一段只含线程收尾。
+    _ = atexit.register(lambda: report("gateway.thread_join", time.monotonic() - closed))
+    return code
+
+
 async def serve(config_path: str, workspace: Path) -> int:
     # Web shell 与 FastAPI 只属于 gateway；插件命令客户端不加载它们。
     from agent.restart import RestartGate, SupervisorCommitChannel
@@ -326,6 +362,10 @@ async def serve(config_path: str, workspace: Path) -> int:
     from bootstrap.app import build_app_runtime
     from bootstrap.runtime_readiness import RuntimeReadiness
 
+    # 事件循环上的 SQLite 与文件系统调用每次都要重新取 GIL；后台线程占满 CPU 时，
+    # 默认 5ms 交接间隔让一次几十行的读取排上数秒（生产开机实测停顿 2.5–15s）。
+    # 1ms 把排队压到约五分之一，纯计算线程吞吐只少约 3%。
+    sys.setswitchinterval(_GIL_SWITCH_INTERVAL)
     commit_channel = SupervisorCommitChannel.from_environment()
     if commit_channel is not None:
         commit_channel.stage("gateway.starting")
@@ -542,46 +582,43 @@ async def serve(config_path: str, workspace: Path) -> int:
             runtime_task is not None and not runtime_task.done()
         )
     finally:
-        try:
-            if stop_task is not None:
-                stop_error, caller_cancel = await _settle_owned_task(
-                    stop_task,
-                    request_cancel=True,
-                )
-                deferred_cancellation = caller_cancel or deferred_cancellation
-                _record_error(stop_error)
-            if restart_task is not None:
-                restart_error, caller_cancel = await _settle_owned_task(
-                    restart_task,
-                    request_cancel=True,
-                )
-                deferred_cancellation = caller_cancel or deferred_cancellation
-                _record_error(restart_error)
-            if settings_restart_task is not None:
-                settings_error, caller_cancel = await _settle_owned_task(
-                    settings_restart_task,
-                    request_cancel=True,
-                )
-                deferred_cancellation = caller_cancel or deferred_cancellation
-                _record_error(settings_error)
-            if restart_commit_error:
-                _record_error(restart_commit_error[0])
-            if runtime_task is not None:
-                runtime_error, caller_cancel = await _settle_owned_task(
-                    runtime_task,
-                    request_cancel=runtime_cancel_requested,
-                )
-                deferred_cancellation = caller_cancel or deferred_cancellation
-                _record_error(runtime_error)
-            _record_error(deferred_cancellation)
-        finally:
-            # Guardian may resend SIGTERM before Gateway writes its close receipt.
-            for sig in registered_signal_handlers:
-                _ = loop.remove_signal_handler(sig)
-            for sig, previous_handler in fallback_signal_handlers.items():
-                _ = signal.signal(sig, previous_handler)
-            if restart_signal_registered:
-                _ = loop.remove_signal_handler(signal.SIGUSR2)
+        for sig in registered_signal_handlers:
+            _ = loop.remove_signal_handler(sig)
+        for sig, previous_handler in fallback_signal_handlers.items():
+            _ = signal.signal(sig, previous_handler)
+        if restart_signal_registered:
+            _ = loop.remove_signal_handler(signal.SIGUSR2)
+        if stop_task is not None:
+            stop_error, caller_cancel = await _settle_owned_task(
+                stop_task,
+                request_cancel=True,
+            )
+            deferred_cancellation = caller_cancel or deferred_cancellation
+            _record_error(stop_error)
+        if restart_task is not None:
+            restart_error, caller_cancel = await _settle_owned_task(
+                restart_task,
+                request_cancel=True,
+            )
+            deferred_cancellation = caller_cancel or deferred_cancellation
+            _record_error(restart_error)
+        if settings_restart_task is not None:
+            settings_error, caller_cancel = await _settle_owned_task(
+                settings_restart_task,
+                request_cancel=True,
+            )
+            deferred_cancellation = caller_cancel or deferred_cancellation
+            _record_error(settings_error)
+        if restart_commit_error:
+            _record_error(restart_commit_error[0])
+        if runtime_task is not None:
+            runtime_error, caller_cancel = await _settle_owned_task(
+                runtime_task,
+                request_cancel=runtime_cancel_requested,
+            )
+            deferred_cancellation = caller_cancel or deferred_cancellation
+            _record_error(runtime_error)
+        _record_error(deferred_cancellation)
     if primary_error is not None:
         raise primary_error
     return result
@@ -612,6 +649,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     os.environ["AKASHIC_WORKSPACE"] = str(workspace)
+    # 设置页的安装任务要用本进程实际使用的配置再调 pkg 子命令；不动 AKASHIC_CONFIG 的既有语义。
+    os.environ["AKASHIC_CORE_CONFIG"] = str(Path(config_path).resolve())
     try:
         _reject_agent_internal_plugin_action(args[0] if args else "")
     except ValueError as exc:
@@ -657,7 +696,25 @@ if __name__ == "__main__":
             sys.exit(1)
         plugin_id = args[1]
         enabled = args[0] == "plugin-enable"
+        # 实例在线时走 Gateway：与设置页同一条路径，启用前检测外部前置条件并热重载；没有运行中的实例（或没有 Gateway）才只写 patch。
+        try:
+            online = asyncio.run(invoke_plugin_command("plugin-set-enabled", (plugin_id, "on" if enabled else "off"),
+                                                       workspace=workspace, config_path=Path(config_path)))
+        except LookupError:
+            online = 3
+        if online != 3:
+            sys.exit(online)
         from agent.plugins.install import set_installed_plugin_enabled
+        from agent.plugins.manifest import plugins_root
+        from agent.plugins.prerequisites import check_before_enable, installed_head
+
+        # 离线回落（没有运行中的实例）启用时同样检测外部前置条件，与在线路径一致；停用不检查。
+        if enabled:
+            try:
+                check_before_enable(workspace, plugin_id, installed_head(plugins_root(), plugin_id))
+            except ValueError as exc:
+                print(str(exc))
+                sys.exit(1)
 
         try:
             manifest = set_installed_plugin_enabled(plugin_id, enabled=enabled, workspace=workspace)
@@ -701,7 +758,7 @@ if __name__ == "__main__":
         )
 
     if args and args[0] == "gateway":
-        sys.exit(asyncio.run(serve(config_path, workspace)))
+        sys.exit(_serve_gateway(config_path, workspace))
 
     if args and not args[0].startswith("--") and args[0] != "gateway":
         command_args = list(args[1:])
@@ -734,7 +791,7 @@ if __name__ == "__main__":
             "agent_restart、设置重启和 boot 进程树清理不可用。",
             file=sys.stderr,
         )
-        sys.exit(asyncio.run(serve(config_path, workspace)))
+        sys.exit(_serve_gateway(config_path, workspace))
     else:
         from agent.supervisor import run_supervisor
 

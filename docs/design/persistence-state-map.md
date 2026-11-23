@@ -11,29 +11,9 @@
 - 目标读者：维护者、coding agent、迁移与备份实现者、评审者
 - 关联条款：STA-001～STA-003、CTX-001、SES-001～SES-006、MEM-001～MEM-009、PLG-001～PLG-013、WSP-001～WSP-004、SCH-001～SCH-002、PRO-001～PRO-002、BAK-001
 
-## 2026-11-01：Windows Codex 控制（待评审）
+## 2026-11-14：后台空闲压缩边界
 
-[0131](../decisions/0131-codex-control-uses-shared-desktop-backend.md) 新增普通可选控制插件。
-
-| 对象与 owner | 正常增加/更新 | 失效、减少与恢复 |
-|---|---|---|
-| `codex_control` 的 `owner_records/target:<session>` | 用户明确新建或选择后更新目标，按调用 seq 拒绝迟到旧选择 | 改选只替换指针；无自动删除，原消息及选择证据保留 |
-| 同分区 `command:<effect-key>` | 新建、发送前保存 started；收到回执后保存真实结果或 unknown | 同调用只回读，不重发；原记录保留，无自动删除 |
-| 当前 WS 连接、审批项、完成窗口 | 连接时取得；上限分别为 16 个审批、128 个完成状态 | 断连/卸载只清空观察副本，不撤销 Windows 指令；重连读取真实会话 |
-| Windows `AkashicCodexControl/backend.json` 与启动日志 | 启动器更新当前 PID/创建时间/CLI/HOME/端口指针，新增日志 | 原进程身份失配即拒绝复用，不杀未知进程；日志无自动清理 |
-| Windows `Akashic Codex Control` 计划任务 / 安装器 | 显式安装时登记当前普通用户登录触发、有限重试与稳定脚本路径 | 只替换同 marker 任务，其他同名任务拒绝覆盖；停用不撤销远端效果 |
-
-图片仍由 Ledger 保存原始附件；控制插件只持有有界读租约，不改源文件或正文。
-Windows CLI 新增的消息和文件效果由 Codex 拥有；中断、断连或代码回退不证明它们已回滚。
-无业务 schema 迁移。已有状态的恢复沿原 owner 协议；正式激活仍需计划任务与 CLI 联通验收。
-
-## 2026-10-27：回复循环预算耗尽后续额
-
-[0129](../decisions/0129-exhausted-react-budget-renews-on-new-input.md) 只调整同来源日志的临时预算投影。
-新 Input、Output、ToolResult 和 failure 仍由原 owner 按既有追加协议增加；新输入在已耗尽且
-记录失败后重新取得循环额度。没有消息、工具或调用账的原位更新、逻辑失效和物理减少；
-Turn 与工具 CallRef 保持原边界。既有失败记录直接参与重建，无 schema 或数据迁移。
-代码回退保留全部消息和效果，旧版本可能再次拒绝这条未完成执行，不能把回退当作效果撤销。
+按 [0157](../decisions/0157-background-idle-compaction.md)，compaction owner 正常新增不可变摘要和一条 source=compaction 的静默 Output，并在同一 Ledger 事务推进 head。边界只含引用和统计，摘要预览只属于 UI 投影。既有 Message 与摘要不原位更新、不逻辑失效或物理减少；head 仍仅由原 owner 按 parent CAS 更新。失败整笔回滚，模型调用账保留；恢复读取原数据库与发行版身份，无新增清理或迁移权限。
 
 ## 2026-10-11：workspace 插件选择与配置（待评审）
 
@@ -41,7 +21,7 @@ Turn 与工具 CallRef 保持原边界。既有失败记录直接参与重建，
 
 | 对象与 owner | 正常增加/更新 | 失效、减少与恢复证据 |
 |---|---|---|
-| `bundle.patch.toml` / 当前 workspace 的安装与启停操作 | 增加完整插件 ID 的选择 row；更新 enabled 意图时保留 config | 卸载保留 disabled row，防止 base 再启用；安装失败只恢复本次旧选择。没有插件数据删除权 |
+| `bundle.patch.toml` / 当前 workspace 的安装与启停操作 | 增加完整插件 ID 的选择 row；启停只写 disabled，与 preset 相同时删行；没写的字段跟随 preset | 卸载保留 disabled row，防止 base 再启用；安装失败只恢复本次旧选择。没有插件数据删除权 |
 | `plugin-stable.json` / 宿主 selection | 原子发布完整已验证输入；运行时只读取已提交选择 | 新选择替代旧指针，历史 journal/恢复事实按原合同保留；换内存指针不假装外部资源已回滚 |
 | `config.input.json` / 插件配置事务 | 既有 revision 管理用户更新；bundle config 只初始化新目录 | 普通启动不覆盖现有配置，不因 row 改变而减少它 |
 | 旧 `manifest.toml` 与 `disabled_builtin` / 一次性 Yoyo | `20261011_02_bundle_choices` 先保存完整恢复计划，再写 patch、退休 Core 字段 | 旧全局清单保留但不再被正常路径读取；Core 原文保存在同目录 `.before-bundle-choices.toml`，每个 workspace 保留 `runtime/before-bundle-choices.json`。共享 config/cache 与失败重试场景核对原消息和旁支字节 |
@@ -322,13 +302,8 @@ Visuals 生成的自包含 HTML（旧版为 `akashic.visual.v1` JSON）是下表
 
 ### 3.3 自主运行、扩展与控制状态
 
-当前 Drift 插件自有库与旧主动岛目录分别核对；主动意图分阶段边界见 [Drift 设计](drift-initiative.md)。
-
 | 对象 | 正常增加 | 允许的原位或逻辑变化 | 允许物理减少的条件 |
 |---|---|---|---|
-| Drift `data_root/drift.sqlite3` 的 `initiative_control` / `initiative_control_receipts` | v3 新建控制单行；操作员按请求 ID 追加固定回执 | 暂停/恢复同事务递增控制版本；重放不改当前状态；原 proposals 沿既有合同 | 当前不得自动减少；回执与同库状态属于恢复证据；本批不迁移旧 `drift/drift.db` |
-| Drift `initiative_proposals` | v4 为新主动提案同事务增加固定联系目标 | 不更改已绑定目标；提案按原状态机更新 | 当前不得自动减少；原提案、目标和控制记录通过同一数据库备份恢复 |
-| Drift `initiative_memory_consent` / `initiative_memory_receipts` | v5 新建默认关闭状态；用户明确授权精确目标并追加幂等回执 | 撤销关闭授权并保留目标，控制版本单调递增 | 当前不得自动减少；以 Drift 同库备份、原目标和操作回执恢复 |
 | `proactive.db` | H3 后当前 runtime 不再写；H2 historical decoder 只读旧 tick、step、delivery 与 continuity | 只有名称明确的 owner handoff 可以推进连续性；当前无写 owner | 不随代码升级清理；delivery dedupe、cooldown 和连续性状态在交接前阻止 activation |
 | `wake_proactive.db` | H3 后当前 runtime 不再写；H2 historical decoder 只读 runs、observations、hazard monitor，inventory 读取 active continuity | reservoir/ACK 只由目标 source adapter 交接；其余 continuity 当前无写 owner | 不随代码升级清理；未交接 ACK、tombstone、quarantine、消费、hazard/context/timer 状态阻止 activation |
 | `drift/drift.db` | run、step、journal 持续追加 | continuum、cursor、global note 和 self state 原位更新 | 日志可以另定 retention；cursor、journal 和下一轮选择所需状态必须恢复，不能按临时 trace 清空 |
@@ -340,12 +315,12 @@ Visuals 生成的自包含 HTML（旧版为 `akashic.visual.v1` JSON）是下表
 | `web-auth/`（workspace root） | `web-auth` 插件首次启动创建 `secret`、`account.json`（scrypt 摘要）与 `initial-password`；登录写 `sessions.json`，本机命令写 `tickets.json`；全部 `0600`、加 `lock` 文件锁后原子替换 | 设置密码删除 `initial-password` 并只保留当前会话；`web-passwd` 清空全部会话；会话从签发起固定有效期（记住 90 天，否则 24 小时）；票据 120 秒过期、一次即删 | 停用或卸载插件保留目录，重新启用原账号继续有效；忘记密码只能本机重置，不提供远程找回 |
 | `plugin-data/computer/state/` | Computer Workload 中的 Chromium 增加并原位更新 profile；Gateway 更新活动状态；OpenCLI 更新登录刷新状态 | 容器停止、插件更新、禁用或普通卸载只让数据暂时无 writer，不改变或删除登录资料；重启只清除 Chromium 自己的 `Singleton*` 临时锁并收束未完成 activity | 只有名称明确的 Computer 数据永久删除操作可以物理减少；必须先停唯一 Workload writer、备份整个目录并核对恢复方式 |
 | `plugin-data/computer/screenshots/` | Computer MCP 以原子替换增加截图文件 | 普通卸载保留该有界集合 | Computer MCP 是唯一删除 owner：每次成功写入后只保留最新 32 张，并删除遗留临时文件 |
-| `plugin-data/models-builtin/litellm-capabilities.json` | 用户同步模型且远端目录通过边界校验时保存完整能力快照、schema、ETag、摘要和抓取时间 | `models` 插件以 `0600` 临时文件完成 fsync 后原子替换；刷新失败保持最近可信快照不变，读取损坏时降级到随包目录 | 普通卸载和同步失败不删除；只有名称明确的模型缓存重置或整个 workspace 删除可以减少，删除后首次离线同步会退回随包目录或 unknown |
+| `plugin-data/models-builtin/modelsdev-capabilities.json` | 用户同步模型且远端目录通过边界校验时保存裁剪后的 models.dev 能力快照、schema、ETag、摘要和抓取时间 | `models` 插件以 `0600` 临时文件完成 fsync 后原子替换；刷新失败保持最近可信快照不变，读取损坏时降级到随包目录 | 普通卸载和同步失败不删除；只有名称明确的模型缓存重置或整个 workspace 删除可以减少，删除后首次离线同步会退回随包目录或 unknown |
 | `runtime/plugin-reloads.sqlite3` | 每次热重载增加 transaction 与阶段事件；首次启动 candidate/formal runtime 前固定 old/new snapshot、old/new generation、base/candidate artifact pointer 与 `runtime_owner_boot_id`；已有 candidate 时 stable watchdog 加入同一 transaction，不另建 owner | 同一 transaction 按状态机更新 phase、failure resource、recovery target/action、单调 attempt 和 retry receipt；failure 只允许 `cleanup_failed → degraded` 单调强化且 target 不可覆盖，终态只能由 exact Host retry 成功后收束；同 boot 不做进程清理，新 supervised boot 只按已记录 old boot ID 恢复 | 当前没有自动 retention；恢复和事故审计仍依赖的记录不得自动删除，artifact/Host tombstone 只在对应 retry receipt 成功后减少 |
 | `plugin_updates`（同一 reload DB） | 可见更新前增加旧完整指针、实际候选指针、该插件原启用状态；新增 nullable `input_ref`，在固定 archive descriptor 后只由同一 update owner 从 NULL 填一次；资源 reload 首次创建时同事务固定关联 | `phase` 仍只记录安装恢复点；selection CAS、`accepted` 同步点和 active Fiber 是分离事实。旧行 `input_ref=NULL` 不猜测、不重放；实际错误原文保留，当前 `UpdateStatus` 读取 `input_ref`、selection、generation/Fiber，并保留当前 required-health failure；任意同一 `update_id` 重复安装拒绝。caller cancellation 只放弃等待，宿主继续结算；宿主 deadline 结束 accepted 等待并撤销迟到提交许可，但已进入的物理 installer、cleanup 和 busy owner 仍须结算并可恢复 | 无自动删除或 data reduction；回退不减少旧 artifact、plugin-data 或消息。新 schema 由显式 yoyo 原生备份、旧 schema 与 fresh/ALTER 后两种已知 schema 核对后只增列，旧 reload/events/rows 保持不变；owner 需保留唯一命名备份、`integrity_check` 与人工恢复路径，普通启动拒绝旧/未知 schema，不自动迁移或整库 downgrade |
 | `plugin_contract_restarts`（同一 reload DB） | 安装 owner 完成合同更新、固定新输入后按 `update_id` 追加重启要求；新 schema 由显式 Core yoyo 原生备份后只增加该表 | 不复制 input ref 或安装 phase；UpdateStatus 结合当前 selection 与实际 generation 投影 `restart_required` / active，旧 generation 可继续服务和被管理 | 不自动删除；保留旧更新、制品和业务数据。恢复证据为 `.before-contract-restart.*.bak`、完整旧行、`integrity_check`、新进程加载与禁用/卸载实际结果；不自动降级 |
 | `runtime/plugin-jobs/outcomes.sqlite` | generation-scoped plugin job 首次 admission INSERT semantic job/event/interval identity、exact snapshot/plugin/model generation、artifact/source/handler/lifecycle identity 与 queued 状态 | 同一 invocation 只按 queued→running→terminal/retry_pending 状态机更新 attempt、phase（handler/provider/documents）、error 与 result digest；跨 generation redelivery 复用同一 semantic key，不新建第二次 effect；documents phase 只由 ActivityHost forward recovery | 当前没有自动 retention；这是 event dedupe、取消与 crash recovery 证据，普通插件卸载、重载或日志清理不得删除。workspace 备份应以 SQLite online backup + integrity_check 保存；只有后续名称明确的 retention/插件数据管理操作可减少 |
-| `runtime/deliveries/settlements.sqlite` | Core 为每个 accepted Turn INSERT 一条 immutable delivery envelope 与 stable logical id | 只按 `prepared → provider_started → delivered → projected → settled` 前向更新 exact binding、provider receipt、Session message 与 opaque domain receipt；provider 调用中断进入 `failed`，明确拒绝进入 `rejected`；候选只读检查 `prepared/delivered/projected` 的 target service 仍可解析 | 当前没有 DELETE 或自动 retention；Core ledger 是 provider effect、Session projection 与领域 settle 的恢复证据。备份应覆盖数据库、WAL/SHM 并使用 SQLite online backup + `integrity_check`；只有后续名称明确的 delivery retention 操作可以减少 |
+| `runtime/deliveries/settlements.sqlite` | 不再增加：旧持久投递实现已删除，现行发送与恢复由 `plugins/delivery` 拥有 | 无；没有代码读写该文件 | 当前没有 DELETE 或自动 retention；文件是旧 provider effect、Session projection 与领域 settle 的历史证据，物理删除需单独授权 |
 | `runtime/proactive-documents/intents/<invocation-id>/` | `ProactiveDocuments.prepare_pair()` 在 DB effect 前创建，保存两份 old state（bytes 或 absent marker）、完整 new bytes、expected digest、idempotency key 与 fsync receipt | 无 DB receipt 时只允许 abort 并保持正文原状态；有 DB receipt 时只允许 ordered replace/forward recovery；partial replace 依据 old bytes 恢复两份原始状态 | commit/abort terminal receipt、目标 digest 与目录 fsync 均完成后才能删除该 intent；启动恢复不得按年龄猜测 orphan。workspace 备份必须与 outcomes.sqlite、两份 Markdown 一起覆盖该目录 |
 | `config_updates`（同一 reload DB） | 每个自身配置请求增加 request ID、旧/新 input ref；宿主更新 accepted/selected/active/failed 与错误 | 当前 selection 和实际 generation 决定是否生效；启动只恢复已选输入，不重试未提交请求 | 不自动删除；Core migration 先备份只增表。配置、凭据、历史与归档保留；关闭/卸载不减少业务状态。恢复证据为原 journal 备份、完整输入归档、selection 与实际 Fiber |
 | `runtime/plugin-stable.json` | 明确新 workspace 或显式升级创建 null 选择；缺失或损坏不能由启动补建 | 插件底座在完整正式组合闭接纳初始化成功后原子替换完整 Root 引用；已提交或结果未知时不得回写旧值冒充回滚 | 无自动删除；备份同时保留所引用的完整组合与组件归档，恢复从该引用加载，不重选当前源码或配置 |
@@ -362,7 +337,6 @@ H4 后 Core 配置、Setup、Prompt、Dashboard 与 Mobile Runtime Inspection �
 | `migrations.sqlite3` | Yoyo 在 migration step 成功后记录唯一 migration ID | 已应用回执保持不变；新增迁移只追加新的成功回执 | runtime 没有删除或回滚回执权限；只随用户明确删除整个 workspace 而减少，恢复依赖 workspace 备份与 SQLite 完整性检查 |
 | `model-registry.sqlite3` | onboarding 或设置事务增加含 credential payload 的 connection、model 和 role binding，并增加单调 revision；`model_definitions.context_window`/`max_output_tokens` 与各自 source 保存模型 capability snapshot | connection 的 key/token、Base URL、模型字段和角色绑定可原位更新；Codex token refresh 不增加模型 revision，其余成功模型事务增加 revision，旧 execution generation 只在 lease 归零后失效。预算 owner 只读取当前 generation 的 `context_window`、`max_output_tokens` 及字段来源；遗留 `effective_context_percent`/`compaction_trigger_percent` 列仅为 v1 schema identity 保留，完全惰性，不是配置或 capability source | 用户显式取消模型选择时，由 Models 在备份和 revision CAS 后删除该配置，清除其角色绑定；旧聊天会话引用回到当前 default，删除 default 则按 ID 选择仍可用的已选模型，没有候选时明确未配置。向量模型不跨空间回退；Message、Session metadata、调用账、凭据和向量数据不减少，普通模型切换不得 cascade；新数据库和备份创建时使用 `0600`，打开既有数据库与创建宿主锁时在初始化边界收紧一次；普通读写不再逐次检查或修复文件权限，WAL/SHM 由 SQLite 管理 |
 | `model-registry.sqlite3/model_calls` | Models owner 在 driver I/O 前追加一次 `started`，保存 binding 与请求摘要；不保存请求正文、原始输出或 credential | `_BoundChat.complete` 在调用 ID 通知完成后开始单调计时；首个非空文本/思考片段只更新一次 `first_token_ms`，driver 返回/抛错时与真实 usage/error 状态一起更新 `duration_ms`。无流式首段、通知失败和旧行对应耗时保持 NULL；新结算的 `failure` 保存错误类型前缀与脱敏诊断，旧失败行不改写；`next_attempt_at` 在该次失败结算时固定，恢复沿原 key 和 attempt；重开不刷新允许时间或显式次数上限。配置 revision 不变，重连只读，无自动重放或逻辑失效 | 当前不得自动减少。yoyo `20260906_06_model_call_timing` 在锁内核对已知 schema，先备份再原子加两列，并逐项核对旧字段。恢复证据为 `backups/model-call-timing/<id>/model-registry.sqlite3` 及 manifest；本轮只在一次性测试库演练，正式库未迁移 |
-| `sessions.db/messages` 的 `model.facts.replay` | Models 校验成功结算与绑定，重放数据随同一条 Output 提交 | 不可变。旧消息的缺失回执只影响请求投影，按 [0143](../decisions/0143-model-output-carries-replay-facts.md) 恢复 | 随原消息保留及备份，使用同一条 Output 恢复。移除仍遵循会话管理合同 |
 | 旧 `data/mobile/master-keys.json` | 已退役；当前代码不初始化、轮换或导入。既有文件可能仍用于旧数据恢复 | 无当前 writer；不能以源码删除推断密钥已无引用 | 无自动删除协议；名称明确的旧数据清理须先备份、扫描引用并验证恢复；原 keyset manifest 是恢复证据 |
 | `sessions.metadata.model_selection` | conversation 从真实 Input 的显式 model ref/effort 增加版本化对象，与新 Message 同事务提交；原 schema1/字符串继续只读 | 用户显式切换时更新该对象，并移除旧字符串 override；无选择输入与同 ID 重放不改 metadata。MessageWriters 按实际 Context 登记独占键，MessageLog 是新链唯一 SQL writer | 用户选择“跟随默认”时只移除 model_selection 与旧 override；无变化 clear 保留 SQL NULL，其他 metadata 不变。卸载不删保存值，原 Message 不改写或减少；SQLite 事务失败整体回滚，数据库备份和跨重开读取证明恢复 |
 | 插件贡献的 Skill/Drift skill | 插件 source 持有 skill 正文；安装把版本化副本发布到 cache，generation 从模块 `skill_roots` / `drift_skill_roots` 属性建 catalog | workspace `skills/` 和 `drift/skills/` 软链接随 active generation 重建 | 禁用/卸载插件可以移除已安装副本、catalog 和软链接；外部 canonical source 不归 workspace 或卸载流程所有 |
@@ -557,7 +531,7 @@ workspace 之外还有两组明确的全局状态：
 │   ├── plugin-archives/              不可变组件与完整组合记录
 │   ├── plugin-reloads.sqlite3         插件热重载事务与恢复阶段
 │   ├── plugin-jobs/outcomes.sqlite    插件 background job 幂等与恢复状态
-│   ├── deliveries/settlements.sqlite  通用 delivery、provider、Session projection 与领域 settle
+│   ├── deliveries/settlements.sqlite  旧持久投递的历史记录；已无代码读写
 │   ├── proactive-documents/
 │   │   └── intents/<invocation-id>/   paired Markdown old/new bytes 与恢复回执
 │   ├── plugin-rollout-fact.json       退役反馈文件；既有内容保留
@@ -707,21 +681,11 @@ H3 前的 `WakeStateStore` 保存以下表；H3 后旧 writer 已删除，H2 只
 - `plugin-data/eventmail-builtin/eventmail.sqlite3` 由 EventMail 插件拥有。`mail_envelopes` 与 `mail_transitions` 正常只追加；Content、Alert、Context 各有独立 source capability 和生命周期。三类查询 projection 允许由 EventMail 原位更新，但每次 Content 状态变化也会追加完整的 `projected` transition；四张 Content 查询表与 Alert/Context projection 都能从不可变流水确定性重建，不能反向改写 envelope。
 - 安装迁移 `20260828_01_migrate_eventmail_state` 先在线备份旧 Content 与 Wake DB，再把旧 Content、Alert、Context 写入 EventMail 并核对 schema、状态和 SQLite integrity。发布成功后，旧 `content-builtin` 目录移入 migration backup，Wake DB 删除已迁移的 Alert/Context 表并升级为 v7；运行路径不再读取两套真源。恢复证据是 migration receipt、retired Content 完整目录和 Wake SQLite backup。
 - `plugin-data/wake-builtin/wake.sqlite3` 保存 admission、seen Content、不可变 Content 初始质量、decision run 与 Timer attempt。`20260828_02_add_wake_content_scores` 先用 SQLite backup API 备份 v7，再移除失去语义的旧冷却时间并新增 v8 `content_scores(initial_score, semantic_interest, scored_at)`；现有 pending revision 由 runtime 首次维护时走普通一次评分路径补齐。每次真实 Timer fire 先追加 attempt，再读取 EventMail watermark；水位读取前可以是 `NULL`。`no_due`、`content_insufficient`、历史 `admission_rejected`、`shared`、`model_skip`、`deferred`、`cancelled_after_fire`、`failed` 都分别闭合并可由 Dashboard 查询。`cancelled_after_fire` 表示 Timer 已触发后取消，不能推断外部效果是否已经发生。新进程在领域恢复前把上一进程遗留的 `checking` 闭合为 failed，因为崩溃前可能已经越过 provider I/O。attempt 是运行诊断，不拥有三类 mail 正文。
-- `runtime/deliveries/settlements.sqlite` 由 Core 拥有。Core 不读取 EventMail DB，也不持有 EventMail closure；它只保存通用 envelope、exact channel attempt/receipt、Session projection message id 和 opaque EventMail receipt。
+- `runtime/deliveries/settlements.sqlite` 是旧持久投递留下的历史记录：通用 envelope、exact channel attempt/receipt、Session projection message id 和 opaque EventMail receipt。写入它的实现已删除，文件保留。
 - Wake 是普通组合 owner：先让 Core 到 `projected`，再让 EventMail settle，最后把 EventMail 的稳定 receipt 交回 Core confirm。两库之间不宣称原子事务；任一崩溃窗口都只向前补尚未完成的一步。
 - `rejected` 与 `failed` 是可观察终态，不自动重发、不投影 Session、不消费 Content。source-bound ACK 失败只保留 Content `delivered`，由该 source 的 `unsettled/ack` 窄口重试，不重做 Turn 或 provider delivery。
 
 **F-012：** EventMail mail、Wake attempt、provider effect、Session message 和 delivery settlement 各有唯一 owner。候选 generation 不能移除仍被 `prepared/delivered/projected` ledger row 引用的 target service；`settled/rejected/failed` 不形成该发布 fence。
-
-### 9.6 LoL 日报目标与发送回执
-
-`plugin-data/lol_tracker-builtin/matches.sqlite3` 由 LoL 插件拥有。采集事实追加并按指纹去重；
-`reports` 首次创建时与 `metadata` 的 `report-destination:<id>` 一起提交固定目标。目标记录只增不改，
-配置改选只影响新报告。正文只从空值补齐一次；新报告的 `receipt/published` 根据真实 Delivery 结果更新，
-只有 delivered 记成功。旧报告没有 destination，保留原 EventMail 提交回执及恢复路线。
-可见报告是 Ledger 中来源为 `lol_tracker` 的原消息，发送选择与回执由 Delivery 拥有。
-停用和卸载保留全部事实、正文和回执；当前没有自动删除或搬迁旧消息协议。恢复与回退边界见
-[0127](../decisions/0127-lol-reports-own-destination.md)。
 
 ## 10. 插件数据与 Skill/MCP 能力发布
 
@@ -1173,16 +1137,3 @@ Yoyo `20260909_02_execution_failures` 当时由 workspace 独占锁保护，迁�
 ## 分发来源组合（0082）
 
 `PluginSelection` 仍独占完整运行输入；停止期准备后只提交一次完整 Root。v4 descriptor 可增加不可变的 `distribution_source` commit，读取时核对归档 provenance；旧 descriptor、Root 和源码不改写。首次 distribution receipt 永久保留作为旧 cache 来源证明，启动标记不再是版本选择。内置升级只增加归档与固定 Python 环境；退役只减少当前 selection 成员，旧 cache、环境、plugin-data、配置、Message 和 Session 均不自动减少。manifest 只为新默认项增加选择，保留既有布尔值；内置停用及外置同 ID 覆盖的卸载保留 false。选择版本即接受 Core/内置 Yoyo：停止期持锁推进成功账本，迁移后才提交组合。内置配置允许由迁移更新并归档，失败重试保留已迁移输入；外置配置与数据仍由自身负责。迁移步骤只按已声明合同增加或更新状态，不授予删除权。准备/CAS/运行成功分别报告，已执行的数据写入不因旧 selection 保留而自动回滚。详见 [0082](../decisions/0082-distribution-owned-plugin-composition.md)。
-
-## Codex 回合通知
-
-`codex_notifications` 通过 Ledger OwnerState 追加 `event:<digest>`，固定原事件与目标；
-Ledger / Delivery 保存消息和投递选择。没有自动删除或历史改写协议。正常接纳、重投、
-停用和会话删除的完整边界见 [ADR-0128](../decisions/0128-codex-notifications-use-local-gateway.md)。
-
-### 多事项任务与回调恢复
-
-`sessions.db/owner_records` 中，reply 的 `work` 子空间按原用户 Input 保存目标、进度、证据、等待的作业和每次更新回执。
-jobs 独占可唤醒作业的原输入、首次登记、结算结果、去重回执和待处理索引；索引与回执在同一事务推进。
-结算后保留去重记录。恢复时读取现有消息、工具结果与投递回执，只接续仍需处理的回复。
-没有自动删除或历史回填。完整数据库备份同时保留这些记录与对应消息。见 [后台通知与主任务接续](../decisions/0113-background-job-notices.md)。

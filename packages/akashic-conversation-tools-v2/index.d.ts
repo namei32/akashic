@@ -6,8 +6,10 @@ import type { WebEntry, WebUiDisposer } from "@akashic/web-ui-v1";
  */
 export interface ConversationTab extends WebEntry {
   label: string;
-  /** 16px 线性 SVG 字符串，启动器菜单使用。 */
+  /** 16px 线性 SVG 字符串，启动器菜单与标题行直达按钮使用。 */
   icon?: string;
+  /** 带 icon 时在对话标题行右侧放置该工具的直达开关（窄屏自动收进更多菜单）。 */
+  header?: boolean;
   /**
    * 默认首次被选中才 render；需要在未打开时用 requestAttention 提示活动的标签设为 true，挂载即渲染。
    * 未选中时标签应按 onActiveChange 暂停昂贵工作。
@@ -60,6 +62,11 @@ export interface ConversationTabView {
   onSessionChange(listener: (session: string | null) => void): WebUiDisposer;
   /** 新的、未处理的 noticeId 只亮徽标，不打开工具区；重放同一 ID 无效。 */
   requestAttention(noticeId: string): void;
+  /**
+   * Agent 开始用本标签时调用（0132）：桌面端工具区收起就展开并激活本标签，不抢焦点；窄屏或工具区已展开时只亮徽标。
+   * 同一 key（如一轮的 ID）只生效一次，用户关掉后同一 key 不再弹出。
+   */
+  reveal(key: string): void;
   /** 宿主先展开并激活本标签再投递；10 秒内没有结果按 failed 回执。 */
   onIntent(listener: (intent: ConversationIntent) => ConversationIntentStatus | Promise<ConversationIntentStatus>): WebUiDisposer;
   /** 只在标签自己的点击或键盘处理函数里调用；会话已切走返回 stale，不自动发送。 */

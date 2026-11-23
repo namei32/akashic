@@ -12,8 +12,9 @@
 ## P1 · 边界②③场景的持续回归
 
 本轮接受评审指出的覆盖缺口：整栈合入后，先将
-`scripts/ledger_runtime_scenario.py` 与 `scripts/bundle_modes_scenario.py`
-接入 nightly / 手动工作流。组合场景须构建当前提交的发行制品，保留日志与
+账本运行时与组合模式的真实场景接入 nightly / 手动工作流。原
+`scripts/ledger_runtime_scenario.py` 与 `scripts/bundle_modes_scenario.py` 已退役，
+可从 `dc5be63d2` 回溯；接入前须按当前合同恢复场景。组合场景须构建当前提交的发行制品，保留日志与
 状态证据；不能用源码直载替代发行安装。再纳入派生库、旧版本迁移和未知发送
 恢复场景。本轮仅新增、重跑相关场景，尚未修改 CI 调度。
 
@@ -28,8 +29,9 @@ systemd unit 与 release 路径耦合需要独立复核；当前是评审风险�
 通道退役。待完成：
 
 - 用插件自有 migration bundle 登记的一次性重放完成线上切换，并按
-  `docker/debug/akasha_replay_compare.py` 核对历史前缀（本机副本实测：legacy 复现
-  5549/5581、相对顺序无逆序、交集身份与时间瞬间零差异）。
+  `dc5be63d2` 中的历史 `docker/debug/akasha_replay_compare.py` 核对历史前缀（本机副本实测：legacy 复现
+  5549/5581、相对顺序无逆序、交集身份与时间瞬间零差异）。脚本已退役，
+  当前重放前须按现行合同准备隔离核对入口。
 - 重放会丢掉旧图里 26 条早期 `remember` 事件。维护者已确认它们不是 Akasha 现行反馈
   通道的产物（属于很早期的 tool result），接受该偏差，不另立 carry-over 迁移。
 - `memory/akasha-v2-index.db`（约 511MB）退役后的物理删除单独授权。
@@ -80,11 +82,6 @@ systemd unit 与 release 路径耦合需要独立复核；当前是评审风险�
 - 按 [`容器与 Host Bridge 非迁移实验合同`](design/akashic-container-host-bridge-experiment-contract.md) 完成 mise/锁文件前置、本机 Local/Bridge/容器分层验证和 hua-home 隔离候选运行时；在 capability matrix、Supervisor 故障注入、OpenCode V4 Flash High 与正式状态零写入证据齐全前，不启动正式 workspace 迁移。
 - 由维护者继续确认 [`design/persistence-state-map.md`](design/persistence-state-map.md) 的 INT-009、INT-010、INT-012～INT-014，以及旧消息编辑和 turns retention；INT-001～INT-008、INT-011 已提升为 projectneed 条款。
 - 把已确认的持久化状态地图转成机器可读备份 manifest，补齐目录快照、global companion state 和隔离恢复演练；确认 snapshot 能启动只读 runtime，并读取会话、记忆、调度、插件数据和主动流程连续性。
-
-## P1 · Watch 主动联系的发布验收
-
-按 [0144](decisions/0144-watch-scoped-contact.md) 验收升级后的插件选择、原授权和待结算回执。
-隔离验证不代替正式部署或渠道送达；不再推进无人值守的通用工具执行。
 
 ## P2 · PTY resize 既有规格差距
 

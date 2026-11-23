@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from agent.plugin_composition.effect import _join_cleanup
-import os
 import inspect
 import logging
 import socket
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +16,7 @@ from typing import Any, Literal, Protocol, cast
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from core.common.file_io import shield_until_done
 from plugins.managed_processes.contract import ManagedProcessDefinition
 from agent.plugin_composition.execution import ChildProcess, ProcessSpawner
 
@@ -524,6 +524,9 @@ class ManagedProcessGenerationHost:
         )
         try:
             await self._wait_ready(generation, entry, port)
+        except asyncio.CancelledError:
+            # 卸载打断启动不是就绪失败。
+            raise
         except BaseException as error:
             await self._emit_incident(
                 generation.generation_id,
@@ -566,11 +569,16 @@ class ManagedProcessGenerationHost:
             raise RuntimeError("managed process has no process after spawn")
         url = f"http://127.0.0.1:{port}{entry.definition.readiness_path}"
         deadline = asyncio.get_running_loop().time() + entry.definition.startup_timeout_seconds
+        failures = 0
         while asyncio.get_running_loop().time() < deadline:
             if process.returncode is not None:
                 raise RuntimeError(f"managed process 启动失败: exit={process.returncode}")
             remaining = deadline - asyncio.get_running_loop().time()
-            if await asyncio.to_thread(_url_ready, url, min(0.5, remaining)):
+            ready = await asyncio.to_thread(_url_ready, url, min(0.5, remaining))
+            if not ready:
+                failures += 1
+                _note_not_ready(entry.definition.name, failures)
+            if ready:
                 await asyncio.sleep(0)
                 if process.returncode is not None:
                     raise RuntimeError(f"managed process 启动失败: exit={process.returncode}")
@@ -998,22 +1006,7 @@ class ManagedProcessGenerationHost:
 async def _await_task_after_cancellation(task: asyncio.Task[Any]) -> Any:
     """Await a critical task to completion and restore caller cancellation."""
 
-    cancelled = False
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            if task.done():
-                break
-            cancelled = True
-            continue
-    try:
-        result = task.result()
-    except asyncio.CancelledError:
-        result = None
-    if cancelled:
-        raise asyncio.CancelledError
-    return result
+    return await shield_until_done(task, ignore_task_cancel=True)
 
 
 def _task_error(task: asyncio.Task[Any], fallback: BaseException) -> BaseException:
@@ -1056,6 +1049,14 @@ class _RejectReadinessRedirect(HTTPRedirectHandler):
         newurl: str,
     ) -> Request:
         raise URLError(f"managed process readiness redirect rejected: {newurl}")
+
+
+# 就绪探测逐次失败不刷屏：首次 info，之后每连续 10 次 warning。
+def _note_not_ready(name: str, failures: int) -> None:
+    if failures == 1:
+        logger.info("[skipped] 进程 %s 就绪探测尚未通过，继续等待", name)
+    elif failures % 10 == 0:
+        logger.warning("进程 %s 就绪探测已连续失败 %d 次，仍在等待", name, failures)
 
 
 def _url_ready(url: str, timeout: float) -> bool:

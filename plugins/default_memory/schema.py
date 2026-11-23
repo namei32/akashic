@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from .event_time import parse_event_time
 
 Kind = Literal["profile", "preference", "procedure", "event"]
 
@@ -13,10 +14,18 @@ class Fact(BaseModel):
     kind: Kind
     summary: str = Field(min_length=1, max_length=2000)
     category: str = Field(default="", max_length=80)
+    happened_at: str = Field(default="", max_length=64)
     emotional_weight: float = Field(default=0, ge=0, le=10)
     tool_requirement: str = Field(default="", max_length=200)
     steps: tuple[str, ...] = Field(default=(), max_length=12)
     evidence_ids: tuple[str, ...] = Field(min_length=1, max_length=40)
+
+    @field_validator("happened_at")
+    @classmethod
+    def valid_time(cls, value: str) -> str:
+        if value:
+            parse_event_time(value)
+        return value
 
     @field_validator("summary")
     @classmethod
@@ -29,6 +38,7 @@ class Fact(BaseModel):
 class Retraction(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     memory_id: str
+    replacement_index: int | None = Field(default=None, ge=0, le=23)
     evidence_ids: tuple[str, ...] = Field(min_length=1)
     reason: str = Field(min_length=1, max_length=500)
 

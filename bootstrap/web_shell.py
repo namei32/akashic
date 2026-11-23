@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
+import hashlib
+import html as html_lib
 import json
 import logging
 import stat
@@ -22,7 +25,7 @@ from websockets.asyncio.client import ClientConnection
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.requests import ClientDisconnect
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from agent.plugin_composition.endpoints import GUARD_PROTOCOL, Endpoint, load_endpoint_plan_requirements
@@ -36,6 +39,10 @@ _WS_RECHECK_SECONDS = 5.0
 # 一次循环停顿无论多长只让在途复检失败一次；要连续失败跨过宽限才断开，未经确认的转发最长约
 # 宽限 + 复检间隔 + 守卫超时（约 45 秒），不会无限放行。
 _WS_GUARD_GRACE_SECONDS = 30.0
+# 客户端池空闲连接过期时间显著短于服务端 uvicorn timeout_keep_alive(30s) 与 5s 复检周期，避免半关闭竞态。
+_POOL_KEEPALIVE_EXPIRY_SECONDS = 4.0
+_GUARD_RETRY_DELAY_SECONDS = 0.05
+_GUARD_LOG_WINDOW_SECONDS = 60.0
 _GUARD_RESPONSE_HEADERS = {"content-type", "location", "cache-control", "retry-after", "www-authenticate"}
 
 _REQUEST_HEADERS_EXCLUDED = {
@@ -54,12 +61,16 @@ _RESPONSE_HEADERS_ALLOWED = {
     "accept-ranges",
     "cache-control",
     "content-disposition",
+    # 上游按 Accept-Encoding 压缩的响应原样转发(代理走 aiter_raw,不解码),
+    # 编码与协商头必须随行,否则客户端会把 gzip 字节当裸正文。
+    "content-encoding",
     "content-length",
     "content-range",
     "content-type",
     "content-security-policy",
     "pragma",
     "referrer-policy",
+    "vary",
     "x-content-type-options",
     "etag",
     "last-modified",
@@ -68,6 +79,12 @@ _RESPONSE_HEADERS_ALLOWED = {
     "set-cookie",
     "x-akashic-web-stale",
 }
+
+# JSON 正文由代理统一协商：超过 1KB 且浏览器接受 gzip 才压缩；超过 64KB 的压缩放到线程里，不占事件循环。
+_JSON_GZIP_MIN_BYTES = 1024
+_JSON_GZIP_THREAD_BYTES = 64 * 1024
+_JSON_GZIP_LEVEL = 5
+_JSON_RELAY_MAX_BYTES = 8 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +125,8 @@ class _HttpClients:
                 entry = _HttpClient(httpx.AsyncClient(
                     # 只限制闲置连接；长流不能占满一个新增的全局并发配额。
                     transport=httpx.AsyncHTTPTransport(uds=endpoint.address,
-                        limits=httpx.Limits(max_connections=None, max_keepalive_connections=20)),
+                        limits=httpx.Limits(max_connections=None, max_keepalive_connections=20,
+                                            keepalive_expiry=_POOL_KEEPALIVE_EXPIRY_SECONDS)),
                     base_url="http://akashic-runtime", timeout=httpx.Timeout(30.0, read=None),
                     cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=())),
                 ))
@@ -142,17 +160,51 @@ class _ProxyStreamingResponse(StreamingResponse):
         status_code: int,
         headers: Mapping[str, str],
         close: Callable[[], Awaitable[None]],
+        stopping: asyncio.Event | None = None,
     ) -> None:
         super().__init__(content, status_code=status_code, headers=headers)
         self._close = close
+        self._stopping = stopping
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         try:
-            await super().__call__(scope, receive, send)
+            if self._stopping is None:
+                await super().__call__(scope, receive, send)
+            else:
+                await self._relay_until_stopping(self._stopping, scope, receive, send)
         except ClientDisconnect:
             pass
         finally:
             await self._close()
+
+    # 事件流没有自然结尾；停机时在块边界正常收尾，浏览器按自身重连策略连到新进程。
+    async def _relay_until_stopping(self, stopping: asyncio.Event, scope: Scope,
+                                    receive: Receive, send: Send) -> None:
+        started = False
+
+        async def tracked(message: Message) -> None:
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        relay = asyncio.ensure_future(super().__call__(scope, receive, tracked))
+        stop = asyncio.ensure_future(stopping.wait())
+        try:
+            _ = await asyncio.wait({relay, stop}, return_when=asyncio.FIRST_COMPLETED)
+            if relay.done():
+                return relay.result()
+            _ = relay.cancel()
+            with suppress(asyncio.CancelledError):
+                await relay
+            if started:
+                with suppress(OSError, ClientDisconnect):
+                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            for task in (relay, stop):
+                if not task.done():
+                    _ = task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
 
 
 _WEB_CONTENT_SECURITY_POLICY = "; ".join((
@@ -162,10 +214,12 @@ _WEB_CONTENT_SECURITY_POLICY = "; ".join((
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data: blob:",
     "font-src 'self' data:",
-    "connect-src 'self'",
+    # 聊天上传前读取本页生成的附件 Blob，文本附件预览也读 data/blob。
+    "connect-src 'self' data: blob:",
     "frame-src 'self'",
     # 浏览器模块的媒体缓冲与解码 worker 不取得外部网络来源；代码高亮 worker 是同源的构建产物。
-    "media-src blob:",
+    # 聊天里已发送的视频是同源制品地址。
+    "media-src 'self' blob:",
     "worker-src 'self' blob:",
     "object-src 'none'",
     "base-uri 'none'",
@@ -176,10 +230,11 @@ _WEB_CONTENT_SECURITY_POLICY = "; ".join((
 class WebShellServer(uvicorn.Server):
     """在线程和进程入口之间发布确定的监听启动结果。"""
 
-    def __init__(self, config: uvicorn.Config) -> None:
+    def __init__(self, config: uvicorn.Config, streams_stopping: asyncio.Event | None = None) -> None:
         self._exit_loop: asyncio.AbstractEventLoop | None = None
         self._exit_event: asyncio.Event | None = None
         self._exit_requested = False
+        self._streams_stopping = streams_stopping or asyncio.Event()
         super().__init__(config)
         self.startup_event = threading.Event()
 
@@ -188,6 +243,11 @@ class WebShellServer(uvicorn.Server):
             await super().startup(sockets=sockets)
         finally:
             self.startup_event.set()
+
+    # 浏览器常驻的事件流不会自己结束；先收尾它们，优雅期只用来等普通请求。
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        self._streams_stopping.set()
+        await super().shutdown(sockets=sockets)
 
     @property
     def should_exit(self) -> bool:
@@ -242,38 +302,123 @@ class _IngressGuard:
         return False if GUARD_PROTOCOL in requires else None
 
 
+class _GuardErrorLog:
+    """按错误分类与时间窗聚合守卫故障日志：窗口内保留首次堆栈，后续重复仅记次数。"""
+
+    def __init__(self, window_seconds: float = _GUARD_LOG_WINDOW_SECONDS) -> None:
+        self._window = window_seconds
+        self._buckets: dict[str, tuple[float, int]] = {}
+
+    def record(self, code: str, error: Exception | None, *, uri: str, status_code: int | None = None) -> None:
+        now = time.monotonic()
+        existing = self._buckets.get(code)
+        if existing is not None:
+            started, suppressed = existing
+            if now - started < self._window:
+                self._buckets[code] = (started, suppressed + 1)
+                return
+            if suppressed > 0:
+                logger.warning(
+                    "Web Shell 入口守卫同类故障已聚合 code=%s suppressed=%d window_s=%.1f",
+                    code, suppressed, now - started,
+                )
+        self._buckets[code] = (now, 0)
+        if error is not None:
+            logger.error(
+                "Web Shell 入口守卫不可用 code=%s error_type=%s uri=%s",
+                code, type(error).__name__, uri, exc_info=error,
+            )
+        else:
+            logger.error(
+                "Web Shell 入口守卫返回服务端错误 code=%s status=%s uri=%s",
+                code, status_code, uri,
+            )
+
+    def flush(self) -> None:
+        now = time.monotonic()
+        for code, (started, suppressed) in tuple(self._buckets.items()):
+            if suppressed > 0:
+                logger.warning(
+                    "Web Shell 入口守卫同类故障已聚合 code=%s suppressed=%d window_s=%.1f",
+                    code, suppressed, now - started,
+                )
+        self._buckets.clear()
+
+
+def _classify_guard_error(error: httpx.HTTPError) -> tuple[str, str]:
+    if isinstance(error, httpx.ConnectError):
+        return "guard_unreachable", "入口守卫不可达"
+    if isinstance(error, (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError)):
+        return "guard_protocol_error", "入口守卫连接异常关闭"
+    if isinstance(error, httpx.TimeoutException):
+        return "guard_timeout", "入口守卫响应超时"
+    return "guard_unavailable", "入口守卫不可用"
+
+
+_RETRYABLE_GUARD_ERRORS = (
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+)
+
+
 async def _guard_verdict(clients: _HttpClients, guard: Endpoint, headers: Mapping[str, str], *,
-                         method: str, uri: str, upgrade: str, peer: str) -> Response | None:
+                         method: str, uri: str, upgrade: str, peer: str,
+                         errors: _GuardErrorLog) -> Response | None:
     """把原请求的方法、路径与头交给守卫；2xx 放行，其余响应原样作为拒绝结果。"""
     forwarded = {name: value for name, value in headers.items()
                  if name.lower() not in _REQUEST_HEADERS_EXCLUDED and name.lower() not in _SHELL_HEADERS}
     # 代理不转 Host；原值以 x-akashic-host 交给守卫做同源判断。
     forwarded.update({"x-akashic-method": method, "x-akashic-uri": uri, "x-akashic-upgrade": upgrade,
                       "x-akashic-peer": peer, "x-akashic-host": headers.get("host", "")})
-    try:
-        async with clients.open(guard) as client:
-            verdict = await client.get("/_guard/check", headers=forwarded, timeout=10)
-    except httpx.HTTPError as error:
-        logger.error("Web Shell 入口守卫不可用", exc_info=error)
-        return _runtime_unavailable(code="guard_unavailable", message="入口守卫不可用")
+    last_error: httpx.HTTPError | None = None
+    verdict: httpx.Response | None = None
+    for attempt in range(2):
+        try:
+            async with clients.open(guard) as client:
+                verdict = await client.get("/_guard/check", headers=forwarded, timeout=10)
+            last_error = None
+            break
+        except httpx.HTTPError as error:
+            last_error = error
+            if attempt == 0 and isinstance(error, _RETRYABLE_GUARD_ERRORS):
+                await asyncio.sleep(_GUARD_RETRY_DELAY_SECONDS)
+                continue
+            break
+    if last_error is not None:
+        code, message = _classify_guard_error(last_error)
+        errors.record(code, last_error, uri=uri)
+        return _runtime_unavailable(
+            html="text/html" in headers.get("accept", ""),
+            code=code,
+            message=message,
+        )
+    assert verdict is not None
     if 200 <= verdict.status_code < 300:
         return None
+    if verdict.status_code >= 500:
+        errors.record("guard_http_5xx", None, uri=uri, status_code=verdict.status_code)
     return Response(verdict.content[:65536], status_code=verdict.status_code,
                     headers={name: value for name, value in verdict.headers.items()
                              if name.lower() in _GUARD_RESPONSE_HEADERS})
 
 
-def create_web_shell_app(workspace: Path, *, wait_for_ready: bool = False) -> FastAPI:
+def create_web_shell_app(workspace: Path, *, wait_for_ready: bool = False,
+                         streams_stopping: asyncio.Event | None = None) -> FastAPI:
     """按 provider 发布的路由前缀转发；runtime 缺席时由外壳响应。"""
     plan = workspace / "runtime/endpoints.json"
+    stopping = streams_stopping or asyncio.Event()
     clients = _HttpClients()
     ingress = _IngressGuard(workspace, wait_for_ready=wait_for_ready)
+    guard_errors = _GuardErrorLog()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
+            guard_errors.flush()
             await clients.aclose()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -290,7 +435,8 @@ def create_web_shell_app(workspace: Path, *, wait_for_ready: bool = False) -> Fa
                                         code="guard_unavailable", message="入口守卫尚未就绪")
         if isinstance(guard, Endpoint):
             verdict = await _guard_verdict(clients, guard, headers, method=method,
-                                           uri=raw + ("?" + query if query else ""), upgrade=upgrade, peer=peer)
+                                           uri=raw + ("?" + query if query else ""), upgrade=upgrade, peer=peer,
+                                           errors=guard_errors)
             if verdict is not None:
                 return verdict
         return _matching_endpoint(endpoints, unquote(raw))
@@ -312,7 +458,7 @@ def create_web_shell_app(workspace: Path, *, wait_for_ready: bool = False) -> Fa
             return target
         if target is None:
             return _runtime_unavailable(html="text/html" in request.headers.get("accept", ""))
-        response = await _proxy_http(request, clients, target, raw)
+        response = await _proxy_http(request, clients, target, raw, stopping)
         response.headers.setdefault("Content-Security-Policy", _WEB_CONTENT_SECURITY_POLICY)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         return response
@@ -435,16 +581,18 @@ def create_web_shell_server(
     port: int = 2236,
     wait_for_ready: bool = False,
 ) -> WebShellServer:
+    streams_stopping = asyncio.Event()
     config = uvicorn.Config(
-        create_web_shell_app(workspace, wait_for_ready=wait_for_ready),
+        create_web_shell_app(workspace, wait_for_ready=wait_for_ready, streams_stopping=streams_stopping),
         host=host,
         port=port,
         log_level="warning",
         access_log=False,
         # 流式代理没有读取期限；停止时不能让旧浏览器请求无限阻止 Core 关闭。
-        timeout_graceful_shutdown=10,
+        # 浏览器常驻的长连接每次停机都会等满优雅期，普通请求两秒内早已结束。
+        timeout_graceful_shutdown=2,
     )
-    return WebShellServer(config)
+    return WebShellServer(config, streams_stopping)
 
 
 async def _proxy_http(
@@ -452,6 +600,7 @@ async def _proxy_http(
     clients: _HttpClients,
     endpoint: Endpoint,
     target_path: str,
+    streams_stopping: asyncio.Event,
 ) -> Response:
     """Relay one HTTP request to a workspace-owned Unix socket."""
 
@@ -474,6 +623,9 @@ async def _proxy_http(
     }
     headers["x-akashic-peer"] = request.client.host if request.client else ""
     headers["x-akashic-host"] = request.headers.get("host", "")
+    # httpx 默认自带 accept-encoding: gzip,deflate,br;代理走 aiter_raw 不解码,
+    # 上游只能按浏览器真实接受度压缩——浏览器没声明时显式 identity,不替它表态。
+    headers["accept-encoding"] = request.headers.get("accept-encoding", "identity")
 
     # 2. 借用跨越整个流式响应；异常、取消和浏览器断连都先关闭响应再归还借用。
     async with AsyncExitStack() as lifetime:
@@ -489,10 +641,72 @@ async def _proxy_http(
         except httpx.HTTPError:
             return _runtime_unavailable(html="text/html" in request.headers.get("accept", ""))
         lifetime.push_async_callback(upstream.aclose)
+        if _relays_json(request, upstream):
+            return await _json_response(request, upstream.status_code, upstream.headers, await upstream.aread())
         response_headers = {name: value for name, value in upstream.headers.items()
                             if name.lower() in _RESPONSE_HEADERS_ALLOWED}
+        event_stream = upstream.headers.get("content-type", "").startswith("text/event-stream")
         return _ProxyStreamingResponse(upstream.aiter_raw(), status_code=upstream.status_code,
-                                       headers=response_headers, close=lifetime.pop_all().aclose)
+                                       headers=response_headers, close=lifetime.pop_all().aclose,
+                                       stopping=streams_stopping if event_stream else None)
+
+
+# 只接手长度已知且不大的 JSON；没有长度（流式生成）或超过上限的正文照旧边收边转，HEAD 没有正文也照旧。
+def _relays_json(request: Request, upstream: httpx.Response) -> bool:
+    length = upstream.headers.get("content-length", "")
+    return request.method != "HEAD" and upstream.headers.get("content-type", "").startswith("application/json") \
+        and "content-encoding" not in upstream.headers \
+        and length.isdigit() and int(length) <= _JSON_RELAY_MAX_BYTES
+
+
+# 插件应用各自只回裸 JSON：模型目录、会话消息页、插件查询动辄上百 KB，远程访问时传输占大头。
+# 1. GET 成功响应带内容指纹，浏览器下次自动条件请求，没变就回 304、不传正文；
+# 2. 正文按浏览器接受度 gzip 压缩；各分支一致地把 Accept-Encoding 并入上游 Vary。
+async def _json_response(request: Request, status: int, upstream_headers: httpx.Headers, body: bytes) -> Response:
+    headers = {name: value for name, value in upstream_headers.items()
+               if name.lower() in _RESPONSE_HEADERS_ALLOWED and name.lower() not in ("content-length", "vary")}
+    headers["vary"] = _vary_with_encoding(upstream_headers.get("vary", ""))
+    if request.method == "GET" and status == 200 and "etag" not in upstream_headers:
+        etag = f'W/"{hashlib.sha256(body).hexdigest()[:24]}"'
+        headers["etag"] = etag
+        if _etag_matches(request.headers.get("if-none-match", ""), etag):
+            return Response(status_code=304, headers={name: value for name, value in headers.items()
+                                                      if name.lower() in ("etag", "cache-control", "vary")})
+    if len(body) >= _JSON_GZIP_MIN_BYTES and _accepts_gzip(request.headers.get("accept-encoding", "")):
+        body = (await asyncio.to_thread(gzip.compress, body, _JSON_GZIP_LEVEL) if len(body) > _JSON_GZIP_THREAD_BYTES
+                else gzip.compress(body, _JSON_GZIP_LEVEL))
+        headers["content-encoding"] = "gzip"
+    return Response(content=body, status_code=status, headers=headers)
+
+
+def _vary_with_encoding(upstream: str) -> str:
+    names = [item.strip() for item in upstream.split(",") if item.strip()]
+    if "*" in names or any(name.lower() == "accept-encoding" for name in names):
+        return ", ".join(names)
+    return ", ".join([*names, "Accept-Encoding"])
+
+
+# If-None-Match 按弱比较：去掉 W/ 前缀后比较，* 匹配任何现存表示。
+def _etag_matches(header: str, etag: str) -> bool:
+    tags = [item.strip() for item in header.split(",") if item.strip()]
+    return "*" in tags or etag.removeprefix("W/") in (tag.removeprefix("W/") for tag in tags)
+
+
+# gzip 的显式权重优先，没写 gzip 时才看通配符 *。
+def _accepts_gzip(value: str) -> bool:
+    weights: dict[str, float] = {}
+    for item in value.split(","):
+        coding, _, params = item.partition(";")
+        weight = 1.0
+        for param in params.split(";"):
+            key, _, raw = param.strip().partition("=")
+            if key.lower() == "q":
+                try:
+                    weight = float(raw)
+                except ValueError:
+                    weight = 0.0
+        weights[coding.strip().lower()] = weight
+    return weights.get("gzip", weights.get("*", 0.0)) > 0
 
 
 async def _proxy_websocket(
@@ -688,12 +902,56 @@ def _is_socket(path: Path) -> bool:
         return False
 
 
+_UNAVAILABLE_HTML_STYLE = (
+    ":root{--paper:#f5f4ed;--ink:#141413;--ink-2:#504e49;--ink-3:#6b6a64;"
+    "--rule:rgb(20 20 19/.18);--accent:#1b365d;--accent-ink:#faf9f5;}"
+    "@media(prefers-color-scheme:dark){:root{--paper:#181816;--ink:#ecebe4;--ink-2:#bab8af;"
+    "--ink-3:#929088;--rule:rgb(236 235 228/.22);--accent:#96b4e2;--accent-ink:#12161e;color-scheme:dark;}}"
+    "*{box-sizing:border-box}"
+    "body{margin:0;min-height:100dvh;display:grid;place-items:center;"
+    "padding:24px max(16px,env(safe-area-inset-right,0px)) 24px max(16px,env(safe-area-inset-left,0px));"
+    "background:var(--paper);color:var(--ink);"
+    'font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Noto Sans SC",sans-serif;}'
+    "main{width:min(100%,380px);display:grid;gap:12px;}"
+    ".brand{font-weight:700;font-size:14px;display:flex;gap:8px;align-items:center;color:var(--ink);}"
+    ".brand i{width:16px;height:16px;border-radius:4px;background:var(--ink);}"
+    "h1{margin:2px 0 0;font-size:22px;line-height:1.3;}"
+    "p{margin:0;color:var(--ink-2);font-size:14px;}"
+    "code{justify-self:start;padding:2px 8px;border:1px solid var(--rule);border-radius:6px;"
+    "color:var(--ink-3);font:12px/1.5 ui-monospace,Menlo,monospace;}"
+    "button{margin-top:4px;min-height:44px;padding:0 18px;justify-self:start;border:0;border-radius:8px;"
+    "background:var(--accent);color:var(--accent-ink);font:inherit;font-weight:600;cursor:pointer;}"
+    "button:disabled{opacity:.5;cursor:progress;}"
+)
+
+
 def _runtime_unavailable(*, html: bool = False, code: str = "runtime_unavailable",
                          message: str = "Runtime 尚未就绪") -> Response:
     if html:
-        return HTMLResponse("<!doctype html><meta charset=utf-8><title>Akashic</title>"
-                            f"<main><h1>{message}</h1><p>服务恢复后刷新此页面。</p></main>",
-                            status_code=503, headers={"Retry-After": "1", "Cache-Control": "no-store"})
+        safe_msg = html_lib.escape(message)
+        safe_code = html_lib.escape(code)
+        page = (
+            "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+            f"<title>{safe_msg} · Akashic</title><style>{_UNAVAILABLE_HTML_STYLE}</style></head>"
+            "<body><main role=\"alert\">"
+            "<div class=\"brand\"><i></i>Akashic</div>"
+            f"<h1>{safe_msg}</h1>"
+            "<p>服务正在准备或恢复连接，请稍候重新加载此页面。</p>"
+            f"<code data-error-code=\"{safe_code}\">{safe_code}</code>"
+            "<button type=\"button\" onclick=\"this.disabled=true;this.textContent='正在重新加载…';location.reload()\">"
+            "重新加载</button></main></body></html>"
+        )
+        return HTMLResponse(
+            page,
+            status_code=503,
+            headers={
+                "Retry-After": "1",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": _WEB_CONTENT_SECURITY_POLICY,
+            },
+        )
     return JSONResponse(status_code=503,
                         content={"code": code, "message": message},
                         headers={"Retry-After": "1"})

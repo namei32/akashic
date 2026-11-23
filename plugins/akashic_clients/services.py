@@ -6,11 +6,10 @@ Protocol；客户端插件不导入 bootstrap、Core runtime 或其他插件实�
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
-from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from collections.abc import AsyncGenerator, Callable, Mapping
+from typing import Literal, Protocol, TypeVar, runtime_checkable
 
-from plugins.channels.contract import AttachmentRef
+from plugins.channels.contract import AttachmentRef, ChannelInboundMessage
 from plugins.ui.contract import MessageDisplayReader
 from plugins.ledger.contract import (
     InvalidPage,
@@ -18,10 +17,7 @@ from plugins.ledger.contract import (
     SessionAttributes,
     SessionDeleteResult,
     SessionTitleResult,
-)
-from plugins.models.contract import (
-    ChatModelSelection,
-    ModelCatalogSnapshot,
+    TextSearch,
 )
 from plugins.ui.contract import (
     WebUiProvider as WebUiProvider,
@@ -38,6 +34,8 @@ from plugins.ledger.contract import Message
 from plugins.ui.contract import (
     PluginUiProvider as PluginUiProvider,
 )
+
+_T = TypeVar("_T")
 
 
 class MessagePagePort(Protocol):
@@ -70,15 +68,12 @@ class SessionPagePort(Protocol):
     next_cursor: tuple[str, str] | None
 
 
-class AttachmentStorePort(Protocol):
-    """客户端临时上传与 旧上传分片共享的文件 owner。"""
+class SteerPort(Protocol):
+    """生成中的插话；对话插件缺席时 stage 返回 False，客户端按普通消息发送。"""
 
-    root: Path
-    def create_path(self, prefix: str, suffix: str) -> Path: ...
-    def create_persistent_path(self, prefix: str, suffix: str) -> Path: ...
-    def create_staging_path(self, *, prefix: str = ".upload-", suffix: str = ".part") -> Path: ...
-    def publish_staging(self, staging: Path, *, prefix: str, suffix: str) -> Path: ...
-    def write_bytes(self, data: bytes, *, prefix: str, suffix: str) -> Path: ...
+    async def stage(self, session_id: str, message_id: str, message: ChannelInboundMessage) -> bool: ...
+
+    async def withdraw(self, session_id: str, message_id: str) -> bool: ...
 
 
 class ArtifactReadLeasePort(Protocol):
@@ -102,16 +97,21 @@ class MessageReaderPort(Protocol):
     def attributes(self) -> SessionAttributes: ...
     @property
     def deleted(self) -> bool: ...
+    async def deleted_async(self) -> bool: ...
     @property
     def title(self) -> str | None: ...
     @property
     def session_id(self) -> str: ...
     def head(self) -> int: ...
+    async def head_async(self) -> int: ...
     def follow(self, *, after_seq: int = -1) -> AsyncGenerator[Message, None]: ...
     def metadata(self) -> Mapping[str, object] | None: ...
     def get(self, message_id: str) -> Message | None: ...
     def read_tail(self, *, before_seq: int | None, through_seq: int | None, limit: int) -> MessagePagePort: ...
+    async def read_tail_async(self, *, before_seq: int | None, through_seq: int | None, limit: int) -> MessagePagePort: ...
+    async def find_text_async(self, query: str, *, limit: int = 200) -> TextSearch: ...
     def read_page(self, *, after_seq: int = -1, through_seq: int | None = None, limit: int = 50) -> MessagePagePort: ...
+    async def read_async(self, consume: Callable[[MessageReaderPort], _T]) -> _T: ...
 
 
 class SessionAdminPort(Protocol):
@@ -124,7 +124,12 @@ class SessionAdminPort(Protocol):
 class MessageCatalogPort(Protocol):
     def reader(self, session_id: str) -> MessageReaderPort: ...
     def sessions(self, *, prefix: str, visibility: str, after: tuple[str, str] | None, limit: int) -> SessionPagePort: ...
-    def follow_metadata(self) -> AsyncGenerator[None, None]: ...
+    async def sessions_async(self, *, prefix: str, visibility: str, after: tuple[str, str] | None, limit: int) -> SessionPagePort: ...
+    async def snapshot_heads_async(self, *, prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
+                                   ) -> Mapping[str, int]: ...
+    @property
+    def metadata_epoch(self) -> str: ...
+    def follow_metadata(self) -> AsyncGenerator[str, None]: ...
     def follow(self, *, poll_interval: float | None = None,
                prefix: str = "", visibility: Literal["listed", "internal"] | None = None,
                ) -> AsyncGenerator[Mapping[str, int], None]: ...
@@ -133,92 +138,18 @@ class MessageCatalogPort(Protocol):
 ReplyStatusPort = Callable[[str], AsyncGenerator[dict[str, object], None]]
 # 产出 None 表示回复插件未加载，无法判断哪些会话在运行。
 ActiveSessionsFollowPort = Callable[[], AsyncGenerator[frozenset[str] | None, None]]
-ModelCatalogReader = Callable[[], Awaitable[ModelCatalogSnapshot]]
-ModelSelectionReader = Callable[[Mapping[str, object]], Awaitable[ChatModelSelection]]
 
 
-
-
-class ModelCatalogUnavailable(RuntimeError): ...
-
-
-class RuntimeInspectionError(ValueError):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-
-
-class RuntimeInspectionService(Protocol):
-    async def list_documents(self) -> dict[str, object]: ...
-    async def get_document(self, document_id: str) -> dict[str, object]: ...
-    async def list_jobs(self) -> dict[str, object]: ...
-    async def get_job(self, job_id: str) -> dict[str, object]: ...
-    async def list_capabilities(self) -> dict[str, object]: ...
-    async def get_mcp(self, owner_id: str, server_name: str) -> dict[str, object]: ...
-
-
-def default_chat_model_id(snapshot: ModelCatalogSnapshot) -> str:
-    """读取已声明的 default 绑定，不为客户端编造模型。"""
-    return str(snapshot.role_bindings.get("default", ""))
-
-
-def project_unavailable_chat_runtimes(snapshot: ModelCatalogSnapshot) -> list[dict[str, str]]:
-    """只读展示连接停用或驱动缺席，不把本地可用误称远端认证成功。"""
-    connections = {item.connection_id: item for item in snapshot.connections}
-    return [
-        {
-            "id": model.model_id,
-            "model": model.model,
-            "sourceName": connections[model.connection_id].name,
-            "availability": model.availability,
-        }
-        for model in snapshot.models
-        if model.kind == "chat" and model.availability != "available"
-    ]
-
-
-def project_chat_runtimes(snapshot: ModelCatalogSnapshot) -> list[dict[str, object]]:
-    """把公共模型目录投影为既有 Web DTO。"""
-    roles_by_model: dict[str, list[str]] = {}
-    for role, model_id in snapshot.role_bindings.items():
-        roles_by_model.setdefault(model_id, []).append(role)
-    connections = {item.connection_id: item for item in snapshot.connections}
-    result: list[dict[str, object]] = []
-    for model in snapshot.models:
-        if model.kind != "chat" or model.availability != "available":
-            continue
-        connection = connections[model.connection_id]
-        capabilities = model.capabilities
-        sources = model.capability_sources
-        result.append({
-            "id": model.model_id,
-            "provider": connection.driver_id,
-            "catalogProvider": connection.driver_id,
-            "model": model.model,
-            "reasoningEffort": model.default_reasoning_effort or "",
-            "supportedReasoningEfforts": list(capabilities.supported_reasoning_efforts),
-            "sourceId": connection.connection_id,
-            "sourceName": connection.name,
-            "contextWindow": capabilities.context_window or 0,
-            "maxOutputTokens": capabilities.max_output_tokens or 0,
-            "inputModalities": list(capabilities.input_modalities),
-            "capabilitySource": sources.context_window,
-            "capabilitySources": {
-                "contextWindow": sources.context_window,
-                "maxOutputTokens": sources.max_output_tokens,
-                "inputModalities": sources.input_modalities,
-            },
-            "roles": sorted(roles_by_model.get(model.model_id, [])),
-        })
-    return result
 
 
 __all__ = [
-    "ArtifactReadLeasePort", "ArtifactStorePort", "AttachmentStorePort",
+    "ArtifactReadLeasePort", "ArtifactStorePort",
     "InvalidPage", "MessageCatalogPort", "MessageConflict", "MessageDisplayReader",
     "MessagePagePort", "MessageReaderPort", "SessionAdminPort",
     "SessionEntryPort", "SessionPagePort", "Message",
-    "ModelCatalogReader", "ModelCatalogSnapshot",
-    "ModelSelectionReader", "RuntimeInspectionError", "RuntimeInspectionService",
-    "default_chat_model_id", "project_chat_runtimes",
 ]
+
+
+# 通道停止接纳（停机或插件重载）；长连接据此正常结束，由客户端重连。
+class ChannelClosed(RuntimeError):
+    pass

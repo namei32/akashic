@@ -21,9 +21,11 @@ epoch 或 compaction 撤权状态。知道已获授工具的名称和 schema 时
 
 ## 2. 引用、view 与持久 binding
 
-- `ToolRef` 直接指向一次真实注册，只携带名称和冻结的公开描述。工具池保存实际 open、capture
-  以及 exact ref 对应的 prepare/authorize，在 view、binding 和贡献注册边界核对引用仍属于当前
-  Root 的同一个注册。工具卸载后，同名新注册不会继承旧贡献。
+- `ToolRef` 直接指向一次真实注册，只携带名称和冻结的公开描述。工具池保存实际 open、capture、
+  图标展示元数据以及 exact ref 对应的 prepare/authorize，在 view、binding 和贡献注册边界核对引用仍属于当前
+  Root 的同一个注册。工具卸载后，同名新注册不会继承旧贡献。`icon` 仅保存在注册展示元数据上
+  （支持 `declare_group(icon=...)` 组级默认与 `register(icon=...)` 单工具覆写），不写入
+  `ToolRef.description` 或 `Bindings` 归档比较字段，以保证历史消息与模型 schema 的向后兼容。
 - `ToolView` 只是一组引用。工具池用引用描述中的实际 provider plugin ID 分组，并保存 provider
   声明的组级 `always_on` 与用途。内置 provider 复用模块声明的 `desc`；未声明用途时明确显示
   “未声明用途”，不从工具名称猜测插件用途。
@@ -79,8 +81,7 @@ replay。新 Summary 正常开启新上下文，旧搜索结果只是
 模型调用格式或名称不属于当前展示时，展示层抛出 `InvalidToolCall`；ReAct 将原 wire 请求和
 拒绝原因作为 `model.tool_rejection` 内容随同一个成功模型 Output 提交，不生成 binding、
 真实 ToolCall、ToolResult 或 effect。Model 投影重放原请求与“调用未执行”的协议反馈。
-Output 仍为 continue 并计入原步数上限，所以取消、重启或执行中的新输入不能重置纠错预算。
-耗尽并记录 failure 后，新输入按 [0129](../decisions/0129-exhausted-react-budget-renews-on-new-input.md) 续额，保留原纠错事实与工具结果。混合响应
+Output 仍为 continue 并计入原步数上限，所以取消、重启或新输入不能重置纠错预算。混合响应
 中的有效调用继续走唯一的 Tools 执行链。展示实现返回未获授 binding 等内部契约错误仍直接失败。
 
 ```text
@@ -113,9 +114,9 @@ Output 仍为 continue 并计入原步数上限，所以取消、重启或执行
 | Plugin validation | 请求显式 `validation_tools`，未声明时为候选 Root 的完整 view | 只在候选隔离 Session 执行 |
 | Programmatic | 作为普通 Source 进入 reply，复用同一 presentation | 不新建独立工具池或来源特判 |
 
-conversation 的 always-on provider 是 `standard_tools`、`standard_web`、`tool_search` 和
-`message_push`；`tool_search` 提供 `load_tools`。`standard_tools` 拥有文件、编辑、shell、`write_stdin` 与 `load_skill`；
-`standard_web` 拥有 `web_fetch/web_search`。`agent_restart` 是 `message_push` 在 supervised
+conversation 的 always-on provider 是 `working_directory`、`files`、`shell`、`standard_web`、`tool_search` 和
+`message_push`；`tool_search` 提供 `load_tools`。`working_directory` 拥有会话工作目录（`set_working_directory`、`working_directory.v1`、顶栏目录；2026-10 由只剩工作目录的 standard_tools 改名，ledger 迁移把 owner state 改归新身份）；`files` 拥有 `read_file`、`list_dir`、`write_file`、`edit_file`（2026-10 拆出，工作目录在调用时借用，缺席时按配置目录访问）；`shell` 拥有 `shell`、`write_stdin`、`task_stop`（2026-10 拆出：进程归 host_execution，工作目录与后台作业通知在调用时借用，缺席时退回配置目录、不提供后台运行；收尾经 tools 的 `release`）；`skills` 拥有 `load_skill`、技能目录与 `prompt_sources.skills`（2026-10 按业务含义从 standard_tools 拆回，context 自带迁移把旧授权改给 `skills`）；`vision` 拥有 `read_image_vision`；
+`standard_web` 拥有 `web_fetch/web_search` 的参数形状与提供方选择，实际请求由 `web_search_exa`、`web_fetch_http` 等提供方插件经 `WEB_PROVIDERS` 登记完成；未配置时恰好一个提供方才自动选用，多个时要求在 `standard_web` 配置 `search_provider`/`fetch_provider`。`agent_restart` 是 `message_push` 在 supervised
 runtime 且完整送达依赖就绪时挂载的可选 child，因此沿用 `message_push` provider 组，不建立
 第二个插件 ID。Akasha 和外部公开 provider 默认只在按插件加载的结果中展示。
 

@@ -1,28 +1,85 @@
-import { currentTheme, subscribeTheme } from "@akashic/web-ui-v1";
+import { mountChat } from "@akashic/chat-app-v1";
 
 const WIDTH_KEY = "akashic.conversation.tools.width";
+const SAMPLES_KEY = "akashic.conversation.tools.samples";
 const DEFAULT_WIDTH_RATIO = 0.42;
 const MIN_PANEL_WIDTH = 360;
 const MIN_CHAT_WIDTH = 420;
+const SNAP_TUNING = { spread: 8, halfLife: 5, minWeight: 2.5, snap: 10, correctionMs: 2000, keep: 40, dwellMs: 320 };
 
-function syncFrameTheme(frame) {
-  // iframe 隐藏后再返回时核对能力，不重建 iframe 或清空编辑器。
-  const observer = new IntersectionObserver((entries) => {
-    if (entries.some((entry) => entry.isIntersecting)) frame.contentWindow?.postMessage(
-      { type: "akashic.models.changed" }, window.location.origin,
-    );
+function storedSamples() {
+  try {
+    const raw = JSON.parse(window.localStorage.getItem(SAMPLES_KEY) ?? "[]");
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((item) => item && typeof item === "object"
+      && Number.isFinite(item.width) && item.width > 0 && Number.isFinite(item.at)).slice(-SNAP_TUNING.keep);
+  } catch {
+    return [];
+  }
+}
+
+function saveSamples(samples) {
+  try {
+    window.localStorage.setItem(SAMPLES_KEY, JSON.stringify(samples));
+  } catch (error) {
+    if (!(error instanceof DOMException)) throw error;
+  }
+}
+
+function favouriteWidth(samples, t = SNAP_TUNING) {
+  const weightsOf = (list) => list.map((_, i) => 0.5 ** ((list.length - 1 - i) / t.halfLife));
+  const densityAt = (list, w, x) => list.reduce((sum, s, i) => sum + w[i] * Math.exp(-((x - s.width) ** 2) / (2 * t.spread * t.spread)), 0);
+  const supportAt = (list, w, x) => list.reduce((sum, s, i) => (Math.abs(s.width - x) <= 2 * t.spread ? sum + w[i] : sum), 0);
+  const peakOf = (list) => {
+    const w = weightsOf(list);
+    const from = Math.floor(Math.min(...list.map((s) => s.width)));
+    const to = Math.ceil(Math.max(...list.map((s) => s.width)));
+    let best = from;
+    let top = -1;
+    for (let x = from; x <= to; x += 1) {
+      const d = densityAt(list, w, x);
+      if (d > top) { top = d; best = x; }
+    }
+    return { width: best, support: supportAt(list, w, best) };
+  };
+  let current = null;
+  for (let n = 1; n <= samples.length; n += 1) {
+    const seen = samples.slice(0, n);
+    const p = peakOf(seen);
+    if (p.support < t.minWeight) current = null;
+    else if (current && Math.abs(p.width - current.width) <= t.snap) {
+      current = { width: current.width, support: supportAt(seen, weightsOf(seen), current.width) };
+    } else current = p;
+  }
+  return current;
+}
+
+function recordWidthSample(samples, width, at, t = SNAP_TUNING) {
+  const last = samples[samples.length - 1];
+  const corrected = last && at - last.at < t.correctionMs;
+  const next = corrected ? [...samples.slice(0, -1), { width, at }] : [...samples, { width, at }];
+  return next.slice(-t.keep);
+}
+
+// 聊天由 Host SDK 挂进同一文档（ADR 0126）。聊天发来的事件经 hooks 转给工作台，没有工作台时取默认值。
+function connectChat(chatHost, railActions) {
+  const hooks = { session() {}, overlay() {}, headerAction() {}, intent: async () => "unhandled" };
+  const handle = mountChat(chatHost, {
+    activateRailAction: (id) => railActions.find((entry) => entry.id === id)?.onActivate(),
+    activateHeaderAction: (id) => hooks.headerAction(id),
+    reportSession: (sessionId) => hooks.session(sessionId),
+    reportOverlay: (open) => hooks.overlay(open),
+    requestIntent: (name, session, payload) => hooks.intent(name, session, payload),
   });
-  observer.observe(frame);
-  const send = () => frame.contentWindow?.postMessage(
-    { type: "akashic.theme", themeId: currentTheme().id },
-    window.location.origin,
-  );
-  frame.addEventListener("load", send);
-  const unsubscribe = subscribeTheme(send);
-  return () => {
-    observer.disconnect();
-    unsubscribe();
-    frame.removeEventListener("load", send);
+  handle.setRailActions(railActions.map(({ id, order, label, iconSvg }) => ({ id, order, label, iconSvg })));
+  return {
+    handle,
+    hooks,
+    // 收起工具区后焦点回到输入框；聊天还没渲染出输入框时不移动焦点。
+    focusTarget: () => chatHost.querySelector("textarea") ?? undefined,
+    // 点按钮收起时回到标题行的工作台按钮；紧凑外壳里它收在「⋯」菜单中，回到菜单按钮。
+    actionTarget: () => chatHost.querySelector("button[data-header-action='workbench'], .conversation-heading__more")
+      ?? chatHost.querySelector("textarea") ?? undefined,
   };
 }
 
@@ -31,6 +88,7 @@ function checkTabs(entries) {
     if (
       typeof entry.id !== "string" || typeof entry.label !== "string"
       || (entry.icon !== undefined && (typeof entry.icon !== "string" || !entry.icon.startsWith("<svg")))
+      || (entry.header !== undefined && typeof entry.header !== "boolean")
       || (entry.background !== undefined && typeof entry.background !== "boolean")
       || (entry.multiple !== undefined && typeof entry.multiple !== "boolean")
       || (entry.hint !== undefined && (typeof entry.hint !== "string" || entry.hint.length > HINT_LIMIT))
@@ -52,7 +110,7 @@ function checkTabs(entries) {
     (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id));
 }
 
-// Shell 底栏动作：声明式投影跨 iframe 传给 chat 渲染，onActivate 留在宿主域。
+// Shell 底栏动作：声明式投影交给聊天渲染，onActivate 留在宿主这边。
 function checkRailActions(value) {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) throw new Error("对话底栏动作必须是数组");
@@ -76,26 +134,6 @@ function checkRailActions(value) {
     (left.order ?? 0) - (right.order ?? 0) || left.id.localeCompare(right.id));
 }
 
-function connectRailActions(frame, actions) {
-  const projection = actions.map(({ id, order, label, iconSvg }) => ({ id, order, label, iconSvg }));
-  const send = () => frame.contentWindow?.postMessage(
-    { type: "akashic.rail-actions", actions: projection }, window.location.origin,
-  );
-  frame.addEventListener("load", send);
-  const onMessage = (event) => {
-    if (event.source !== frame.contentWindow || event.origin !== window.location.origin) return;
-    const message = event.data;
-    if (!message || typeof message !== "object" || message.type !== "akashic.rail-action-activate") return;
-    if (typeof message.id !== "string") return;
-    actions.find((entry) => entry.id === message.id)?.onActivate();
-  };
-  window.addEventListener("message", onMessage);
-  return () => {
-    frame.removeEventListener("load", send);
-    window.removeEventListener("message", onMessage);
-  };
-}
-
 function storedWidth() {
   try {
     const value = Number.parseInt(window.localStorage.getItem(WIDTH_KEY) ?? "", 10);
@@ -114,53 +152,16 @@ function saveWidth(value) {
   }
 }
 
-function toolIcon() {
-  const icon = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  icon.setAttribute("viewBox", "0 0 24 24");
-  icon.setAttribute("aria-hidden", "true");
-  icon.innerHTML = '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M15 3v18"/>';
-  return icon;
-}
+// Codex 20×20 右栏图标：连续超椭圆圆角，作顶栏工作台开关。
+const TOOL_ICON = '<svg viewBox="0 0 20 20" fill="none" data-icon="fill" aria-hidden="true"><path fill-rule="evenodd" clip-rule="evenodd" d="M5.5 2.877C3.476 2.877 1.835 4.518 1.835 6.542V13.459C1.835 15.483 3.476 17.124 5.5 17.124H14.5C16.524 17.124 18.165 15.483 18.165 13.459V6.542C18.165 4.518 16.524 2.877 14.5 2.877H5.5ZM11.835 15.794H5.5C4.21 15.794 3.165 14.748 3.165 13.459V6.542C3.165 5.252 4.21 4.207 5.5 4.207H11.835V15.794ZM14.5 4.207C15.79 4.207 16.835 5.252 16.835 6.542V13.459C16.835 14.748 15.79 15.794 14.5 15.794H13.165V4.207H14.5Z" fill="currentColor"/></svg>';
 
-// 告知 chat 宿主右上角有工具区开关，标题带据此让出开关所占的位置；快捷键列给 chat 的快捷键面板。
-function announceTools(frame, entries) {
-  const shortcuts = [
+// 工作台的快捷键列给聊天的快捷键面板。
+function toolShortcuts(entries) {
+  return [
     { label: "打开或收起工作台", keys: shortcutKeys(HOST_SHORTCUTS.toggle) },
     { label: "工作台上下分屏", keys: shortcutKeys(HOST_SHORTCUTS.split) },
     ...entries.filter((entry) => entry.shortcut).map((entry) => ({ label: `打开${entry.label}`, keys: shortcutKeys(entry.shortcut) })),
   ];
-  const send = () => frame.contentWindow?.postMessage(
-    { type: "akashic.chat-tools", present: true, shortcuts }, window.location.origin,
-  );
-  frame.addEventListener("load", send);
-  return () => frame.removeEventListener("load", send);
-}
-
-// 通知入口的 ?session= 只消费一次，避免刷新后反复跳回同一会话。
-function takeRequestedSession() {
-  const url = new URL(window.location.href);
-  const sessionId = url.searchParams.get("session");
-  if (!sessionId) return "";
-  url.searchParams.delete("session");
-  window.history.replaceState(window.history.state, "", url);
-  return sessionId;
-}
-
-function frameSource(sessionId) {
-  return sessionId ? `/chat?embedded=1&session=${encodeURIComponent(sessionId)}` : "/chat?embedded=1";
-}
-
-// chat iframe 报告当前会话；宿主只转交给标签，不保存、不推导。
-function followChatSession(frame, onSession) {
-  const onMessage = (event) => {
-    if (event.source !== frame.contentWindow || event.origin !== window.location.origin) return;
-    const message = event.data;
-    if (!message || typeof message !== "object" || message.type !== "akashic.chat-session") return;
-    if (message.sessionId !== null && typeof message.sessionId !== "string") return;
-    onSession(message.sessionId || null);
-  };
-  window.addEventListener("message", onMessage);
-  return () => window.removeEventListener("message", onMessage);
 }
 
 const NARROW_QUERY = "(max-width: 68rem)";
@@ -189,6 +190,8 @@ const ICONS = {
   collapse: '<path d="M14 10h6M14 10V4M10 14H4M10 14v6M14 10l6-6M10 14l-6 6"/>',
   launch: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 9h18"/>',
   split: '<rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 12h18"/>',
+  chevronRight: '<path d="m9 18 6-6-6-6"/>',
+  chevronDown: '<path d="m6 9 6 6 6-6"/>',
 };
 
 // 按键换成快捷键写法（与 entry.shortcut 同一套）；输入法组合中、带 Alt 的不算。
@@ -218,7 +221,7 @@ function shortcutKeys(spec) {
 }
 
 function svgIcon(name) {
-  return `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
 }
 
 function chromeButton(className, label, icon) {
@@ -244,33 +247,19 @@ function newInstanceId() {
   return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
 }
 
-// 告知 chat 哪些意图有接受者，chat 据此决定是否显示“在侧栏打开”；不代表一定成功。
-function announceIntents(frame, entries) {
-  const names = [...new Set(entries.flatMap((entry) => entry.accepts ?? []))];
-  const send = () => frame.contentWindow?.postMessage(
-    { type: "akashic.workbench-intents", names }, window.location.origin,
-  );
-  frame.addEventListener("load", send);
-  send();
-  return () => frame.removeEventListener("load", send);
+// 告知聊天哪些意图有接受者，聊天据此决定是否显示“在侧栏打开”；不代表一定成功。
+function intentNames(entries) {
+  return [...new Set(entries.flatMap((entry) => entry.accepts ?? []))];
 }
 
-// 外层校验：只认自己 chat iframe 发来的、当前会话的、大小合规的意图；领域 payload 由接收标签校验。
-function readIntent(event, frame, session) {
-  if (event.source !== frame.contentWindow || event.origin !== window.location.origin) return null;
-  const message = event.data;
-  if (!message || typeof message !== "object" || message.type !== "akashic.workbench-intent") return null;
-  if (typeof message.id !== "string" || !message.id || message.id.length > 64) return null;
+// 外层校验：只认当前会话的、大小合规的意图；领域 payload 由接收标签校验。
+function readIntent(name, session, payload, current) {
   let size = Infinity;
   // 上限按 UTF-8 字节计（合同写的是 16 KiB）；不可序列化（循环引用、BigInt）按超限处理。
-  try { size = new TextEncoder().encode(JSON.stringify(message.payload ?? null)).byteLength; } catch { /* 见上 */ }
-  const valid = typeof message.name === "string" && INTENT_NAME.test(message.name)
-    && typeof message.session === "string" && message.session === session && size <= INTENT_LIMIT;
-  return { id: message.id, valid, intent: { id: message.id, name: message.name, session: message.session, payload: message.payload ?? null } };
-}
-
-function replyIntent(frame, id, status) {
-  frame.contentWindow?.postMessage({ type: "akashic.workbench-intent-result", id, status }, window.location.origin);
+  try { size = new TextEncoder().encode(JSON.stringify(payload ?? null)).byteLength; } catch { /* 见上 */ }
+  const valid = typeof name === "string" && INTENT_NAME.test(name)
+    && typeof session === "string" && session === current && size <= INTENT_LIMIT;
+  return valid ? { id: newInstanceId(), name, session, payload: payload ?? null } : null;
 }
 
 // 每个会话各记一份分组（上下最多两组，每组的标签与当前标签）与展开状态；只是视图偏好，读写失败时退回新标签页。
@@ -291,7 +280,11 @@ function readGroup(value) {
   if (!value || typeof value !== "object" || !Array.isArray(value.tabs)) return null;
   const tabs = value.tabs.filter((tab) => tab && typeof tab === "object"
     && (tab.tool === null || typeof tab.tool === "string") && (tab.instance === null || typeof tab.instance === "string"));
-  return { tabs, active: Number.isInteger(value.active) ? value.active : 0 };
+  const clusters = Array.isArray(value.clusters)
+    ? value.clusters.filter((c) => c && typeof c === "object" && typeof c.id === "string" && typeof c.label === "string")
+      .map((c) => ({ id: c.id, label: c.label.slice(0, TITLE_LIMIT), collapsed: c.collapsed === true }))
+    : [];
+  return { tabs, active: Number.isInteger(value.active) ? value.active : 0, clusters };
 }
 
 function saveLayout(session, layout) {
@@ -335,11 +328,7 @@ function buildChrome() {
   end.append(split, maximize, close);
   groups[0].bar.append(end);
   panel.append(groups[0].root, divider, groups[1].root);
-  const toggle = element("button", "conversation-tools-toggle");
-  toggle.type = "button";
-  toggle.setAttribute("aria-controls", panel.id);
-  toggle.append(toolIcon(), document.createElement("span"));
-  return { panel, splitter, groups, divider, split, maximize, close, toggle };
+  return { panel, splitter, groups, divider, split, maximize, close };
 }
 
 // 一组标签：标签条（标签与“+”）与内容区；标签记录的面板挂在它所在那组的内容区里。
@@ -414,32 +403,75 @@ function renderLaunch(panel, tools, onTool) {
   panel.replaceChildren(page);
 }
 
-// 分隔条：拖动与方向键调整宽度并记住，双击恢复默认比例。
+// 分隔条：拖动与方向键调整宽度并记住，支持 KDE 偏好磁吸与 320ms 悬停微调解锁，双击恢复默认比例。
 function connectSplitter(root, splitter, sizing) {
   let dragStartX = 0;
   let dragStartWidth = 0;
+  let holding = false;
+  let freeFrom = null;
+  let stillWidth = 0;
+  let dwellTimer = 0;
+  const clearSnap = () => {
+    holding = false;
+    freeFrom = null;
+    if (dwellTimer) { window.clearTimeout(dwellTimer); dwellTimer = 0; }
+    splitter.removeAttribute("data-snapped");
+  };
   const stop = (event) => {
     if (!root.classList.contains("is-resizing")) return;
     root.classList.remove("is-resizing");
+    clearSnap();
     if (splitter.hasPointerCapture(event.pointerId)) splitter.releasePointerCapture(event.pointerId);
-    sizing.set(sizing.width(), true);
+    const finalW = sizing.width();
+    sizing.set(finalW, true);
+    if (Math.round(finalW) !== Math.round(dragStartWidth)) sizing.recordSample(finalW);
   };
   splitter.addEventListener("pointerdown", (event) => {
     if (event.button !== 0) return;
     event.preventDefault();
+    clearSnap();
     dragStartX = event.clientX;
     dragStartWidth = sizing.width();
+    stillWidth = dragStartWidth;
     root.classList.add("is-resizing");
     splitter.setPointerCapture(event.pointerId);
   });
   splitter.addEventListener("pointermove", (event) => {
     if (!root.classList.contains("is-resizing")) return;
     const rtl = getComputedStyle(root).direction === "rtl";
-    sizing.set(dragStartWidth + (dragStartX - event.clientX) * (rtl ? -1 : 1));
+    const unclamped = dragStartWidth + (dragStartX - event.clientX) * (rtl ? -1 : 1);
+    const raw = Math.min(sizing.maximum(), Math.max(MIN_PANEL_WIDTH, unclamped));
+    const snapTarget = sizing.snapPoint();
+    // 解锁后从磁吸点按手的位移 1:1 跟随；位移取未钳制值，两端仍拖得到边界。
+    if (freeFrom !== null && snapTarget !== null) {
+      sizing.set(snapTarget + (unclamped - freeFrom));
+      return;
+    }
+    const wasHolding = holding;
+    holding = snapTarget !== null && Math.abs(raw - snapTarget) <= SNAP_TUNING.snap;
+    if (!holding) {
+      if (dwellTimer) { window.clearTimeout(dwellTimer); dwellTimer = 0; }
+      splitter.removeAttribute("data-snapped");
+      sizing.set(raw);
+      return;
+    }
+    if (!wasHolding) splitter.setAttribute("data-snapped", "");
+    sizing.set(snapTarget);
+    if (!wasHolding || Math.abs(raw - stillWidth) > SNAP_TUNING.snap / 6) {
+      stillWidth = raw;
+      if (dwellTimer) window.clearTimeout(dwellTimer);
+      dwellTimer = window.setTimeout(() => {
+        if (!root.classList.contains("is-resizing") || !holding) return;
+        freeFrom = unclamped;
+        holding = false;
+        dwellTimer = 0;
+        splitter.removeAttribute("data-snapped");
+      }, SNAP_TUNING.dwellMs);
+    }
   });
   splitter.addEventListener("pointerup", stop);
   splitter.addEventListener("pointercancel", stop);
-  splitter.addEventListener("dblclick", () => sizing.reset());
+  splitter.addEventListener("dblclick", () => { clearSnap(); sizing.reset(); });
   splitter.addEventListener("keydown", (event) => {
     const rtl = getComputedStyle(root).direction === "rtl";
     let next = sizing.width();
@@ -492,6 +524,9 @@ function connectDivider(panel, divider) {
 // 宽度：全局一份；没有记录时按页面宽度的默认比例。
 function createSizing(root, splitter) {
   const saved = storedWidth();
+  let samples = storedSamples();
+  // 磁吸点只随样本变：拖动每帧都要问，KDE 全量重算放在初始化和记样本时。
+  let favourite = favouriteWidth(samples);
   const state = { width: saved ?? 0, preferred: saved ?? 0, useDefault: saved === null };
   const maximum = () => Math.max(MIN_PANEL_WIDTH, root.clientWidth - MIN_CHAT_WIDTH);
   const set = (value, persist = false) => {
@@ -505,13 +540,19 @@ function createSizing(root, splitter) {
     state.preferred = state.width;
     saveWidth(state.width);
   };
+  const recordSample = (width) => {
+    samples = recordWidthSample(samples, Math.round(width), Date.now());
+    favourite = favouriteWidth(samples);
+    saveSamples(samples);
+  };
+  const snapPoint = () => (favourite ? Math.min(maximum(), Math.max(MIN_PANEL_WIDTH, favourite.width)) : null);
   const fit = () => set(state.useDefault ? root.clientWidth * DEFAULT_WIDTH_RATIO : state.preferred);
   const reset = () => {
     state.useDefault = true;
     clearWidth();
     fit();
   };
-  return { width: () => state.width, maximum, set, fit, reset };
+  return { width: () => state.width, maximum, set, fit, reset, recordSample, snapPoint };
 }
 
 // 标签挂载与父视图的生命周期，按标签记录（工具 + 实例）计。每个记录只 render 一次：先占位再 render，
@@ -540,6 +581,7 @@ function createTabLifecycle(tools, isActive, currentSession, hooks) {
       get session() { return sessionOf(record); },
       onSessionChange: (listener) => subscribe("session", record.key, listener, { value: sessionOf(record) }),
       requestAttention: (noticeId) => hooks.attention(record, noticeId),
+      reveal: (key) => hooks.reveal(record, key),
       onIntent: (listener) => subscribe("intent", record.key, listener, null),
       quote: (request) => hooks.quote(request),
       instance: record.instance,
@@ -617,7 +659,7 @@ function createRecords(entries, content) {
   const singles = new Map();
   let launchSeq = 0;
   const make = (key, entry, instance, session) => {
-    const record = { key, entry, instance, session, title: null, indicator: null, attention: false, panel: toolPanel(key) };
+    const record = { key, entry, instance, session, title: null, indicator: null, attention: false, clusterId: null, panel: toolPanel(key) };
     Object.assign(record, buildTabItem(record));
     content.append(record.panel);
     return record;
@@ -632,8 +674,8 @@ function createRecords(entries, content) {
   };
 }
 
-function newGroup(tabs, activeKey = undefined) {
-  return { tabs, activeKey: activeKey ?? tabs[0]?.key ?? null };
+function newGroup(tabs, activeKey = undefined, clusters = []) {
+  return { tabs, activeKey: activeKey ?? tabs[0]?.key ?? null, clusters: clusters.map((c) => ({ ...c })) };
 }
 
 function titleOf(record, order) {
@@ -653,19 +695,20 @@ function readIndicator(value) {
 
 // 工具区状态的唯一 owner：本会话的分组（上下最多两组，各自的标签顺序与当前标签）、展开与铺满。
 // 标签只经 view 读到可见事实与当前会话。
-function mountTools(root, frame, tools, entries) {
+function mountTools(root, chat, tools, entries) {
   const chrome = buildChrome();
   const sizing = createSizing(root, chrome.splitter);
   const narrow = window.matchMedia(NARROW_QUERY);
   const records = createRecords(entries, chrome.groups[0].content);
   const state = {
     open: false, maximized: false, session: null, groups: [newGroup([records.launch()])], focus: 0,
-    // chat 的模态层（窄屏导航抽屉等）在 iframe 内，盖不住宿主的浮动开关；打开期间收起开关。
+    // 聊天的模态层（窄屏导航抽屉等）盖不住宿主的浮动开关；打开期间收起开关。
     chatOverlay: false,
     // 窄屏恢复布局时只是暂不展开；记下的仍是用户的展开偏好，用户自己开关后清除。
     held: false,
   };
   const handled = new Set();
+  const revealed = new Set();
   const shortcuts = new Map(entries.filter((entry) => entry.shortcut).map((entry) => [entry.shortcut, entry]));
   const allTabs = () => state.groups.flatMap((group) => group.tabs);
   const groupOf = (record) => state.groups.find((group) => group.tabs.includes(record)) ?? null;
@@ -673,13 +716,23 @@ function mountTools(root, frame, tools, entries) {
   const activeOf = (group) => group.tabs.find((record) => record.key === group.activeKey) ?? null;
   const activeRecord = () => activeOf(focusedGroup());
   const isActive = (key) => state.open && state.groups.some((group) => group.activeKey === key);
-  // 活动只提示；打开、关闭与切换由用户决定，包括移动端。
+  // 活动只提示；关闭与切换由用户决定。例外是 reveal（0132）：桌面端工具区收起时展开到该标签，
+  // 同一 key 只一次，用户关掉后这一轮不再弹出；窄屏和工具区已展开时只亮徽标。
   const lifecycle = createTabLifecycle(tools, isActive, () => state.session, {
     attention(record, noticeId) {
       if (typeof noticeId !== "string" || !noticeId || handled.has(noticeId)) return;
       handled.add(noticeId);
       if (!isActive(record.key)) record.attention = true;
       update();
+    },
+    reveal(record, key) {
+      if (typeof key !== "string" || !key || revealed.has(key)) return;
+      revealed.add(key);
+      if (state.open || narrow.matches || state.chatOverlay) {
+        if (!isActive(record.key)) record.attention = true;
+        update();
+      } else if (record.entry && !record.instance) openTool(record.entry);
+      else activate(record.key);
     },
     quote: (request) => forwardQuote(request),
     title(record, title) {
@@ -709,13 +762,91 @@ function mountTools(root, frame, tools, entries) {
   });
   let disposed = false;
   let dragging = null;
+  const selectedKeys = new Set();
+  const clusterNodes = new Map();
+
+  function cleanClusters(group) {
+    const counts = new Map();
+    for (const record of group.tabs) {
+      if (record.clusterId) counts.set(record.clusterId, (counts.get(record.clusterId) ?? 0) + 1);
+    }
+    group.clusters = group.clusters.filter((cluster) => (counts.get(cluster.id) ?? 0) >= 2);
+    const liveIds = new Set(group.clusters.map((cluster) => cluster.id));
+    for (const record of group.tabs) {
+      if (record.clusterId && !liveIds.has(record.clusterId)) record.clusterId = null;
+    }
+  }
+
+  function buildClusterPill(cluster, members, group) {
+    let pill = clusterNodes.get(cluster.id);
+    if (!pill) {
+      const rootEl = element("div", "conversation-tools-cluster");
+      const toggleBtn = element("button", "conversation-tools-cluster-pill");
+      toggleBtn.type = "button";
+      const icon = element("span", "conversation-tools-cluster-chevron");
+      const label = element("span", "conversation-tools-cluster-label");
+      const count = element("span", "conversation-tools-cluster-count");
+      const dot = element("span", "conversation-tools-tab-dot");
+      toggleBtn.append(icon, label, count, dot);
+      const ungroupBtn = chromeButton("conversation-tools-cluster-ungroup", "解散分组", "close");
+      rootEl.append(toggleBtn, ungroupBtn);
+      pill = { rootEl, toggleBtn, icon, label, count, ungroupBtn };
+      clusterNodes.set(cluster.id, pill);
+    }
+    const hasActive = members.some((record) => record.key === group.activeKey);
+    const hasBusy = members.some((record) => record.indicator?.busy);
+    const hasAttention = members.some((record) => record.attention);
+    pill.rootEl.classList.toggle("is-collapsed", cluster.collapsed);
+    pill.rootEl.classList.toggle("has-active", hasActive);
+    pill.rootEl.classList.toggle("is-busy", hasBusy);
+    pill.rootEl.classList.toggle("has-attention", hasAttention);
+    pill.toggleBtn.setAttribute("aria-expanded", String(!cluster.collapsed));
+    pill.toggleBtn.title = `${cluster.label} (${members.length}) · 点击${cluster.collapsed ? "展开" : "折叠"}分组`;
+    pill.icon.innerHTML = svgIcon(cluster.collapsed ? "chevronRight" : "chevronDown");
+    pill.label.textContent = cluster.label;
+    pill.count.textContent = String(members.length);
+    pill.toggleBtn.onclick = () => {
+      cluster.collapsed = !cluster.collapsed;
+      update();
+      remember();
+    };
+    pill.ungroupBtn.onclick = (event) => {
+      event.stopPropagation();
+      ungroupCluster(group, cluster.id);
+    };
+    return pill.rootEl;
+  }
+
+  function groupSelectedIn(group) {
+    const members = group.tabs.filter((record) => selectedKeys.has(record.key));
+    if (members.length < 2) return false;
+    const id = newInstanceId();
+    const firstLabel = members[0].label ?? members[0].entry?.label ?? "标签组";
+    const firstIndex = group.tabs.indexOf(members[0]);
+    const remaining = group.tabs.filter((record) => !selectedKeys.has(record.key));
+    for (const record of members) record.clusterId = id;
+    remaining.splice(Math.min(firstIndex, remaining.length), 0, ...members);
+    group.tabs = remaining;
+    group.clusters.push({ id, label: firstLabel, collapsed: false });
+    cleanClusters(group);
+    for (const record of members) selectedKeys.delete(record.key);
+    update();
+    remember();
+    return true;
+  }
+
+  function ungroupCluster(group, clusterId) {
+    for (const record of group.tabs) if (record.clusterId === clusterId) record.clusterId = null;
+    group.clusters = group.clusters.filter((cluster) => cluster.id !== clusterId);
+    update();
+    remember();
+  }
 
   function update() {
     root.classList.toggle("tools-open", state.open);
     root.classList.toggle("tools-maximized", state.open && state.maximized);
     chrome.panel.hidden = !state.open;
     chrome.splitter.hidden = !state.open;
-    chrome.toggle.hidden = state.open || state.chatOverlay;
     const maximizeLabel = state.maximized ? "还原" : "铺满";
     chrome.maximize.title = maximizeLabel;
     chrome.maximize.setAttribute("aria-label", maximizeLabel);
@@ -742,24 +873,55 @@ function mountTools(root, frame, tools, entries) {
     const counts = new Map();
     chrome.groups.forEach((shell, index) => {
       const group = state.groups[index];
+      if (group) cleanClusters(group);
+      const renderedClusters = new Set();
+      const items = [];
+      const selectedCount = group ? group.tabs.filter((record) => selectedKeys.has(record.key)).length : 0;
       for (const record of group?.tabs ?? []) {
         const order = record.entry ? (counts.get(record.entry.id) ?? 0) + 1 : 0;
         if (record.entry) counts.set(record.entry.id, order);
-        paintTab(record, group, titleOf(record, order));
+        const cluster = record.clusterId ? group.clusters.find((c) => c.id === record.clusterId) : null;
+        paintTab(record, group, titleOf(record, order), cluster);
+        if (cluster && !renderedClusters.has(cluster.id)) {
+          renderedClusters.add(cluster.id);
+          const members = group.tabs.filter((item) => item.clusterId === cluster.id);
+          items.push(buildClusterPill(cluster, members, group));
+        }
+        if (!cluster?.collapsed) items.push(record.item);
       }
-      const items = group?.tabs.map((record) => record.item) ?? [];
+      if (selectedCount >= 2 && group) {
+        if (!shell.clusterActionBtn) {
+          const action = element("button", "conversation-tools-cluster-action");
+          action.type = "button";
+          shell.clusterActionBtn = action;
+        }
+        const action = shell.clusterActionBtn;
+        action.textContent = `成组 · ${selectedCount}`;
+        action.title = `将选中的 ${selectedCount} 个标签合成可折叠组 (${IS_MAC ? "⌘G" : "Ctrl+G"})`;
+        action.onclick = () => groupSelectedIn(group);
+        items.push(action);
+      }
       if (items.length !== shell.tabs.children.length || items.some((item, at) => shell.tabs.children[at] !== item))
         shell.tabs.replaceChildren(...items);
       shell.root.classList.toggle("is-focused", state.groups.length > 1 && index === state.focus);
-      if (group) activeOf(group)?.item.scrollIntoView({ block: "nearest", inline: "nearest" });
+      if (group) {
+        const active = activeOf(group);
+        if (active?.item.isConnected) active.item.scrollIntoView({ block: "nearest", inline: "nearest" });
+      }
     });
+    const liveClusterIds = new Set(state.groups.flatMap((group) => group.clusters.map((cluster) => cluster.id)));
+    for (const id of clusterNodes.keys()) {
+      if (!liveClusterIds.has(id)) clusterNodes.delete(id);
+    }
   }
 
-  function paintTab(record, group, title) {
+  function paintTab(record, group, title, cluster = null) {
     const active = record.key === group.activeKey;
     const detail = record.indicator?.detail;
     record.label = title;
     record.item.classList.toggle("is-active", active);
+    record.item.classList.toggle("is-selected", selectedKeys.has(record.key));
+    record.item.classList.toggle("is-clustered", Boolean(cluster));
     record.item.classList.toggle("is-busy", Boolean(record.indicator?.busy));
     record.item.classList.toggle("has-attention", record.attention);
     record.button.setAttribute("aria-selected", String(active && state.open));
@@ -811,15 +973,22 @@ function mountTools(root, frame, tools, entries) {
     return entry.hint ?? "";
   }
 
+  // 极简收敛（方案 2）：聊天顶栏不再平铺工作台内部标签；桌面分屏展开时，工作台标签栏与聊天标题共享同一条 53px 顶栏，
+  // 开关按钮只留在收起态/窄屏态的聊天顶栏里，避免左右重复出现工作台开关。
   function updateToggle() {
     const pending = [...new Set([...records.singles(), ...allTabs()])].find((record) => record.attention || record.indicator?.busy);
     const keys = shortcutKeys(HOST_SHORTCUTS.toggle).join("+");
-    const label = pending ? `打开工作台（${keys}）· ${pending.label ?? pending.entry.label}有新活动` : `打开工作台（${keys}）`;
-    chrome.toggle.classList.toggle("has-attention", Boolean(pending));
-    chrome.toggle.title = label;
-    chrome.toggle.setAttribute("aria-label", label);
-    chrome.toggle.setAttribute("aria-expanded", String(state.open));
-    chrome.toggle.querySelector("span").textContent = "工作台";
+    const sharedDesktopHeader = state.open && !narrow.matches && !state.maximized;
+    if (sharedDesktopHeader) {
+      chat.handle.setHeaderActions([]);
+      return;
+    }
+    const label = state.open
+      ? `收起工作台（${keys}）`
+      : pending ? `打开工作台（${keys}）· ${pending.label ?? pending.entry.label}有新活动` : `打开工作台（${keys}）`;
+    chat.handle.setHeaderActions([
+      { id: "workbench", label: state.open ? "收起工作台" : "工作台", hint: label, iconSvg: TOOL_ICON, attention: !state.open && Boolean(pending), active: state.open },
+    ]);
   }
 
   function remember() {
@@ -828,7 +997,8 @@ function mountTools(root, frame, tools, entries) {
       open: state.open || state.held, focus: state.focus,
       groups: state.groups.map((group) => ({
         active: group.tabs.findIndex((record) => record.key === group.activeKey),
-        tabs: group.tabs.map((record) => ({ tool: record.entry?.id ?? null, instance: record.instance })),
+        clusters: group.clusters,
+        tabs: group.tabs.map((record) => ({ tool: record.entry?.id ?? null, instance: record.instance, clusterId: record.clusterId ?? null })),
       })),
     });
   }
@@ -871,6 +1041,10 @@ function mountTools(root, frame, tools, entries) {
     state.focus = state.groups.indexOf(group);
     state.open = true;
     const record = activeOf(group);
+    if (record.clusterId) {
+      const cluster = group.clusters.find((c) => c.id === record.clusterId);
+      if (cluster) cluster.collapsed = false;
+    }
     record.attention = false;
     update();
     remember();
@@ -889,8 +1063,11 @@ function mountTools(root, frame, tools, entries) {
   function removeTab(record, closed) {
     const group = groupOf(record);
     if (!group) return;
+    selectedKeys.delete(record.key);
+    record.clusterId = null;
     const index = group.tabs.indexOf(record);
     group.tabs.splice(index, 1);
+    cleanClusters(group);
     if (group.activeKey === record.key) group.activeKey = (group.tabs[index] ?? group.tabs[index - 1])?.key ?? null;
     if (!group.tabs.length && state.groups.length > 1) {
       state.groups.splice(state.groups.indexOf(group), 1);
@@ -913,13 +1090,15 @@ function mountTools(root, frame, tools, entries) {
     if (state.open) activeRecord()?.button.focus();
   }
 
-  function closePanel(focusTarget = chrome.toggle) {
+  // 没给焦点目标时回到标题行的工作台按钮：它随本次 update 才重新画出来，等聊天渲染完再聚焦。
+  function closePanel(focusTarget) {
     state.held = false;
     state.open = false;
     state.maximized = false;
     update();
     remember();
-    focusTarget.focus();
+    if (focusTarget) focusTarget.focus();
+    else requestAnimationFrame(() => chat.actionTarget()?.focus());
   }
 
   // 5. 分屏：当前标签移到下方一组（上方只有它一个时，下方开一个新标签页）；已分屏时把下方一组并回上方。
@@ -928,8 +1107,10 @@ function mountTools(root, frame, tools, entries) {
     const [upper, lower] = state.groups;
     if (lower) {
       const lowerActive = state.focus === 1 ? activeOf(lower) : null;
-      for (const record of lower.tabs) if (!record.entry) records.drop(record);
+      for (const record of lower.tabs) if (!record.entry) { record.clusterId = null; records.drop(record); }
+      upper.clusters.push(...lower.clusters);
       upper.tabs.push(...lower.tabs.filter((record) => record.entry));
+      cleanClusters(upper);
       if (lowerActive?.entry) upper.activeKey = lowerActive.key;
       state.groups = [upper];
     } else {
@@ -938,6 +1119,8 @@ function mountTools(root, frame, tools, entries) {
       else {
         const index = upper.tabs.indexOf(moving);
         upper.tabs.splice(index, 1);
+        moving.clusterId = null;
+        cleanClusters(upper);
         upper.activeKey = (upper.tabs[index] ?? upper.tabs[index - 1]).key;
       }
       state.groups.push(newGroup([moving]));
@@ -951,9 +1134,12 @@ function mountTools(root, frame, tools, entries) {
     if (!from || record === before) return;
     const index = from.tabs.indexOf(record);
     from.tabs.splice(index, 1);
+    if (from !== target) record.clusterId = null;
+    cleanClusters(from);
     if (from.activeKey === record.key) from.activeKey = (from.tabs[index] ?? from.tabs[index - 1])?.key ?? null;
     const at = before ? target.tabs.indexOf(before) : -1;
     target.tabs.splice(at < 0 ? target.tabs.length : at, 0, record);
+    cleanClusters(target);
     if (!from.tabs.length) state.groups.splice(state.groups.indexOf(from), 1);
     activate(record.key);
   }
@@ -976,9 +1162,15 @@ function mountTools(root, frame, tools, entries) {
     const used = new Set();
     const groups = layout.groups.map((spec) => {
       // 当前标签按存下时的下标取，再滤掉恢复不了的标签，下标不会错位。
-      const restored = spec.tabs.map((item) => restoreTab(item, used));
+      const restored = spec.tabs.map((item) => {
+        const tab = restoreTab(item, used);
+        if (tab && typeof item.clusterId === "string") tab.clusterId = item.clusterId;
+        return tab;
+      });
       const tabs = restored.filter(Boolean);
-      return newGroup(tabs, restored[spec.active]?.key);
+      const group = newGroup(tabs, restored[spec.active]?.key, spec.clusters ?? []);
+      cleanClusters(group);
+      return group;
     }).filter((group) => group.tabs.length);
     state.groups = groups.length ? groups : [newGroup([])];
     state.focus = Math.min(layout.focus, state.groups.length - 1);
@@ -997,23 +1189,21 @@ function mountTools(root, frame, tools, entries) {
     return records.single(entry);
   }
 
-  // 7. 意图交给第一个声明 accepts 的工具：先展开并激活（多开工具取本会话最近的实例），再投递；结果异步回执给 chat。
-  async function routeIntent(event) {
-    const request = readIntent(event, frame, state.session);
-    if (!request) return;
-    if (!request.valid) return replyIntent(frame, request.id, "invalid");
-    const target = entries.find((entry) => entry.accepts?.includes(request.intent.name));
+  // 7. 意图交给第一个声明 accepts 的工具：先展开并激活（多开工具取本会话最近的实例），再投递；结果异步回给聊天。
+  async function routeIntent(name, session, payload) {
+    const intent = readIntent(name, session, payload, state.session);
+    if (!intent) return "invalid";
+    const target = entries.find((entry) => entry.accepts?.includes(intent.name));
     const existing = target?.multiple ? allTabs().findLast((record) => record.entry === target) : null;
     const record = existing ? activate(existing.key) : target ? openTool(target) : null;
-    if (!record) return replyIntent(frame, request.id, "unhandled");
-    const listener = lifecycle.intentListener(record.key);
-    if (!listener) return replyIntent(frame, request.id, "unhandled");
+    const listener = record ? lifecycle.intentListener(record.key) : null;
+    if (!listener) return "unhandled";
     let timer = 0;
     const timeout = new Promise((resolve) => { timer = window.setTimeout(() => resolve("failed"), INTENT_TIMEOUT_MS); });
-    const status = await Promise.race([Promise.resolve().then(() => listener(request.intent)), timeout])
+    const status = await Promise.race([Promise.resolve().then(() => listener(intent)), timeout])
       .catch((error) => { console.error("[conversation-ui] intent failed", error); return "failed"; });
     window.clearTimeout(timer);
-    replyIntent(frame, request.id, ["handled", "invalid", "failed"].includes(status) ? status : "failed");
+    return ["handled", "invalid", "failed"].includes(status) ? status : "failed";
   }
 
   // 8. 引用只进发起时的那个会话：会话已切走、工具区已卸载或超长都拒绝，chat 收到后再核对一次。
@@ -1023,12 +1213,12 @@ function mountTools(root, frame, tools, entries) {
     if (typeof text !== "string" || !text || text.length > QUOTE_LIMIT) return "rejected";
     if (typeof source !== "string" || !source || source.length > SOURCE_LIMIT) return "rejected";
     if (typeof session !== "string" || session !== state.session) return "stale";
-    frame.contentWindow?.postMessage({ type: "akashic.composer-quote", session, text, source }, window.location.origin);
+    chat.handle.quote({ session, text, source });
     return "inserted";
   }
 
   // 9. 快捷键：Mod+J 开关工具区，Mod+\ 分屏，工具声明的组合切到（或打开）该工具并把焦点移进去。
-  //    chat iframe 同源，直接在它的 window 上监听；页面不可见、浮层占着键盘、标签自己处理过的按键（如终端里）都不接。
+  //    聊天与工具区同一文档，在 window 上监听；页面不可见、浮层占着键盘、标签自己处理过的按键（如终端里）都不接。
   //    按住不放的自动重复只吞掉，不反复开合。
   function onShortcut(event) {
     const spec = event.defaultPrevented || root.offsetParent === null ? null : shortcutOf(event);
@@ -1038,7 +1228,7 @@ function mountTools(root, frame, tools, entries) {
     event.preventDefault();
     if (event.repeat) return;
     if (spec === HOST_SHORTCUTS.toggle) {
-      if (state.open) closePanel(frame);
+      if (state.open) closePanel(chat.focusTarget());
       else openPanel(true);
     } else if (spec === HOST_SHORTCUTS.split) toggleSplit();
     else focusTool(entry);
@@ -1070,36 +1260,52 @@ function mountTools(root, frame, tools, entries) {
     event.preventDefault();
   }
 
-  function followChatOverlay(event) {
-    if (event.source !== frame.contentWindow || event.origin !== window.location.origin) return;
-    const message = event.data;
-    if (!message || typeof message !== "object" || message.type !== "akashic.chat-overlay") return;
-    state.chatOverlay = message.open === true;
+  function followChatOverlay(open) {
+    state.chatOverlay = open === true;
     update();
   }
-  // iframe 重载时旧的打开状态作废，键盘监听重新挂到新的 window 上。
-  const onFrameLoad = () => {
-    state.chatOverlay = false;
-    update();
-    frame.contentWindow?.addEventListener("keydown", onShortcut);
-  };
 
-  // 标签条的指针与键盘：点选、中键关闭、关闭按钮；方向键与 Home/End 在本组里换标签，Delete 关闭。
+  // 标签条的指针与键盘：点选、⌘/Ctrl/Shift 多选成组、中键关闭、关闭按钮；方向键与 Home/End 在本组里换标签，Delete 关闭，⌘G 成组。
   function onStripClick(event) {
     const record = allTabs().find((item) => item.item.contains(event.target));
     if (!record) return;
     if (record.close.contains(event.target) || event.button === 1) closeTab(record);
-    else if (event.button === 0) activate(record.key);
+    else if (event.button === 0 && (event.metaKey || event.ctrlKey || event.shiftKey)) {
+      if (selectedKeys.has(record.key)) selectedKeys.delete(record.key);
+      else selectedKeys.add(record.key);
+      update();
+    } else if (event.button === 0) {
+      if (selectedKeys.size) selectedKeys.clear();
+      activate(record.key);
+    }
   }
 
   function onStripKey(event) {
+    const mod = IS_MAC ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
+    if (!event.isComposing && mod && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "g" && selectedKeys.size >= 2) {
+      const stripIndex = chrome.groups.findIndex((shell) => shell.bar.contains(event.target));
+      const targetGroup = state.groups[stripIndex] ?? focusedGroup();
+      if (targetGroup && groupSelectedIn(targetGroup)) { event.preventDefault(); return; }
+    }
     const record = allTabs().find((item) => item.button === event.target);
     const group = record ? groupOf(record) : null;
     if (!group) return;
-    const at = group.tabs.indexOf(record);
-    const keys = { ArrowRight: at + 1, ArrowLeft: at - 1, Home: 0, End: group.tabs.length - 1 };
+    if ((event.key === " " || event.key === "Enter") && (event.shiftKey || event.metaKey || event.ctrlKey)) {
+      if (selectedKeys.has(record.key)) selectedKeys.delete(record.key);
+      else selectedKeys.add(record.key);
+      update();
+      event.preventDefault();
+      return;
+    }
+    const visibleTabs = group.tabs.filter((item) => {
+      if (!item.clusterId) return true;
+      const cluster = group.clusters.find((c) => c.id === item.clusterId);
+      return !cluster?.collapsed;
+    });
+    const at = visibleTabs.indexOf(record);
+    const keys = at >= 0 ? { ArrowRight: at + 1, ArrowLeft: at - 1, Home: 0, End: visibleTabs.length - 1 } : {};
     if (event.key === "Delete") closeTab(record);
-    else if (event.key in keys) activate(group.tabs[(keys[event.key] + group.tabs.length) % group.tabs.length].key, true);
+    else if (event.key in keys && visibleTabs.length) activate(visibleTabs[(keys[event.key] + visibleTabs.length) % visibleTabs.length].key, true);
     else return;
     event.preventDefault();
   }
@@ -1169,18 +1375,31 @@ function mountTools(root, frame, tools, entries) {
     state.maximized = !state.maximized;
     update();
   });
-  chrome.toggle.addEventListener("click", () => openPanel(true));
+  const onNarrow = () => updateToggle();
+  narrow.addEventListener("change", onNarrow);
   root.classList.add("has-tools");
-  root.append(chrome.splitter, chrome.panel, chrome.toggle);
+  root.append(chrome.splitter, chrome.panel);
   root.addEventListener("keydown", onKeydown);
   window.addEventListener("keydown", onShortcut);
-  window.addEventListener("message", followChatOverlay);
-  frame.addEventListener("load", onFrameLoad);
   window.addEventListener("resize", sizing.fit);
-  const stopSession = followChatSession(frame, applySession);
-  const stopIntents = announceIntents(frame, entries);
-  const onIntent = (event) => void routeIntent(event);
-  window.addEventListener("message", onIntent);
+  Object.assign(chat.hooks, {
+    session: applySession, overlay: followChatOverlay, intent: routeIntent,
+    headerAction: (id) => {
+      if (id === "workbench") {
+        if (state.open) closePanel(chat.actionTarget());
+        else openPanel(true);
+        return;
+      }
+      if (id.startsWith("tool:")) {
+        const entry = entries.find((item) => `tool:${item.id}` === id);
+        if (!entry) return;
+        if (state.open && activeRecord()?.entry === entry) closePanel(chat.actionTarget());
+        else focusTool(entry);
+      }
+    },
+  });
+  chat.handle.setShortcuts(toolShortcuts(entries));
+  chat.handle.setWorkbenchIntents(intentNames(entries));
   for (const record of records.singles()) if (record.entry.background) lifecycle.mount(record);
   return {
     start() {
@@ -1189,14 +1408,10 @@ function mountTools(root, frame, tools, entries) {
     },
     dispose() {
       disposed = true;
-      stopSession();
-      stopIntents();
-      window.removeEventListener("message", onIntent);
+      chat.handle.setHeaderActions([]);
+      narrow.removeEventListener("change", onNarrow);
       root.removeEventListener("keydown", onKeydown);
       window.removeEventListener("keydown", onShortcut);
-      frame.contentWindow?.removeEventListener("keydown", onShortcut);
-      window.removeEventListener("message", followChatOverlay);
-      frame.removeEventListener("load", onFrameLoad);
       window.removeEventListener("resize", sizing.fit);
       lifecycle.dispose();
     },
@@ -1207,24 +1422,26 @@ function renderConversation(host, view, props) {
   const tools = view.child("conversation.tools.v2");
   const entries = checkTabs(tools.entries);
   const railActions = checkRailActions(props?.railActions);
-  const root = document.createElement("div");
-  root.className = "conversation-page";
-  const frame = document.createElement("iframe");
-  frame.className = "conversation-page-frame";
-  frame.title = "Akashic 对话";
-  frame.src = frameSource(takeRequestedSession());
-  root.appendChild(frame);
-  const workbench = entries.length ? mountTools(root, frame, tools, entries) : null;
+  const root = element("div", "conversation-page");
+  const chatHost = element("div", "conversation-page-chat");
+  root.appendChild(chatHost);
   host.replaceChildren(root);
-  const stopThemeSync = syncFrameTheme(frame);
-  const stopRailActions = connectRailActions(frame, railActions);
-  const stopToolsNotice = workbench ? announceTools(frame, entries) : () => {};
+  const chat = connectChat(chatHost, railActions);
+  const workbench = entries.length ? mountTools(root, chat, tools, entries) : null;
+  // 页面隐藏后再返回时告诉聊天"重新显示了"，由聊天通知各插件重读；不重建聊天、不清空编辑器。
+  const visibility = new IntersectionObserver((records) => {
+    if (records.some((record) => record.isIntersecting)) chat.handle.shown();
+  });
+  visibility.observe(chatHost);
+  // 设置面板盖住聊天又关上时视口交叉没变，观察器不会再报；按同一信号处理，例如引导里刚连好的模型。
+  const settingsClosed = () => { if (chatHost.getClientRects().length) chat.handle.shown(); };
+  window.addEventListener("akashic:settings-closed", settingsClosed);
   workbench?.start();
   return () => {
+    window.removeEventListener("akashic:settings-closed", settingsClosed);
+    visibility.disconnect();
     workbench?.dispose();
-    stopToolsNotice();
-    stopRailActions();
-    stopThemeSync();
+    chat.handle.dispose();
     host.replaceChildren();
   };
 }

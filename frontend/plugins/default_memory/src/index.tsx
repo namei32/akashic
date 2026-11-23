@@ -1,13 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { WebHostContextV1 } from "@akashic/web-ui-v1";
-import { request, RequestError } from "../../shared/src/configuration";
+import { request, RequestError } from "../../../../packages/akashic-plugin-kit/src/configuration";
 import "./style.css";
+import { MemoryBrowser } from "./browser";
 
 type Status = {
   initialized: boolean; mode: "active" | "staging"; paused: boolean; auto_learn: boolean; control_version: number;
   learning: Record<string, number>; memories: Record<string, number>; kinds: Record<string, number>;
   current_source: string | null; failures: Record<string, string>; retry_pending: number;
+  eligible_turns?: number; eligible_checkpoints?: number; source_counts?: Record<string, number>;
+  strategy?: string; checkpoint_learning?: boolean; checkpoint_waiting?: boolean; history_lookup_available?: boolean;
   last_learned_at: string | null; last_scan_at: string | null;
   progress: {eligible: number; applied: number; pending: number; failed: number} | null;
 };
@@ -138,18 +141,19 @@ function MemoryStatus({ctx}: {ctx: WebHostContextV1}) {
         <section aria-label="学习状态">
           <h2>{state}</h2>
           <p>{data.mode === "active" ? "已接入对话召回" : "准备模式，尚未接入对话召回"} · {data.auto_learn ? "符合条件的新对话会自动学习" : "自动学习未开启，显式重试仍可处理失败轮次"}</p>
+          <p>原文查证：{data.history_lookup_available ? "已接入" : "未启用"} · 汇总来源学习：{data.checkpoint_waiting ? "等待摘要提供者" : data.checkpoint_learning ? "已启用" : "未启用"}</p>
           {data.paused && <p>暂停不会删除记忆，也不会停止已有记忆的召回。重试失败项前请先恢复学习。</p>}
           {data.current_source && <details><summary>正在处理一个轮次</summary><code>{data.current_source}</code></details>}
           {data.retry_pending > 0 && <p>已有 {count(data.retry_pending)} 个轮次等待重试。</p>}
         </section>
         <dl className="memory-metrics">
           <div><dt>有效记忆</dt><dd>{count(data.memories.active)}</dd></div>
-          <div><dt>累计完成轮次</dt><dd>{count(data.learning.applied)}</dd></div>
+          <div><dt>累计处理来源</dt><dd>{count(data.learning.applied)}</dd></div>
           <div><dt>待处理轮次</dt><dd>{data.progress ? count(data.progress.pending) : "待扫描"}</dd></div>
           <div><dt>失败轮次</dt><dd>{count(failures.length)}</dd></div>
         </dl>
         <section><h2>学习进度</h2>
-          {data.progress ? <p>最近一次扫描发现 {count(data.progress.eligible)} 个符合条件的完整轮次，其中已完成 {count(data.progress.applied)} 个，待处理 {count(data.progress.pending)} 个，失败 {count(data.progress.failed)} 个。</p>
+          {data.progress ? <p>最近一次扫描发现 {count(data.progress.eligible)} 个符合条件的学习来源（完整轮次 {count(data.eligible_turns)}，汇总批次 {count(data.eligible_checkpoints)}），其中已完成 {count(data.progress.applied)} 个，待处理 {count(data.progress.pending)} 个，失败 {count(data.progress.failed)} 个。</p>
             : <p>尚未扫描历史，待处理数量未知。页面刷新只读取状态，不触发历史补学。</p>}
           <dl className="memory-details">
             <div><dt>最近扫描</dt><dd>{time(data.last_scan_at)}</dd></div>
@@ -163,7 +167,8 @@ function MemoryStatus({ctx}: {ctx: WebHostContextV1}) {
             {failures.map(([key, reason], i) => <li key={key}><p>{failureLabel(reason)}</p><details><summary>查看失败详情 {i + 1}</summary><p>{reason}</p><code>{key}</code></details></li>)}
           </ul>}
         </section>
-        <aside className="memory-notes"><p>原始对话由聊天记录保留。当前页面只管理学习状态；失效记忆不会在这里物理删除。</p><p>Akasha 仍提供项目记忆策略和兴趣评分，Default Memory 负责结构化记忆学习与召回。</p></aside>
+        <MemoryBrowser ctx={ctx} />
+        <aside className="memory-notes"><p>原始对话由聊天记录保留。当前页面展示学习状态、记忆内容和来源；失效记忆继续保留。</p><p>Akasha 仍提供项目记忆策略和兴趣评分，Default Memory 负责结构化记忆学习与召回。</p></aside>
       </>}
     </div>
   </main>;

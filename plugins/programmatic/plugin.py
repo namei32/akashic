@@ -26,7 +26,6 @@ from plugins.ledger.contract import (
     ContentPart,
     ContentReferences,
     Control,
-    Input,
     Output,
 )
 from plugins.models.contract import MODEL_SELECTION
@@ -45,7 +44,6 @@ from plugins.sources.contract import (
     SOURCE_CHANGED_V3 as SOURCE_CHANGED,
     SOURCE_SESSION_V4 as SOURCE_SESSION,
     SOURCES_V5 as SOURCES,
-    SessionFactoryV4 as SessionFactory,
     SourceChangedV3 as SourceChanged,
     GuardedSourceSession as SourceSession,
 )
@@ -93,7 +91,7 @@ def open_source(ctx: Context, session_id: str) -> SourceSession:
 
     writers = ctx.require(MESSAGE_WRITERS)
     return ctx.require(SOURCE_SESSION)(reader=reader,
-        inputs=writers.bind(ctx, author="user", source="programmatic", body_types=(Input,),
+        inputs=ctx.require(SOURCES).user_inputs(ctx, name="programmatic",
             content={"text": ctx.require(CONTENT).check_text, "channel.origin": ctx.require(CHECK_ORIGIN),
                      "model.selection": check_model})(session_id),
         controls=writers.bind(ctx, author="app", source="programmatic", body_types=(Control,),

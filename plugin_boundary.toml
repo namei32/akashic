@@ -18,10 +18,6 @@ note = "Core 按可信插件 owner 打开短凭据租约"
 role = "core"
 note = "Core 只拥有执行身份与 generation 作用域；实际进程和文件由插件提供"
 
-[capabilities.executor]
-role = "core"
-note = "有界纯同步 worker 池"
-
 [capabilities."core.host_info"]
 role = "core"
 note = "宿主装配固定提供 boot identity 与 validation marker 的只读值"
@@ -55,3 +51,38 @@ note = "插件手册与 skill 文档仍在教学使用；代码中无此 Service
 [capabilities."core.plugin_config.v1"]
 role = "core"
 note = "按实际 Context 应用自身固定输入；沿 selection CAS 与局部换代，不解释业务字段"
+
+# R12：UI 宿主只提供通用扩展点。宿主插件可以导入的只有基础设施合同；
+# 其余插件的功能由它自己的前端模块经 UI_SLOTS 贡献，宿主不点名。
+[ui_hosts]
+plugins = ["akashic_clients", "ui"]
+infrastructure = ["ui", "ledger", "channels", "gateway", "content", "tools", "workloads", "reply"]
+frontend = ["frontend/plugins/akashic_clients/chat/src"]
+host_routes = ["/api/chat/sessions", "/api/chat/artifacts", "/api/chat/uploads", "/api/chat/plugin-ui",
+               "/api/chat/navigation", "/api/shell/state"]
+
+# R14：插件分层。core 层不得 import extra 层的任何模块（含 contract）；
+# extra 层可按计划迁到外部仓库。新增插件必须在此二选一。
+[tiers]
+core = [
+    "ledger", "ledger_invariants", "content", "content_view", "context", "turn_projection",
+    "sources", "conversation", "reply", "reply_program", "react", "prompt", "compaction",
+    "programmatic", "tools", "tool_search", "host_execution", "workloads", "managed_processes",
+    "working_directory", "shell", "files", "jobs", "models", "openai_compatible", "ui",
+    "akashic_clients", "shell_ui", "conversation_ui", "web_auth", "onboarding", "plugin_settings",
+    "assets", "gateway", "channels", "delivery", "delivery_policy", "akashic_sender",
+    "plugin_update", "skills", "commands", "mcp", "codemode", "runtime_inspection",
+    "runtime_diagnostics",
+]
+extra = ["default_memory"]
+
+# 已迁出 Core 的插件：目录不再存在，但仍按 extra 层约束（core 层不得 import 它们）。
+# 迁出一个插件时，把名字从上面的 extra 移到这里；extra 仓库自己的新插件由它的 extra_tiers.toml 声明，不进本表。
+external = [
+    "akasha", "codex", "computer", "design", "gemini", "goal", "main_session", "markdown_memory",
+    "markdown_reader", "message_push", "opencode_go", "privacy_mask", "projects", "scheduler",
+    "session_title", "stable_view", "standard_web", "subagent",
+    "subagent_claude_code", "subagent_codex", "telegram_channel", "telegram_sender", "terminal",
+    "timer", "userinformation", "vision", "visuals", "watch", "web_fetch_http",
+    "web_search_exa", "web_search_searxng", "workspace_changes",
+]

@@ -49,6 +49,7 @@ RUN apt-get update \
 
 COPY --from=stream-build /build/addons/selkies-web-core/dist /opt/computer/stream-web
 COPY --from=stream-build /build/addons/selkies-web-core/selkies-ws-core.js /opt/computer/stream-web/source/selkies-ws-core.js
+COPY --from=stream-build /build/addons/selkies-web-core/selkies-wr-core.js /opt/computer/stream-web/source/selkies-wr-core.js
 COPY --from=stream-build /build/addons/selkies-web-core/lib/util.js /opt/computer/stream-web/source/util.js
 COPY --from=stream-build /build/LICENSE /opt/computer/stream-web/source/LICENSE
 COPY --chown=1000:1000 docker/computer/package.json docker/computer/package-lock.json /opt/computer/
@@ -60,7 +61,7 @@ RUN chmod 0755 /opt/computer/start.sh
 
 USER 1000:1000
 WORKDIR /data
-EXPOSE 6081 8080 19826
+EXPOSE 6081 8080 19826 19827
 # Only the supervisor receives stop; it closes Chromium before D-Bus and X11.
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/opt/computer/start.sh"]

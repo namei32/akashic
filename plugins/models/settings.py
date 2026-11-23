@@ -10,10 +10,13 @@ from typing import Any, Protocol, TypeAlias
 from agent.plugin_composition.model import ServiceKey
 from plugins.models.contract import (
     CapabilitySources,
+    CatalogMode,
     DiscoveredModel,
     ModelCapabilities,
     ModelKind,
 )
+
+from .quota import ConnectionQuota
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +29,9 @@ class AddConnection:
     auth_identity: str
     credential: Mapping[str, str]
     driver_config: Mapping[str, Any] = field(default_factory=dict)
+    # all：建连接时读取目录，对话模型全部启用；picked 配 adopt_models 只启用这几个。
+    catalog_mode: CatalogMode = "picked"
+    adopt_models: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,10 +43,18 @@ class UpdateConnection:
     endpoint: str | None = None
     credential: Mapping[str, str] | None = None
     driver_config: Mapping[str, Any] | None = None
+    remove_model_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class DisableConnection:
+    expected_revision: int
+    connection_id: str
+
+
+# 重新启用停用的连接；凭据与模型配置原样保留，失效时由下次调用或额度读取暴露。
+@dataclass(frozen=True, slots=True)
+class EnableConnection:
     expected_revision: int
     connection_id: str
 
@@ -78,15 +92,6 @@ class UpdateModel:
 
 
 @dataclass(frozen=True, slots=True)
-class ExtendModelReasoningEfforts:
-    """Add declared efforts to a manually configured chat model without rebinding it."""
-
-    expected_revision: int
-    model_id: str
-    efforts: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class RemoveModel:
     """移除模型选择，后续聊天引用跟随默认模型；历史事实不变。"""
 
@@ -106,6 +111,14 @@ class SetDefaultModel:
 class SyncModels:
     expected_revision: int
     connection_id: str
+
+
+# 切换连接的模型范围；切到 all 时读取目录，把还没有的对话模型补上。
+@dataclass(frozen=True, slots=True)
+class SetCatalogMode:
+    expected_revision: int
+    connection_id: str
+    mode: CatalogMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,13 +151,14 @@ ModelChange: TypeAlias = (
     AddConnection
     | UpdateConnection
     | DisableConnection
+    | EnableConnection
     | AddModel
     | VerifyModel
     | UpdateModel
-    | ExtendModelReasoningEfforts
     | RemoveModel
     | SetDefaultModel
     | SyncModels
+    | SetCatalogMode
     | StartConnectionAuth
     | FinishConnectionAuth
     | CancelConnectionAuth
@@ -177,6 +191,8 @@ class ModelSettings(Protocol):
 
     async def apply(self, command: ModelChange) -> SettingsReceipt: ...
 
+    async def quotas(self, *, fresh: bool, connection_id: str | None = None) -> tuple[ConnectionQuota, ...]: ...
+
 
 MODEL_SETTINGS = ServiceKey[ModelSettings]("models.settings.v1")
 
@@ -188,6 +204,7 @@ __all__ = [
     "CancelConnectionAuth",
     "CreateConnectionWithModel",
     "DisableConnection",
+    "EnableConnection",
     "FinishConnectionAuth",
     "MODEL_SETTINGS",
     "ModelChange",

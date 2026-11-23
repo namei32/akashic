@@ -10,10 +10,6 @@ services:
     security_opt:
       - no-new-privileges:true
       - seccomp:${AKASHIC_RUNTIME_CHECKOUT:?AKASHIC_RUNTIME_CHECKOUT is required}/docker/host-runtime/chromium-seccomp.json
-    labels:
-      com.akashic.observability: "true"
-      com.akashic.service: "akashic-core"
-      com.akashic.environment: "${AKASHIC_ENVIRONMENT:-hua-home}"
     environment:
       AKASHIC_CONFIG: "${AKASHIC_CONFIG:?AKASHIC_CONFIG is required}"
       AKASHIC_WORKSPACE: "${AKASHIC_WORKSPACE:?AKASHIC_WORKSPACE is required}"
@@ -75,6 +71,8 @@ services:
       timeout: 5s
       retries: 3
       start_period: "${AKASHIC_READINESS_TIMEOUT_S:-120}s"
+      # 启动期每秒探测：就绪后最多晚 1s 被发布器看到，而不是一个完整 interval。
+      start_interval: 1s
     stop_grace_period: 60s
     logging:
       driver: local
@@ -82,9 +80,10 @@ services:
         max-size: "50m"
         max-file: "5"
     restart: "no"
+    # Core 开机到首次使用 Controller 要数秒；并行启动，host_execution 首次使用前自己等 socket。
     depends_on:
       workload-controller:
-        condition: service_healthy
+        condition: service_started
     networks:
       - default
       - akashic-workloads
@@ -136,6 +135,8 @@ services:
       - "${AKASHIC_GID:-1000}"
       - --owner-container
       - "${AKASHIC_CONTAINER_NAME:?AKASHIC_CONTAINER_NAME is required}"
+      - --host-egress-dir
+      - "${AKASHIC_WORKLOAD_RUNTIME_DIR:-${AKASHIC_EXPERIMENT_ROOT}/workload-runtime}/host-egress"
     volumes:
       - type: bind
         source: /var/run/docker.sock
@@ -164,6 +165,9 @@ services:
       interval: 5s
       timeout: 2s
       retries: 12
+      # Core 依赖它 healthy 才启动；socket 出现后 1s 内放行。
+      start_period: 60s
+      start_interval: 1s
     stop_grace_period: 45s
     restart: "no"
 

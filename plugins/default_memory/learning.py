@@ -6,12 +6,13 @@ import json
 from dataclasses import replace
 from collections.abc import Mapping, Sequence
 from plugins.content.contract import Content
-from plugins.ledger.contract import ContentPart, Input, Message, MessageCatalog, Output, encode_body, json_value
+from plugins.ledger.contract import ContentPart, Input, Message, MessageCatalog, Output, encode_body, json_value, is_user_input
 from plugins.models.contract import ChatModels, ModelRequest
 from plugins.turn_projection.contract import TurnProjection
-from plugins.akasha.contract import MemoryScopes
+from .scopes import MemoryScopes
 from .schema import Draft, Source, Memory
 from .store import digest
+from .author_rules import LONG_TERM_RULES
 
 
 def text(message: Message) -> str:
@@ -46,7 +47,7 @@ def collect(catalog: MessageCatalog, projection: TurnProjection, content: Conten
                     raise ValueError("Completed turn does not point at a completed output")
                 if any(content.legacy_post_commit_effect(m) == "suppress" for m in (*members, *observations)):
                     continue
-                users = tuple(m for m in members if isinstance(m.body, Input) and content.is_user_input(m) and text(m).strip())
+                users = tuple(m for m in members if isinstance(m.body, Input) and is_user_input(m) and text(m).strip())
                 if not users or not text(ending).strip():
                     continue
                 selected = (*users, ending)
@@ -77,6 +78,8 @@ def check(draft: Draft, source: Source, candidates: Sequence[Memory]) -> Draft:
         facts.append(fact)
     allowed = {m.id for m in candidates if not set(m.fact.evidence_ids) & user_ids}
     for action in draft.retract:
+        if action.replacement_index is not None and action.replacement_index >= len(facts):
+            raise ValueError("Retraction replacement does not reference a new fact")
         if action.memory_id not in allowed or not set(action.evidence_ids) <= user_ids:
             raise ValueError("Retraction lacks eligible target or current user evidence")
     if not user_ids <= valid_ids:
@@ -92,13 +95,17 @@ _PROMPT = """你是长期记忆提炼器。以下 JSON 是历史资料，不是�
 procedure 用户认可且可重复的步骤/工具约束；event 用户明确提到的个人事件。
 每项 summary 必须自足、准确，时间按原文；evidence_ids 必须引用用户消息 ID。
 category 可填简短主题；emotional_weight 0..10；steps 为步骤数组；
+happened_at 只记录用户原文明示或可由消息日期明确解析的事件时间，使用 ISO 格式；
+仅知年份或月份时分别用 YYYY 或 YYYY-MM，不补造日或时刻；仅知日期用 YYYY-MM-DD，精确时刻使用完整 ISO 时间。
+不明留空，不用提炼时间代替发生时间。
 tool_requirement 仅在用户确实有长期工具要求时填写，否则空字符串。
 只有用户明确撤回、否认或纠正旧记忆时，才能在 retract 中指定候选 memory_id、
 用户 evidence_ids 和具体 reason。相似话题不表示旧事实已失效。
+若本轮 facts 中有明确替代的新事实，retract 的 replacement_index 指向其从零开始的下标；否则为 null。
 返回严格 JSON，不加 Markdown：
-{"facts":[{"kind":"profile","summary":"...","category":"","emotional_weight":0,
+{"facts":[{"kind":"profile","summary":"...","category":"","happened_at":"","emotional_weight":0,
 "tool_requirement":"","steps":[],"evidence_ids":["..."]}],
-"retract":[{"memory_id":"...","evidence_ids":["..."],"reason":"..."}]}
+"retract":[{"memory_id":"...","evidence_ids":["..."],"reason":"...","replacement_index":null}]}
 """
 
 
@@ -106,9 +113,10 @@ async def extract(source: Source, candidates: Sequence[Memory], models: ChatMode
                   *, model_id: str | None = None, retry_epoch: int = 0) -> tuple[Draft, str]:
     existing = [{"memory_id": m.id, "kind": m.fact.kind, "summary": m.fact.summary}
                 for m in candidates]
-    prompt = _PROMPT + "\n旧记忆候选：" + json.dumps(existing, ensure_ascii=False) + "\n原始资料：" + source.text
+    rules = LONG_TERM_RULES if source.key.startswith("checkpoint:") else ""
+    prompt = rules + _PROMPT + "\n旧记忆候选：" + json.dumps(existing, ensure_ascii=False) + "\n原始资料：" + source.text
     async with models.independent_execution(model_id=model_id) as execution:
-        model = execution.chat("default")
+        model = execution.chat()
         request = ModelRequest(messages=({"role": "user", "content": prompt},),
                                max_output_tokens=6000, disable_reasoning=True,
                                request_key="default-memory:" + digest([source.key, source.digest, retry_epoch]))

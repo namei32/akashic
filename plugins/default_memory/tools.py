@@ -6,11 +6,11 @@ from dataclasses import asdict
 from collections.abc import Mapping
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from plugins.ledger.contract import ContentPart, Input, json_value
+from plugins.ledger.contract import ContentPart, Input, json_value, is_user_input
 from plugins.tools.contract import CallSource, Result
 from .io import run_io
 from .learning import check, text
-from .schema import Draft, Fact, Source
+from .schema import Draft, Fact, Source, Kind
 from .store import digest
 from .runtime import Runtime
 
@@ -18,13 +18,17 @@ from .runtime import Runtime
 class RecallArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     query: str = Field(min_length=1, max_length=16000)
-    limit: int = Field(default=8, ge=1, le=40)
+    limit: int = Field(default=8, ge=1, le=200)
+    intent: Literal["answer", "timeline"] = "answer"
+    memory_kind: Kind | None = None
+    time_filter: str = ""
 
 
 class RememberArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     summary: str = Field(min_length=1, max_length=2000)
     kind: Literal["profile", "preference", "procedure", "event"] = "preference"
+    happened_at: str = ""
     steps: tuple[str, ...] = Field(default=(), max_length=12)
     tool_requirement: str = Field(default="", max_length=200)
 
@@ -52,7 +56,7 @@ class MemoryTool:
             first = source.messages[0]
             graph = self.runtime.route(first.session_id, write=self.action != "recall")
             users = [m for m in source.messages if isinstance(m.body, Input)
-                     and self.runtime.content.is_user_input(m)]
+                     and is_user_input(m)]
             if self.action != "recall" and not users:
                 return "记忆修改需要真实用户输入"
             newest = users[-1] if users else first
@@ -94,16 +98,22 @@ class MemoryTool:
             raise ValueError("Memory scope changed after preparation")
         if self.action == "recall":
             args = RecallArgs.model_validate(data["arguments"])
-            record = await self.runtime.recall(identity, session, args.query, limit=args.limit)
+            original = data["arguments"]
+            intent = args.intent if isinstance(original, dict) and "intent" in original else "context"
+            record = await self.runtime.recall(identity, session, args.query, limit=args.limit,
+                                               timestamp=str(data["timestamp"]), intent=intent, memory_kind=args.memory_kind,
+                                               time_filter=args.time_filter)
             return self.result(record)
         async with self.runtime.learning_lock:
+            if str(data["user_id"]) in await run_io(self.runtime.store.retracted_evidence):
+                raise ValueError("A retracted message cannot authorize memory changes")
             if self.action == "forget":
                 args = ForgetArgs.model_validate(data["arguments"])
                 record = await run_io(self.runtime.store.forget, identity, fingerprint, graph,
                                                  args.memory_ids, args.reason, [str(data["user_id"])])
                 return self.result(record)
             args = RememberArgs.model_validate(data["arguments"])
-            fact = Fact(kind=args.kind, summary=args.summary, steps=args.steps,
+            fact = Fact(kind=args.kind, summary=args.summary, happened_at=args.happened_at, steps=args.steps,
                         tool_requirement=args.tool_requirement, evidence_ids=(str(data["user_id"]),))
             source = Source(identity, graph, session, str(data["user_id"]), str(data["timestamp"]),
                             (str(data["user_id"]),), (str(data["user_id"]),), fingerprint, "")

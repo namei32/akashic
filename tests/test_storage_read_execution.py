@@ -9,7 +9,7 @@ import pytest
 from plugins.ledger.log import MessageLog
 from plugins.ledger.contract import Input
 from tests.test_message_log import writer
-from tests.test_akasha_execution import WorkerGate
+from tests.support.worker_gate import WorkerGate
 
 
 @pytest.mark.asyncio
@@ -120,114 +120,6 @@ async def test_external_edit_during_async_read_does_not_restart_snapshot(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_subagent_outcome_read_keeps_control_responsive_and_prefix_fixed(tmp_path, monkeypatch):
-    """O/C3/C4: 子任务终态查询不阻塞控制，也不把后来控制塞进旧快照。"""
-    import plugins.ledger.log as storage
-    from plugins.subagent.runtime import Subagents
-    from plugins.ledger.contract import Control
-
-    log = MessageLog(tmp_path / "sessions.db")
-    writer(log, source="subagent").append("job-input", Input(()))
-    reader = log.reader("s")
-    gate = WorkerGate()
-    original = storage._message
-
-    def decode(row):
-        if row["id"] == "job-input":
-            gate.stop()
-        return original(row)
-
-    monkeypatch.setattr(storage, "_message", decode)
-
-    async def query():
-        return await Subagents.outcome(reader)
-
-    job = asyncio.create_task(query())
-    try:
-        await gate.wait(job)
-        control = writer(log, source="subagent", bodies=(Control,))
-        control.append("pause", Control("pause", 0, "user stop"))
-        writer(log, source="peer").append("peer", Input(()))
-        gate.release.set()
-        assert await job is None
-        monkeypatch.setattr(storage, "_message", original)
-        assert await Subagents.outcome(reader) == ("cancelled", "子任务已按请求取消。")
-        assert [item.message_id for item in reader.snapshot()] == ["job-input", "pause", "peer"]
-    finally:
-        gate.release.set()
-        await asyncio.gather(job, return_exceptions=True)
-        log.close()
-
-
-@pytest.mark.asyncio
-async def test_subagent_cancel_rechecks_completion_committed_during_read(tmp_path, monkeypatch):
-    """C3: 真实来源在异步读取期间完成，旧取消检查不能改写其终态。"""
-    from agent.plugin_composition import CompositionRoot, PluginRuntime
-    from plugins.ledger.services import MessageWriters, OwnerState
-    from plugins.ledger.contract import MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE
-    from agent.plugin_composition.tasks import TASKS, PluginTasks
-    from plugins.subagent.request import PROFILE_TOOLS, Request
-    from plugins.subagent.runtime import Subagents
-    from plugins.ledger.log import MessageReader
-    from plugins.ledger.contract import ContentPart, ContentReferences, Output
-
-    log = MessageLog(tmp_path / "sessions.db")
-    root = CompositionRoot("subagent-cancel-read")
-    contexts = []
-
-    async def storage(ctx):
-        await ctx.provide(MESSAGE_CATALOG, log.catalog())
-        await ctx.provide(MESSAGE_WRITERS, MessageWriters(log))
-        await ctx.provide(OWNER_STATE, OwnerState(log))
-        await ctx.provide(TASKS, PluginTasks())
-
-    async def consumer(ctx):
-        contexts.append(ctx)
-
-    await root.mount(storage, name="storage")
-    await root.mount(consumer, name="jobs", inject=(MESSAGE_CATALOG, MESSAGE_WRITERS, OWNER_STATE, TASKS),
-                     runtime=PluginRuntime("jobs", "jobs", tmp_path, tmp_path, tmp_path, {}))
-    ctx = contexts[0]
-    request = Request(job_id="a" * 32, label="job", profile="research", background=False,
-                      retry_count=0, parent_session_id="parent", parent_message_id="parent-input",
-                      parent_part_index=0, origin=None, sink=None, program_binding="program",
-                      tools={name: name for name in PROFILE_TOOLS["research"]})
-    messages = log.writer(request.session_id, author="subagent", source="subagent",
-                          body_types=(Input, Output), content={"subagent.request": lambda _: ContentReferences()})
-    messages.append(request.input_id, Input((ContentPart("subagent.request", request.model_dump()),)))
-    async with ctx.runtime_scope():
-        state = ctx.require(OWNER_STATE).open(ctx)
-        state.transact(lambda tx: tx.save("job", {"session_id": request.session_id,
-            "input_id": request.input_id, "settled": False}, expected_version=None))
-    gate = WorkerGate()
-    original = MessageReader.snapshot
-
-    def snapshot(reader, **kwargs):
-        gate.stop()
-        return original(reader, **kwargs)
-
-    monkeypatch.setattr(MessageReader, "snapshot", snapshot)
-
-    async def cancel():
-        async with ctx.runtime_scope():
-            return await Subagents(ctx).cancel(request.job_id)
-
-    job = asyncio.create_task(cancel())
-    try:
-        await gate.wait(job)
-        messages.append("completed", Output((), "complete"))
-        gate.release.set()
-        assert await job is False
-        monkeypatch.setattr(MessageReader, "snapshot", original)
-        assert [item.message_id for item in log.reader(request.session_id).snapshot()] == [request.input_id, "completed"]
-    finally:
-        gate.release.set()
-        await asyncio.gather(job, return_exceptions=True)
-        await root.dispose()
-        log.close()
-
-
-@pytest.mark.asyncio
 async def test_resume_reads_only_current_source_work_and_replays_fixed_prefix(tmp_path, monkeypatch):
     """O/C3/C4：重试不读取关闭正文，重放仍归属原来的 Input 前缀。"""
     import plugins.ledger.log as storage
@@ -310,4 +202,88 @@ async def test_committed_read_does_not_wait_for_another_threads_write(tmp_path, 
     finally:
         gate.release.set()
         await asyncio.gather(job, return_exceptions=True)
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_catalog_page_async_twins_match_sync_reads(tmp_path):
+    """目录页、水位、消息尾页与软删标记的异步孪生和同步版结果一致。"""
+    from plugins.ledger.contract import ContentPart
+
+    log = MessageLog(tmp_path / "sessions.db")
+    try:
+        writer(log).append("first", Input((ContentPart("text", "hello"),)))
+        writer(log).append("second", Input((ContentPart("text", "world"),)))
+        catalog = log.catalog()
+        assert await catalog.sessions_async() == catalog.sessions()
+        assert await catalog.sessions_async(prefix="other:") == catalog.sessions(prefix="other:")
+        assert await catalog.snapshot_heads_async() == catalog.snapshot_heads()
+        assert await catalog.snapshot_heads_async(prefix="other:") == catalog.snapshot_heads(prefix="other:")
+        reader = catalog.reader("s")
+        assert await reader.read_tail_async(limit=1) == reader.read_tail(limit=1)
+        assert await reader.read_tail_async(before_seq=1) == reader.read_tail(before_seq=1)
+        assert await reader.deleted_async() is reader.deleted is False
+        assert await reader.head_async() == reader.head() == 1
+    finally:
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_read_tail_async_cancel_drains_physical_read(tmp_path, monkeypatch):
+    """取消 read_tail_async 后，worker 内的实际读取排空前任务不结束、连接不归还。"""
+    from plugins.ledger.log import MessageReader
+
+    log = MessageLog(tmp_path / "sessions.db")
+    writer(log).append("first", Input(()))
+    gate = WorkerGate()
+    original = MessageReader._page
+
+    def blocked(reader, **kwargs):
+        gate.stop()
+        return original(reader, **kwargs)
+
+    monkeypatch.setattr(MessageReader, "_page", blocked)
+    job = asyncio.create_task(log.catalog().reader("s").read_tail_async(limit=50))
+    try:
+        await gate.wait(job)
+        job.cancel()
+        tick = asyncio.Event()
+        asyncio.get_running_loop().call_soon(tick.set)
+        await tick.wait()
+        assert not job.done(), "取消未等待实际读取排空"
+        gate.release.set()
+        try:
+            await asyncio.wait_for(job, 5)
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("读取未经取消语义结束")
+        monkeypatch.setattr(MessageReader, "_page", original)
+        assert [m.message_id for m in log.catalog().reader("s").read_tail(limit=50).messages] == ["first"]
+        with closing(sqlite3.connect(tmp_path / "sessions.db")) as raw:
+            assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        gate.release.set()
+        await asyncio.gather(job, return_exceptions=True)
+        log.close()
+
+
+@pytest.mark.asyncio
+async def test_async_page_reads_reject_caller_transaction(tmp_path):
+    """调用线程自己持有未提交事务时，异步孪生拒绝读取；事务结束后恢复。"""
+    log = MessageLog(tmp_path / "sessions.db")
+    writer(log).append("first", Input(()))
+    catalog = log.catalog()
+    try:
+        with log._writer_lock, log._writer_connection:  # pyright: ignore[reportPrivateUsage]
+            log._writer_connection.execute("BEGIN IMMEDIATE")  # pyright: ignore[reportPrivateUsage]
+            with pytest.raises(RuntimeError, match="active storage transaction"):
+                await catalog.sessions_async()
+            with pytest.raises(RuntimeError, match="active storage transaction"):
+                await catalog.snapshot_heads_async()
+            with pytest.raises(RuntimeError, match="active storage transaction"):
+                await catalog.reader("s").read_tail_async()
+        assert (await catalog.sessions_async()).total == 1
+        assert await catalog.reader("s").head_async() == 0
+    finally:
         log.close()

@@ -38,6 +38,7 @@ RUN printf '%s\n' \
         wqy-zenhei \
         curl \
         git \
+        nodejs \
         python \
         python-pip \
         util-linux \
@@ -54,6 +55,8 @@ RUN printf '%s\n' \
 WORKDIR /opt/akashic
 
 COPY requirements.lock /opt/akashic/distribution/requirements.lock
+# 镜像不带浏览器：用到 Chromium 的插件（visuals、design）在 resources.json 里声明并在安装时取回。
+# 开头 ENV 里的 PLAYWRIGHT_BROWSERS_PATH 保持不动：开头一变，系统包层缓存全部失效，要从 Arch 归档重下。
 ARG AKASHIC_PYPI_INDEX_URL=https://pypi.org/simple
 ARG AKASHIC_REQUIREMENTS_SHA256
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -81,6 +84,7 @@ COPY Dockerfile.distribution /opt/akashic/distribution/Dockerfile.distribution
 COPY distribution-entrypoint.sh /opt/akashic/distribution/distribution-entrypoint.sh
 COPY distribution-entrypoint.sh /opt/akashic/distribution-entrypoint.sh
 
+# 运行期禁止写字节码且镜像只读：构建时预编译核心源码，每次启动不再重新编译。
 RUN test -n "${AKASHIC_SOURCE_COMMIT}" \
     && test -n "${AKASHIC_SOURCE_TREE}" \
     && test -n "${AKASHIC_CORE_SHA256}" \
@@ -89,15 +93,16 @@ RUN test -n "${AKASHIC_SOURCE_COMMIT}" \
     && tar -xf /opt/akashic/distribution/core.tar -C /opt/akashic/source \
     && test ! -e /opt/akashic/source/plugins \
     && test -f /opt/akashic/source/config.example.toml \
+    && /opt/venv/bin/python -m compileall -q -j 0 /opt/akashic/source \
     && /opt/venv/bin/python -c "from pathlib import Path; assert Path('/opt/akashic/distribution/requirements.lock').read_bytes() == Path('/opt/akashic/source/docker/host-runtime/requirements.lock').read_bytes(), 'Build lock differs from Core lock'" \
-    && /opt/venv/bin/python -c "import akashic_sdk; assert akashic_sdk.__file__.startswith('/opt/akashic/source/sdk/python/src/')"
+    && /opt/venv/bin/python -c "import akashic_sdk; assert akashic_sdk.__file__.startswith('/opt/akashic/source/sdk/python/src/')" \
+    && node --version
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     export PIP_CACHE_DIR=/root/.cache/pip \
     && mkdir -p /tmp/akashic-distribution-workspace /tmp/akashic-distribution-plugins \
     && /opt/venv/bin/python /opt/akashic/source/scripts/distribution_runtime.py prepare-wheels \
         --distribution /opt/akashic/distribution \
-    && /opt/venv/bin/python -m playwright install --only-shell chromium \
     && /opt/venv/bin/python /opt/akashic/source/scripts/install_plugin_distribution.py \
         --distribution /opt/akashic/distribution \
         --bundle /opt/akashic/distribution/bundles/base.toml \

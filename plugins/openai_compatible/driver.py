@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from plugins.models.contract import describe_transport_error
+from plugins.models.contract import stream_text
 
 from core.common.diagnostic_log import log_timing
 
@@ -8,6 +8,7 @@ from core.common.diagnostic_log import log_timing
 # narrowed key/value types of arbitrary Mapping and list payloads.
 # pyright: reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 
+from pathlib import Path
 import asyncio
 import json
 import zlib
@@ -16,11 +17,11 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, cast
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 
-from core.net.http import HttpClient, StreamProgress, finish_response, retry_after_time
+from core.net.http import HttpClient, StreamProgress, finish_response
 
 from core.common.frozen_json import freeze_json
 
@@ -29,7 +30,6 @@ from plugins.models.contract import (
     LLMResponse,
     ModelRequest,
     ModelUsage,
-    ToolCall,
 )
 from plugins.models.contract import (
     BoundModelDescriptor,
@@ -43,16 +43,35 @@ from plugins.models.contract import (
 )
 from plugins.models.contract import (
     AuthenticationError,
-    ContentSafetyError,
-    ContextLengthError,
     InvalidRequestError,
     ModelError,
     ModelTimeoutError,
-    QuotaError,
-    RateLimitError,
     TransportError,
 )
-from plugins.models.contract import ModelDriverDefinition, message_size
+from plugins.models.contract import (
+    ModelDriverDefinition,
+    StreamCallbackError as _CallbackError,
+    StreamReadError as _StreamReadError,
+    build_stream_tool_calls as _tool_calls,
+    check_bound_model as _check_bound_model,
+    NonStreamBody,
+    chat_completion_response,
+    check_chat_response_error,
+    check_credential_scope as _check_credential_scope,
+    credential_bearer_token as _credential_token,
+    is_driver_retryable as _retryable,
+    map_driver_error as _map_error,
+    mark_unsent_error as _unsent,
+    merge_stream_tool_deltas as _merge_tool_deltas,
+    normalize_http_base_url as _normalize_base_url,
+    parse_openai_usage as _usage,
+    positive_float_config as _positive_float,
+    raise_http_status as _raise_status,
+    response_json_object as _json_object,
+    message_size,
+)
+
+from .plan_quota import read_plan_quota
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
@@ -64,20 +83,6 @@ _DISCOVERY_READ_TIMEOUT_SECONDS = 10.0
 _DISCOVERY_TOTAL_TIMEOUT_SECONDS = 15.0
 _DISCOVERY_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 _DISCOVERY_MAX_MODELS = 10_000
-_SAFETY_CODES = (
-    "content_filter",
-    "content_policy_violation",
-    "data_inspection_failed",
-)
-_CONTEXT_CODES = (
-    "context_length_exceeded",
-    "maximum context length",
-    "context window exceeds limit",
-    "range of input length",
-    "reduce the length",
-    "string too long",
-    "too many tokens",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,17 +150,7 @@ class _BoundChat:
         body = _chat_body(
             self._descriptor, connection, request,
         )
-        if request.on_delta is None and connection.thinking_format != "deepseek":
-            payload = await _request_json(
-                connection,
-                self._credential,
-                "POST",
-                "/chat/completions",
-                body_bytes=self._encode_body(body, request),
-                http=self._http,
-            )
-            return _parse_chat_response(payload)
-        # V4 长生成可能超过网关非流式等待窗口；无观察者时也完整聚合 SSE。
+        # 长生成可能超过网关非流式等待窗口；无观察者时也完整聚合 SSE。
         body["stream"] = True
         body["stream_options"] = {"include_usage": True}
         return await _stream_chat(
@@ -339,7 +334,18 @@ def definition() -> ModelDriverDefinition:
         discover=_discover,
         probe=_probe,
         probe_embedding=_probe_embedding,
+        icon=_icon,
+        read_quota=read_plan_quota,
     )
+
+
+# 同一驱动接多家服务：按目录身份、地址、名称认出已知品牌，认不出就不显示图标。
+def _icon(descriptor: DriverConnectionDescriptor) -> str | None:
+    identity = " ".join((str(descriptor.config.get("catalog_provider_id") or ""), descriptor.endpoint, descriptor.name)).lower()
+    host = (urlsplit(descriptor.endpoint).hostname or "").lower()
+    brand = "zhipu" if host.endswith("bigmodel.cn") else "zai" if host == "z.ai" or host.endswith(".z.ai") else next(
+        (name for name in ("commandcode", "deepseek", "openrouter") if name in identity or name in host), None)
+    return None if brand is None else (Path(__file__).parent / "icons" / f"{brand}.svg").read_text(encoding="utf-8")
 
 
 async def _open(
@@ -478,6 +484,12 @@ async def _discover(
         if model in seen_models:
             raise TransportError(f"models response contains duplicate id: {model}").exception()
         seen_models.add(model)
+        # 服务商标明了接口却不含 chat/completions 的模型（如 Command Code 的 Claude 只走 /messages）这个驱动调不了。
+        endpoints = raw.get("supported_endpoints")
+        if isinstance(endpoints, list) and endpoints and not any(
+            str(item).rstrip("/").endswith("/chat/completions") for item in cast(list[object], endpoints)
+        ):
+            continue
         result.append(
             DiscoveredModel(
                 kind=None,
@@ -648,7 +660,10 @@ async def _request_json(
                     method, path, json=body, headers={"Authorization": f"Bearer {token}"}
                 )
             _raise_status(response, secret=token)
-            return _json_object(response)
+            payload = _json_object(response)
+            if path == "/chat/completions":
+                check_chat_response_error(payload, secret=token)
+            return payload
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -788,7 +803,7 @@ async def _stream_chat(
                 if response.status_code >= 400:
                     _ = await response.aread()
                 _raise_status(response, secret=token)
-                return await _consume_stream(response, on_delta, progress_timeout=connection.progress_timeout)
+                return await _consume_stream(response, on_delta, progress_timeout=connection.progress_timeout, secret=token)
         except asyncio.CancelledError:
             raise
         except _CallbackError as error:
@@ -814,24 +829,12 @@ async def _stream_chat(
     raise TransportError("stream failed without result").exception() from last_error
 
 
-class _StreamReadError(RuntimeError):
-    def __init__(self, error: Exception, *, response_delta_seen: bool) -> None:
-        super().__init__(str(error))
-        self.error = error
-        self.response_delta_seen = response_delta_seen
-
-
-class _CallbackError(RuntimeError):
-    def __init__(self, error: Exception) -> None:
-        super().__init__(str(error))
-        self.error = error
-
-
 async def _consume_stream(
     response: httpx.Response,
     on_delta: Callable[[dict[str, str]], Awaitable[None]] | None,
     *,
     progress_timeout: float = 300.0,
+    secret: str = "",
 ) -> LLMResponse:
     content: list[str] = []
     thinking: list[str] = []
@@ -845,11 +848,15 @@ async def _consume_stream(
     pending_content = ""
     legacy_candidate: str | None = None
     progress = StreamProgress(progress_timeout)
+    body = NonStreamBody()
     try:
         lines = response.aiter_lines()
         async for line in progress.read(lines):
             if not line.startswith("data:"):
+                if body.feed(line):
+                    break
                 continue
+            body.frame()
             data = line[5:].strip()
             if not data:
                 continue
@@ -863,6 +870,7 @@ async def _consume_stream(
                 raise TransportError("stream contains invalid JSON").exception() from error
             if not isinstance(chunk, dict):
                 raise TransportError("stream chunk must be an object").exception()
+            check_chat_response_error(chunk, secret=secret)
             raw_usage = chunk.get("usage")
             if isinstance(raw_usage, Mapping):
                 usage = _usage(raw_usage)
@@ -932,18 +940,25 @@ async def _consume_stream(
         raise _StreamReadError(
             error, response_delta_seen=response_delta_seen
         ) from error
-    if not completed:
+    if not completed and finish_reason is None:
+        # 1. 未见任何 data 帧：对端其实回了非流正文，按完整响应解析或分类。
+        payload = body.payload(secret=secret, success="choices")
+        if payload is not None:
+            return _tagged_completion(payload)
+        # 2. 其余都是真断流，保持可重试的传输错误。
         error = TransportError("stream ended before its terminal marker").exception()
         raise _StreamReadError(error, response_delta_seen=response_delta_seen)
     parsed_content, parsed_thinking = _split_tagged_thinking(
-        "".join(content).strip() or None,
+        stream_text("".join(content), finish_reason),
         "".join(thinking).strip() or None,
+        finish_reason,
     )
     if not native_reasoning_seen and not tool_seen:
         if legacy_candidate is not None:
             candidate_content, candidate_thinking = _split_tagged_thinking(
                 legacy_candidate,
                 None,
+                finish_reason,
             )
             if candidate_thinking:
                 await _emit_delta(on_delta, {"thinking_delta": candidate_thinking})
@@ -952,12 +967,21 @@ async def _consume_stream(
         elif pending_content:
             await _emit_delta(on_delta, {"content_delta": pending_content})
     return LLMResponse(
-        content=parsed_content,
+        # 半截工具调用的文本不算截断正文，交给 ReAct 按拒绝提示处理。
+        content=None if finish_reason == "length" and calls else parsed_content,
         thinking=parsed_thinking,
-        tool_calls=_tool_calls(calls),
+        tool_calls=() if finish_reason == "length" else _tool_calls(calls),
         finish_reason=finish_reason,
         usage=usage,
+        output_discarded=finish_reason == "length" and bool(calls),
     )
+
+
+# 完整响应沿用流式路径的旧式 <think> 标签拆分。
+def _tagged_completion(payload: Mapping[str, Any]) -> LLMResponse:
+    reply = chat_completion_response(payload)
+    content, thinking = _split_tagged_thinking(reply.content, reply.thinking, reply.finish_reason)
+    return replace(reply, content=content, thinking=thinking)
 
 
 async def _emit_delta(
@@ -990,59 +1014,10 @@ def _client(connection: _ConnectionConfig, token: str | None = None) -> httpx.As
     )
 
 
-def _parse_chat_response(payload: Mapping[str, Any]) -> LLMResponse:
-    choices = payload.get("choices")
-    if (
-        not isinstance(choices, list)
-        or not choices
-        or not isinstance(choices[0], Mapping)
-    ):
-        raise TransportError("chat response is missing first choice").exception()
-    choice = cast(Mapping[str, Any], choices[0])
-    message = choice.get("message")
-    if not isinstance(message, Mapping):
-        raise TransportError("chat response is missing message").exception()
-    content = message.get("content")
-    if content is not None and not isinstance(content, str):
-        raise TransportError("chat message content must be string or null").exception()
-    thinking = message.get("reasoning_content")
-    if thinking is None:
-        thinking = message.get("reasoning")
-    if thinking is not None and not isinstance(thinking, str):
-        raise TransportError("chat reasoning content must be string or null").exception()
-    raw_calls = message.get("tool_calls", [])
-    calls: list[ToolCall] = []
-    if not isinstance(raw_calls, list):
-        raise TransportError("chat tool_calls must be an array").exception()
-    for raw in raw_calls:
-        if not isinstance(raw, Mapping):
-            raise TransportError("chat tool call must be an object").exception()
-        function = raw.get("function")
-        if not isinstance(function, Mapping):
-            raise TransportError("chat tool call is missing function").exception()
-        calls.append(
-            ToolCall(
-                id=_required_string(raw.get("id"), "tool call id"),
-                name=_required_string(function.get("name"), "tool call name"),
-                arguments=_tool_arguments(function.get("arguments")),
-            )
-        )
-    raw_usage = payload.get("usage")
-    usage = _usage(raw_usage) if isinstance(raw_usage, Mapping) else None
-    finish = choice.get("finish_reason")
-    content, thinking = _split_tagged_thinking(content, thinking)
-    return LLMResponse(
-        content=content,
-        thinking=thinking,
-        tool_calls=calls,
-        finish_reason=None if finish is None else str(finish),
-        usage=usage,
-    )
-
-
 def _split_tagged_thinking(
     content: str | None,
     thinking: str | None,
+    finish_reason: str | None,
 ) -> tuple[str | None, str | None]:
     """Read legacy think tags only when the provider has no reasoning field."""
 
@@ -1050,8 +1025,12 @@ def _split_tagged_thinking(
         return content, thinking
     match = _THINK_RE.search(content)
     if match is None:
+        # 思考中途被长度截断：还没有正文，其余内容都是推理，不能落进回答。
+        opened = content.lstrip()
+        if finish_reason == "length" and opened.startswith("<think>"):
+            return None, opened.removeprefix("<think>").strip() or None
         return content, None
-    answer = _THINK_RE.sub("", content).strip() or None
+    answer = _THINK_RE.sub("", content).lstrip() or None
     return answer, match.group(1).strip() or None
 
 
@@ -1114,111 +1093,6 @@ def _parse_embedding_response(
     )
 
 
-def _merge_tool_deltas(calls: dict[int, dict[str, str]], raw_calls: list[Any]) -> bool:
-    """合并合法工具片段，并报告是否增加了调用内容。"""
-    advanced = False
-    for raw in raw_calls:
-        if not isinstance(raw, Mapping):
-            raise TransportError("stream tool call delta must be an object").exception()
-        index = raw.get("index")
-        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
-            raise TransportError("stream tool call index must be non-negative").exception()
-        slot = calls.setdefault(index, {"id": "", "name": "", "arguments": ""})
-        raw_id = raw.get("id")
-        if isinstance(raw_id, str):
-            slot["id"] += raw_id
-            advanced = advanced or bool(raw_id)
-        function = raw.get("function")
-        if isinstance(function, Mapping):
-            name = function.get("name")
-            arguments = function.get("arguments")
-            if isinstance(name, str):
-                slot["name"] += name
-                advanced = advanced or bool(name)
-            if isinstance(arguments, str):
-                slot["arguments"] += arguments
-                advanced = advanced or bool(arguments)
-
-    return advanced
-
-
-def _tool_calls(calls: Mapping[int, Mapping[str, str]]) -> list[ToolCall]:
-    result: list[ToolCall] = []
-    for index in sorted(calls):
-        raw = calls[index]
-        result.append(
-            ToolCall(
-                id=_required_string(raw.get("id"), "tool call id"),
-                name=_required_string(raw.get("name"), "tool call name"),
-                arguments=_tool_arguments(raw.get("arguments") or "{}"),
-            )
-        )
-    return result
-
-
-def _tool_arguments(value: object) -> Mapping[str, Any]:
-    if not isinstance(value, str):
-        raise TransportError("tool call arguments must be a JSON string").exception()
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as error:
-        raise TransportError("tool call arguments are invalid JSON").exception() from error
-    if not isinstance(parsed, dict):
-        raise TransportError("tool call arguments must decode to an object").exception()
-    return cast(dict[str, Any], parsed)
-
-
-def _usage(raw: Mapping[str, Any]) -> ModelUsage:
-    input_tokens = _optional_int(raw.get("prompt_tokens"))
-    output_tokens = _optional_int(raw.get("completion_tokens"))
-    prompt_details = raw.get("prompt_tokens_details")
-    completion_details = raw.get("completion_tokens_details")
-    cached = (
-        _optional_int(prompt_details.get("cached_tokens"))
-        if isinstance(prompt_details, Mapping)
-        else None
-    )
-    cache_hit = _optional_int(raw.get("prompt_cache_hit_tokens"))
-    cache_miss = _optional_int(raw.get("prompt_cache_miss_tokens"))
-    if cache_hit is not None or cache_miss is not None:
-        if input_tokens is None:
-            input_tokens = (cache_hit or 0) + (cache_miss or 0)
-        if cached is None:
-            cached = cache_hit or 0
-    if cached is None:
-        # Kimi 使用顶层命中字段；不覆盖既有字段中的明确零值。
-        cached = _optional_int(raw.get("cached_tokens"))
-    cache_write = (
-        _optional_int(prompt_details.get("cache_write_tokens"))
-        if isinstance(prompt_details, Mapping)
-        else None
-    )
-    reasoning = (
-        _optional_int(completion_details.get("reasoning_tokens"))
-        if isinstance(completion_details, Mapping)
-        else None
-    )
-    covered = int(input_tokens is not None and output_tokens is not None)
-    coverage = (
-        'exact'
-        if covered
-        else (
-            'partial'
-            if input_tokens is not None or output_tokens is not None
-            else 'unavailable'
-        )
-    )
-    return ModelUsage(
-        input_tokens=input_tokens,
-        cache_write_input_tokens=cache_write,
-        cached_input_tokens=cached,
-        output_tokens=output_tokens,
-        reasoning_output_tokens=reasoning,
-        covered_request_count=covered,
-        coverage=coverage,
-    )
-
-
 def _merge_usage(items: Sequence[ModelUsage | None]) -> ModelUsage | None:
     """Merge per-request usage while preserving unknown token counts."""
 
@@ -1256,128 +1130,6 @@ def _merge_usage(items: Sequence[ModelUsage | None]) -> ModelUsage | None:
     )
 
 
-def _unsent(error: Exception) -> Exception:
-    """发送前本地校验失败：请求可证明未到达 provider，标记为允许重试的证据。"""
-    error = ModelError.change(error, send_evidence="unsent")
-    return error
-
-
-def _raise_status(response: httpx.Response, *, secret: str) -> None:
-    error = _status_error(response, secret=secret)
-    if error is None:
-        return
-    # 4xx 是对本请求的明确拒绝应答——正面证据。5xx 只说明服务端/网关
-    # 未能给出结论，不能证明后端未接收或未处理：不授证据，fail-closed。
-    if response.status_code < 500:
-        error = ModelError.change(error, send_evidence="rejected")
-    raise error
-
-
-def _status_error(response: httpx.Response, *, secret: str) -> Exception | None:
-    if response.status_code < 400:
-        return None
-    message = _response_error_message(response, secret=secret)
-    lowered = message.lower()
-    if response.status_code in {401, 403}:
-        return AuthenticationError(
-            f"模型连接授权未通过（HTTP {response.status_code}）。"
-            f"请在模型设置中核对 API Key 或账号权限后重试。服务返回：{message}"
-        ).exception()
-    if response.status_code >= 500:
-        # status-first：5xx 只说明服务端/网关未给出结论，正文诊断文案
-        # （context_length 等）不得把错误提升为可证明的容量拒绝。
-        error = TransportError(f"模型服务暂不可用（HTTP {response.status_code}），请稍后重试。服务返回：{message}").exception()
-        if response.status_code == 503:
-            # 503 与 429 一样可能带 Retry-After；固定为绝对允许时间，由 Models 可取消地遵守。
-            error = ModelError.change(error, retry_at=retry_after_time(response.headers.get("retry-after")))
-        return error
-    if any(code in lowered for code in _CONTEXT_CODES):
-        return ContextLengthError(f"模型上下文超过限制（HTTP {response.status_code}）。服务返回：{message}").exception()
-    if any(code in lowered for code in _SAFETY_CODES):
-        return ContentSafetyError(f"模型安全策略拒绝请求（HTTP {response.status_code}）。服务返回：{message}").exception()
-    if response.status_code == 402 or (
-        response.status_code == 429
-        and any(value in lowered for value in ("quota", "usage limit", "credit"))
-    ):
-        return QuotaError(f"模型账号额度不足（HTTP {response.status_code}）。服务返回：{message}").exception()
-    if response.status_code == 429:
-        error = RateLimitError(f"模型服务限流（HTTP 429）。服务返回：{message}").exception()
-        # Retry-After 必须随错误传给 Models，由独占重试预算决定何时再付。
-        error = ModelError.change(error, retry_at=retry_after_time(response.headers.get("retry-after")))
-        return error
-    if 400 <= response.status_code < 500:
-        return InvalidRequestError(
-            f"模型服务拒绝请求（HTTP {response.status_code}）。服务返回：{message}"
-        ).exception()
-    error = TransportError(f"provider returned HTTP {response.status_code}: {message}").exception()
-    return error
-
-
-def _response_error_message(response: httpx.Response, *, secret: str = "") -> str:
-    try:
-        payload = response.json()
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return _redact_secret(response.text, secret)[:500] or f"HTTP {response.status_code}"
-    if isinstance(payload, Mapping):
-        raw = payload.get("error", payload.get("detail", payload))
-        if isinstance(raw, Mapping):
-            message, code = raw.get("message"), raw.get("code")
-            details = [value for value in (code, message) if isinstance(value, str) and value]
-            if details:
-                return _redact_secret(": ".join(dict.fromkeys(details)), secret)[:500]
-        if isinstance(raw, str) and raw:
-            return _redact_secret(raw, secret)[:500]
-    return f"HTTP {response.status_code}"
-
-
-def _redact_secret(message: str, secret: str) -> str:
-    if secret:
-        return message.replace(secret, "[REDACTED]")
-    return message
-
-
-def _map_error(error: Exception) -> Exception:
-    if ModelError.matches(error, AuthenticationError, ContentSafetyError, ContextLengthError, InvalidRequestError, ModelTimeoutError, QuotaError, RateLimitError, TransportError):
-        return error
-    if isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)):
-        # 连接建立失败可证明请求未发出：这是允许重试的正面证据。
-        mapped = TransportError(describe_transport_error(error)).exception()
-        mapped = ModelError.change(mapped, send_evidence="unsent")
-        mapped = ModelError.change(mapped, retry_safe=True)
-        return mapped
-    if isinstance(error, (httpx.TimeoutException, TimeoutError)):
-        return ModelTimeoutError(describe_transport_error(error)).exception()
-    if isinstance(error, httpx.TransportError):
-        # 请求发出后的读/写失败不携带任何安全证据。
-        return TransportError(describe_transport_error(error)).exception()
-    if isinstance(error, _StreamReadError):
-        # 已进入 HTTP 200 流：无论是否观察到 delta，远端效果都不可证。
-        mapped = _map_error(error.error)
-        if ModelError.matches(mapped):
-            mapped = ModelError.change(mapped, response_delta_seen=error.response_delta_seen, send_evidence=None)
-        else:
-            setattr(mapped, "response_delta_seen", error.response_delta_seen)
-        return mapped
-    return error
-
-
-def _retryable(error: Exception) -> bool:
-    value = ModelError.read(error)
-    return value is not None and value.send_evidence in ("rejected", "unsent") and (
-        isinstance(value, (ModelTimeoutError, RateLimitError)) or value.retry_safe
-    )
-
-
-def _json_object(response: httpx.Response) -> dict[str, Any]:
-    try:
-        payload = response.json()
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise TransportError("provider response is not valid JSON").exception() from error
-    if not isinstance(payload, dict):
-        raise TransportError("provider response must be a JSON object").exception()
-    return cast(dict[str, Any], payload)
-
-
 def _json_bytes_object(content: bytes) -> dict[str, Any]:
     try:
         payload = json.loads(content)
@@ -1386,53 +1138,6 @@ def _json_bytes_object(content: bytes) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise TransportError("provider response must be a JSON object").exception()
     return cast(dict[str, Any], payload)
-
-
-def _credential_token(payload: Mapping[str, str]) -> str:
-    token = (
-        payload.get("access_token") or payload.get("api_key") or payload.get("token")
-    )
-    if not token or not token.strip():
-        raise AuthenticationError("credential does not contain an API token").exception()
-    return token.strip()
-
-
-def _check_credential_scope(
-    descriptor: DriverConnectionDescriptor,
-    credential: CredentialHandle,
-) -> None:
-    if credential.connection_id != descriptor.connection_id:
-        raise AuthenticationError("credential connection scope does not match").exception()
-    if credential.auth_identity != descriptor.auth_identity:
-        raise AuthenticationError("credential auth identity does not match").exception()
-
-
-def _check_bound_model(
-    descriptor: DriverConnectionDescriptor,
-    connection_id: str,
-    driver_id: str,
-) -> None:
-    if connection_id != descriptor.connection_id or driver_id != descriptor.driver_id:
-        raise ValueError("bound model does not belong to this driver connection")
-
-
-def _normalize_base_url(value: str) -> str:
-    text = value.strip()
-    parsed = urlsplit(text)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("endpoint must be an absolute HTTP(S) URL")
-    if parsed.username or parsed.password:
-        raise ValueError("endpoint must not contain credentials")
-    if parsed.query:
-        raise ValueError("endpoint must not contain a query")
-    if parsed.fragment:
-        raise ValueError("endpoint must not contain a fragment")
-    path = parsed.path.rstrip("/")
-    for suffix in ("/chat/completions", "/completions", "/embeddings", "/models"):
-        if path.endswith(suffix):
-            path = path[: -len(suffix)].rstrip("/")
-            break
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
 def _compile_chat_row(message: Mapping[str, Any], fill_reasoning: bool) -> _ChatRow:
@@ -1476,29 +1181,6 @@ def _compile_chat_row(message: Mapping[str, Any], fill_reasoning: bool) -> _Chat
             item = dict(message)
         item["reasoning_content"] = ""
     return _ChatRow(message, fill_reasoning, _json_dumps_bytes(message if item is None else item), images)
-
-
-def _required_string(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise TransportError(f"{name} must be a non-empty string").exception()
-    return value
-
-
-def _optional_int(value: object) -> int | None:
-    if value is None:
-        return None
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise TransportError("usage token counts must be non-negative integers").exception()
-    return value
-
-
-def _positive_float(value: object, name: str) -> float:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"{name} must be a positive number")
-    result = float(value)
-    if not math.isfinite(result) or result <= 0:
-        raise ValueError(f"{name} must be a positive finite number")
-    return result
 
 
 __all__ = ["definition"]

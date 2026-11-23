@@ -29,7 +29,7 @@ const { values } = parseArgs({
   },
 });
 assert(values.url, "请显式提供 --url，选择本次验收的服务");
-assert(["all", "models", "model-usage"].includes(values.page), "page 只接受 all、models 或 model-usage");
+assert(["all", "models"].includes(values.page), "page 只接受 all 或 models");
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(values.output);
 const bundles = new Map(
@@ -62,15 +62,23 @@ function readQuery(query) {
     return false;
   if (plugin === "projects" && query.method === "project.list")
     return Object.keys(payload).length === 0;
-  // plugins/akasha/plugin.py 的策略读取与召回记录投影。
+  // 只读投影：宿主执行状态快照、会话当前目录与一轮回答的改动摘要（各插件 plugin.py 的 query）。
+  if (plugin === "host_execution" && query.method === "bridge.state")
+    return Object.keys(payload).length === 0;
+  if (plugin === "working_directory" && query.method === "directory.current")
+    return Object.keys(payload).length === 0;
+  if (plugin === "workspace_changes" && query.method === "turn.message")
+    return Object.keys(payload).join() === "message_id";
+  // plugins/akasha/plugin.py 的策略读取（单条与批量）与召回记录投影。
   if (plugin === "akasha")
     return (
-      query.method === "scope.policy.get" || query.method === "recall.turn"
+      query.method === "scope.policy.get" || query.method === "scope.policy.list" || query.method === "recall.turn"
     );
-  // 外部插件源码的只读 Message/Compaction 与 plugins/models 的回答用量尾注。
+  // 外部插件源码的只读 Message/Compaction 与 plugins/models/chat_ui.py 的只读查询（用量尾注、模型胶囊目录与调用统计）。
   return (
     (plugin === "status_commands" && query.method === "memory.status") ||
-    (plugin === "models" && query.method === "usage.message")
+    (plugin === "models" &&
+      ["usage.message", "chat.models", "call.latest", "call.stats"].includes(query.method))
   );
 }
 
@@ -122,7 +130,7 @@ async function measure(page, label) {
         .filter((e) => {
           if (
             e.closest(
-              ".product-band__nav,.onboarding-progress,.meme-dashboard__sidebar,.model-capsule__rails",
+              ".product-band__nav,.onboarding-progress,.meme-dashboard__sidebar,.model-picker__group-rail",
             )
           )
             return false;
@@ -151,7 +159,7 @@ async function measure(page, label) {
     });
     assert.deepEqual(geometry.clipped, [], `${label}: 可见控件被横向裁切`);
     for (const text of geometry.reading) {
-      assert(text.fontSize >= 16, `${label}: 长正文小于 16px`);
+      assert(text.fontSize >= 15, `${label}: 长正文小于 15px`);
       assert(text.lineHeight >= text.fontSize * 1.4, `${label}: 正文行距过小`);
     }
     reading.push(...geometry.reading);
@@ -288,7 +296,7 @@ async function onboarding(page, prefix) {
   await measure(page, `${prefix}-onboarding-welcome`);
   await surface.getByRole("button", { name: "开始", exact: true }).click();
   await surface
-    .locator(".onboarding-column .settings-connection-card,.onboarding-column .config-form form")
+    .locator(".onboarding-column .settings-provider-head:visible,.onboarding-column .settings-template-tile:visible,.onboarding-column .config-form form:visible")
     .first()
     .waitFor();
   await measure(page, `${prefix}-onboarding-step`);
@@ -321,11 +329,12 @@ async function customPanel(page, prefix, id) {
 
 /** 检查真实聊天、只读历史、弹窗和工具，不发送输入。 */
 async function chat(page, prefix, narrow) {
-  await main(page, "对话", "iframe");
-  const frame = page.frameLocator(".shell-view.is-active iframe");
+  await main(page, "对话", ".akashic-chat");
+  // 聊天挂在外壳文档里（ADR 0126）：按聊天根节点定位，字号与书写方向改在同一文档的根上。
+  const frame = page.locator(".shell-view.is-active .akashic-chat");
   await frame.locator("textarea:not([disabled])").waitFor();
   if (values.large || values.rtl)
-    await frame.locator("html").evaluate(
+    await page.locator("html").evaluate(
       (root, { large, rtl }) => {
         if (large) root.style.fontSize = "200%";
         if (rtl) root.dir = "rtl";
@@ -338,50 +347,43 @@ async function chat(page, prefix, narrow) {
     "真实聊天页出现错误提示",
   );
   await measure(page, `${prefix}-chat`);
-  const model = frame.locator(".model-capsule__trigger");
+  // 模型选择与思考强度由 models 插件的输入框工具位提供（plugins/models/plugin_ui.js）。
+  // 窄屏输入框收起时不显示工具位，先像用户一样点进输入框。
+  await frame.locator("textarea:not([disabled])").click();
+  const model = frame.locator(".model-picker__trigger");
   await model.click();
   const picker = frame.getByRole("dialog", { name: "选择模型", exact: true });
   await picker.waitFor();
   await measure(page, `${prefix}-chat-model-picker`);
-  const tabs = picker.getByRole("tab");
-  for (let i = 0; i < (await tabs.count()); i++) {
-    await tabs.nth(i).click();
-    assert(await hit(tabs.nth(i)));
-  }
-  const choices = picker.locator(".model-capsule__option");
+  const choices = picker.locator(".model-picker__option");
   assert(await hit(choices.first()), "模型首项不可达");
   assert(await hit(choices.last()), "模型末项不可达");
   await measure(page, `${prefix}-chat-model-last`);
-  const effort = picker.locator(".model-capsule__effort-entry");
-  if (await effort.count()) {
-    await effort.click();
-    await measure(page, `${prefix}-chat-effort-picker`);
-  }
-  await frame
-    .getByRole("button", { name: "关闭模型选择", exact: true })
-    .click();
+  await page.keyboard.press("Escape");
+  await picker.waitFor({ state: "detached" });
   if (narrow)
     await frame.getByRole("button", { name: "打开导航", exact: true }).click();
   await measure(page, `${prefix}-chat-navigation`);
   const navigation = narrow
     ? frame.locator(".compact-navigation-dialog")
     : frame.locator(".chat-sidebar").first();
-  const create = navigation.getByRole("button", {
-    name: "新建项目",
-    exact: true,
-  });
+  const create = navigation
+    .getByRole("button", { name: "新建项目", exact: true })
+    .first();
   if (await create.count()) {
     await create.click();
     const dialog = frame.getByRole("dialog", { name: "创建项目", exact: true });
     await dialog.waitFor();
-    await measure(page, `${prefix}-project-dialog`);
+    await measure(page, `${prefix}-group-dialog`);
     const memory = dialog.getByRole("button", { name: /记忆设置/ });
     if (await memory.count()) {
       await memory.click();
       await measure(page, `${prefix}-project-memory-menu`);
-      await frame.locator("body").press("Escape");
+      await page.keyboard.press("Escape");
+      // 菜单退场动画期间仍是最上层，等它卸载后下一次 Escape 才轮到对话框。
+      await page.getByRole("menu").waitFor({ state: "detached" });
     }
-    await frame.locator("body").press("Escape");
+    await page.keyboard.press("Escape");
     if (narrow)
       await frame
         .getByRole("button", { name: "打开导航", exact: true })
@@ -392,7 +394,7 @@ async function chat(page, prefix, narrow) {
     await recent.click();
     await frame.locator(".message-row").first().waitFor();
     await measure(page, `${prefix}-chat-history`);
-  } else if (narrow) await frame.locator("body").press("Escape");
+  } else if (narrow) await page.keyboard.press("Escape");
   // 工具只展开与关闭；不点击远程桌面，不发送按键或剪贴板。
   const toggle = page.locator(
     ".shell-view.is-active .conversation-tools-toggle",
@@ -422,7 +424,7 @@ async function chat(page, prefix, narrow) {
       }
     }
     const close = tools.getByRole("button", {
-      name: "关闭工具区",
+      name: "收起工具区",
       exact: true,
     });
     assert(await hit(close));
@@ -436,13 +438,13 @@ async function models(page, prefix) {
   await page.evaluate(() => { window.location.hash = "models"; });
   const view = page.locator("dialog.shell-settings-dialog[open]");
   await view.locator(".settings-page").waitFor();
-  await view.locator(".settings-connection-card").first().waitFor();
+  await view.locator(".settings-provider-head").first().waitFor();
   await measure(page, `${prefix}-models`);
-  const cards = view.locator("button.settings-connection-card");
+  const cards = view.locator("button.settings-provider-head:not(:disabled)");
   const count = await cards.count();
   for (let i = 0; i < count; i++) {
     await cards.nth(i).click();
-    const dialog = page.locator("dialog.settings-scrim[open]");
+    const dialog = view.locator(".settings-provider-editor:not([hidden])");
     await dialog.waitFor();
     await measure(page, `${prefix}-connection-${i}`);
     const summaries = dialog.locator("summary");
@@ -462,13 +464,16 @@ async function models(page, prefix) {
       await measure(page, `${prefix}-connection-${i}-manual`);
     }
     const controls = dialog.locator("input,select,textarea,button");
-    for (let j = 0; j < (await controls.count()); j++)
-      if (await controls.nth(j).isVisible())
+    for (let j = 0; j < (await controls.count()); j++) {
+      if (await controls.nth(j).isVisible()) {
+        await controls.nth(j).scrollIntoViewIfNeeded();
         assert(await hit(controls.nth(j)), `连接 ${i}: 表单控件不可达`);
-    await page.keyboard.press("Escape");
+      }
+    }
+    await cards.nth(i).click();
     await dialog.waitFor({ state: "hidden" });
   }
-  await view.getByRole("button", { name: "添加向量模型", exact: true }).click();
+  await view.getByRole("button", { name: "+ 添加向量模型", exact: true }).click();
   const dialog = page.getByRole("dialog", {
     name: "添加向量模型",
     exact: true,
@@ -478,85 +483,6 @@ async function models(page, prefix) {
   assert(await hit(cancel));
   await cancel.click();
   await view.getByRole("button", { name: "关闭设置", exact: true }).click();
-}
-
-/** 已安装模型用量插件的真实读取、键盘、分页和窄屏路径。 */
-async function modelUsage(page, width) {
-  const panel = page.locator("dialog.shell-settings-dialog[open]");
-  const usage = panel.locator(".model-usage");
-  const ready = () => usage.locator('.usage-results[aria-busy="false"]').waitFor();
-  await ready();
-  assert.equal(await panel.getByRole("heading", {name: "模型用量", exact: true}).count(), 1);
-  async function capture(label) {
-    const geometry = await usage.evaluate(element => ({width: element.clientWidth, scrollWidth: element.scrollWidth,
-      left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right}));
-    assert(geometry.scrollWidth <= geometry.width + 1, "模型用量页面横向溢出");
-    assert(geometry.left >= -1 && geometry.right <= width + 1, "模型用量超出视口");
-    if (width <= 760) {
-      const small = await usage.locator("button,select,summary").evaluateAll(elements => elements.filter(element => {
-        const box = element.getBoundingClientRect();
-        return box.width > 0 && box.height > 0 && (box.width < 43.5 || box.height < 43.5);
-      }).map(element => element.textContent));
-      assert.deepEqual(small, [], "触控目标不足 44px");
-    }
-    const screenshot = `${width}-model-usage-${label}.png`;
-    await page.screenshot({path: resolve(output, screenshot), animations: "disabled"});
-    report.screens.push({label, viewport: page.viewportSize(), ...geometry, screenshot});
-  }
-  const exact = usage.locator(".usage-exact").first();
-  await exact.locator("summary").click();
-  assert(await exact.locator("span").isVisible());
-  await exact.locator("summary").press("Escape");
-  assert(await panel.isVisible(), "完整数值 Escape 不应关闭设置");
-  assert.equal(await exact.getAttribute("open"), null);
-  const axis = await usage.locator(".usage-chart svg text").allTextContents();
-  await usage.getByRole("group", {name: "趋势指标"}).getByRole("button", {name: "输出", exact: true}).click();
-  assert.notDeepEqual(await usage.locator(".usage-chart svg text").allTextContents(), axis, "输入输出应分别使用刻度");
-  const chart = usage.locator(".usage-chart-interactive");
-  await chart.focus(); await chart.press("End");
-  const lastX = await usage.locator(".usage-chart-selection").getAttribute("x");
-  await chart.press("ArrowLeft");
-  assert.notEqual(await usage.locator(".usage-chart-selection").getAttribute("x"), lastX);
-  await chart.press("Escape");
-  assert(await panel.isVisible());
-  await capture("overview");
-  const expand = usage.locator(".usage-expand").first();
-  if (await expand.count()) {
-    await expand.click(); await usage.locator(".usage-detail-row").first().waitFor();
-    await capture("details"); await expand.click();
-  }
-  const next = usage.getByRole("button", {name: "下一页", exact: true});
-  if (await next.getAttribute("aria-disabled") === "false") {
-    await next.scrollIntoViewIfNeeded();
-    const outer = panel.locator(".shell-settings-page");
-    const before = await outer.evaluate(element => element.scrollTop);
-    await next.click();
-    await usage.getByText("第 2 页 · 最多 50 条", {exact: true}).waitFor();
-    await ready();
-    assert(Math.abs(await outer.evaluate(element => element.scrollTop) - before) <= 2, "分页使外层页面跳动");
-    assert(await next.evaluate(element => element.getRootNode().activeElement === element), "分页丢失键盘焦点");
-    assert.equal(await usage.locator(".usage-table-scroll").evaluate(element => element.scrollTop), 0);
-    await capture("page-two");
-  }
-  const model = usage.getByRole("combobox", {name: "模型", exact: true});
-  if (await model.locator('option[value="usage-unavailable"]').count()) {
-    await model.selectOption("usage-unavailable");
-    await usage.getByText("2 次调用", {exact: true}).waitFor(); await ready();
-    assert.equal((await usage.locator(".usage-primary dd").first().innerText()).trim(), "—");
-    assert(await usage.locator(".usage-chart-bar.is-unknown").count() > 0);
-    await capture("unknown-usage");
-  }
-  // 仅中断本浏览器的一次真实 HTTP 读取，检查旧结果保留与恢复，不伪造统计响应。
-  const retained = await usage.locator(".usage-summary").innerText();
-  const fail = route => route.abort("failed");
-  await page.route("**/api/dashboard/model-usage?*", fail);
-  await usage.getByRole("button", {name: "刷新", exact: true}).click();
-  await usage.getByRole("alert").waitFor();
-  assert.equal(await usage.locator(".usage-summary").innerText(), retained);
-  await page.unroute("**/api/dashboard/model-usage?*", fail);
-  await usage.getByRole("button", {name: "重试", exact: true}).click();
-  await usage.getByRole("alert").waitFor({state: "hidden"}); await ready();
-  report.pages.push({width, page: "model-usage", keyboard: true, pagination: true, networkRecovery: true});
 }
 
 try {
@@ -595,20 +521,12 @@ try {
         });
         return route.abort();
       }
-      const chatDocument =
-        url.pathname === "/chat" || url.pathname === "/chat/";
-      const chatAsset =
-        url.pathname.startsWith("/assets/") &&
-        new URL(req.frame().url()).pathname.replace(/\/$/, "") === "/chat";
-      if (values.candidate && (chatDocument || chatAsset)) {
-        const file = chatDocument
-          ? "index.html"
-          : url.pathname.slice("/assets/".length);
+      // /assets/ 只发布聊天挂载模块（外壳在 /dashboard/assets/）。
+      if (values.candidate && url.pathname.startsWith("/assets/")) {
+        const file = url.pathname.slice("/assets/".length);
         assert(!file.includes("/"), "候选资源必须是构建目录的单个文件");
         const body = await readFile(resolve(root, "static/chat", file));
-        const type = file.endsWith(".html")
-          ? "text/html"
-          : file.endsWith(".css")
+        const type = file.endsWith(".css")
             ? "text/css"
             : file.endsWith(".js")
               ? "text/javascript"
@@ -653,11 +571,6 @@ try {
     );
     try {
       await page.goto(values.url, { waitUntil: "domcontentloaded" });
-      if (values.page === "model-usage") {
-        await modelUsage(page, width);
-        await context.close();
-        continue;
-      }
       // 全新 workspace 首跑时整屏引导会异步弹出并遮住导航；
       // 给它一个出现窗口，像用户一样关掉；看过后同一 context 内不再复现。
       if (

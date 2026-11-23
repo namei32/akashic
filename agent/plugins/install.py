@@ -12,17 +12,23 @@ from collections.abc import Mapping
 from typing import cast
 from uuid import uuid4
 
-from agent.plugins.python_environment import ENVIRONMENT_FILE, OfflineWheels, PythonEnvironments
+from agent.plugins.prerequisites import forget_plugin
+from agent.plugins.dependency_constraints import DependencyBatch, build_constraints
+from agent.plugins.resources import ensure_resources
+from agent.plugins.python_environment import (
+    ENVIRONMENT_FILE, INPROCESS_KEY, OfflineWheels, PythonEnvironments, inprocess_runtime,
+)
 from agent.plugins.reload_journal import ReloadJournal
 from agent.plugins.distribution_sources import distribution_plugin_sources, read_distribution_adoption
+from agent.plugins.extra_repo import is_official_repo, same_origin as same_origin
+from agent.plugins.source_resolver import ResolvedPluginSource
 from agent.plugins.files import sync_directory
+from agent.plugins.input_preparation import check_plugin_source, read_initial_config
 
 from agent.plugins.artifacts import (
-    ArtifactPointer,
     ArtifactPointers,
     read_pointers,
     relative_artifact_pointer,
-    resolve_pointer,
     write_pointers,
 )
 from agent.plugins.manifest import (
@@ -32,7 +38,8 @@ from agent.plugins.manifest import (
     plugins_root,
     workspace_plugin_data_dir,
 )
-from agent.plugins.bundles import patch_rows, set_plugin_choice
+from agent.plugins.bundles import absorbed_plugin_ids, patch_rows, set_plugin_choice
+from agent.plugins.selection import PluginSelection
 from agent.plugins.static_manifest import (
     StaticPluginManifest,
     load_static_plugin_manifest,
@@ -57,7 +64,6 @@ class _CacheActivation:
     previous_pointers: ArtifactPointers | None
     created_artifact: bool
     created_data_dir: bool
-    superseded_artifact: Path | None
     journal: ReloadJournal
 
     def rollback(self) -> None:
@@ -73,12 +79,6 @@ class _CacheActivation:
         # 3. 安装未提交时不留下本事务新建的正式 plugin-data 空目录。
         if self.created_data_dir:
             _remove_created_data_dir(self.result.data_path)
-
-    def finalize(self) -> None:
-        """提交完成后删除离线刷新所替代的旧 artifact。"""
-
-        if self.superseded_artifact is not None:
-            _remove_path(self.superseded_artifact)
 
 
 def set_installed_plugin_enabled(
@@ -110,6 +110,8 @@ def finalize_uninstall_plugin(
 
     home = plugins_home or plugins_root()
     plugin_name, marketplace = _split_installed_plugin_id(plugin_id)
+    # 卸载后包的前置条件声明与未启用原因不再有意义：一并清掉，重装时重新记。
+    forget_plugin(workspace, plugin_id)
     cache_path = home / "cache" / marketplace / plugin_name
     data_path = workspace_plugin_data_dir(workspace, plugin_name, marketplace)
     if cache_path.exists():
@@ -142,6 +144,9 @@ def install_git_plugin(
     update_id: str | None = None,
     offline_wheels: OfflineWheels | None = None,
     reserved_ids: frozenset[str] = frozenset(),
+    takeover: frozenset[str] = frozenset(),
+    reject_pending_migrations: bool = False,
+    dependency_batch: DependencyBatch | None = None,
 ) -> PluginInstallResult:
     home = (plugins_home or plugins_root()).resolve(strict=False)
     journal = ReloadJournal(workspace)
@@ -192,23 +197,23 @@ def install_git_plugin(
         if re.fullmatch(r"[0-9a-f]{40}", source_revision) is None:
             raise RuntimeError(f"插件 Git HEAD 无效: {source_revision}")
         static_manifest = load_static_plugin_manifest(clone_root)
+        check_plugin_source(clone_root)
+        _ = read_initial_config(clone_root)
         plugin_name = _validate_path_segment(static_manifest.name, "插件 name")
-        # 默认 preset 的身份不能被外置安装接管；克隆校验后、cache/data 写入前拒绝。
-        reserved = set(reserved_ids)
-        adoption = read_distribution_adoption(workspace)
-        if adoption is not None:
-            reserved.update(row["plugin_id"] for row in cast(tuple[Mapping[str, str], ...], adoption["entries"]))
-        receipt_path = workspace / "runtime/distribution-install.json"
-        if receipt_path.exists():
-            receipt = json.loads(receipt_path.read_text())
-            if marketplace == receipt["marketplace"]:
-                raise ValueError(f"外置插件不能接管内置数据身份: {plugin_name}@{marketplace}; 请使用独立 marketplace")
-            configured = os.environ.get("AKASHIC_PLUGIN_DISTRIBUTION")
-            if configured:
-                reserved.update(f"{item.plugin_name}@{item.marketplace}" for item in
-                                distribution_plugin_sources(Path(configured)))
-        if f"{plugin_name}@{marketplace}" in reserved:
-            raise ValueError(f"外置插件不能接管内置数据身份: {plugin_name}@{marketplace}; 请使用独立身份并显式停用原实现")
+        # 已被 Core 吸收的身份不再作为外置插件安装：在写 cache、patch 和安装记录之前拒绝，与 pkg install 的说明一致。
+        if (provider := absorbed_plugin_ids().get(f"{plugin_name}@{marketplace}")) is not None:
+            raise ValueError(f"{plugin_name}@{marketplace} 已并入 Core 的 {provider} 插件，不再作为扩展包安装")
+        _reject_takeover(
+            workspace=workspace,
+            plugin_id=f"{plugin_name}@{marketplace}",
+            marketplace=marketplace,
+            reserved_ids=reserved_ids,
+            takeover=takeover,
+            source=source,
+        )
+        # 只有实例运行中的在线调用方要求拒绝；离线安装放行，新迁移由下次启动的 runner 执行。
+        if reject_pending_migrations:
+            _reject_pending_migrations(workspace, clone_root, plugin_name, marketplace)
         plugin_version = _validate_path_segment(
             static_manifest.version,
             "插件 version",
@@ -228,6 +233,7 @@ def install_git_plugin(
             journal=journal, update_id=update_id,
             previous_enabled=previous_enabled,
             offline_wheels=offline_wheels,
+            dependency_batch=dependency_batch,
         )
         plugin_id = f"{plugin_name}@{marketplace}"
         try:
@@ -237,8 +243,103 @@ def install_git_plugin(
             activation.rollback()
             raise
         journal.commit_update(update_id)
-        activation.finalize()
     return activation.result
+
+
+# 官方来源的新制品带有未执行迁移时拒绝换代：在线实例不跑迁移，须走停机部署或启动。
+def _reject_pending_migrations(workspace: Path, clone_root: Path, plugin_name: str, marketplace: str) -> None:
+    from agent.migrations.runner import pending_artifact_migrations
+
+    source = ResolvedPluginSource(clone_root, "installed", marketplace, plugin_name)
+    pending = pending_artifact_migrations(workspace, source)
+    if pending:
+        raise ValueError(
+            f"{plugin_name}@{marketplace} 的目标版本带有待执行迁移 {', '.join(pending)}；"
+            "在线安装不执行迁移，请停机后离线安装或走停机部署"
+        )
+
+
+# 把 artifact 的 origin 改成真实上游地址；artifact 内容摘要不含 .git，不影响身份。
+# 地址按 same_origin 的口径写入（去首尾空白与末尾 /），pkg 才会把它判成同一来源。
+def set_artifact_origin(artifact: Path, upstream: str) -> None:
+    _ = _run_git(["remote", "set-url", "origin", "--", upstream.strip().rstrip("/")], cwd=artifact)
+
+
+# 默认 preset 的身份不能被外置安装接管；只有 takeover 显式列出的 plugin_id，
+# 或已是已安装来源的同源升级放行。
+def _reject_takeover(
+    *,
+    workspace: Path,
+    plugin_id: str,
+    marketplace: str,
+    reserved_ids: frozenset[str],
+    takeover: frozenset[str],
+    source: str,
+) -> None:
+    # 1. 汇总调用方保留的身份、历史归属凭证里的身份和发行版当前自带的身份。
+    reserved = set(reserved_ids)
+    adoption = read_distribution_adoption(workspace)
+    adopted: set[str] = set()
+    if adoption is not None:
+        adopted.update(row["plugin_id"] for row in cast(tuple[Mapping[str, str], ...], adoption["entries"]))
+    reserved.update(adopted)
+    receipt_path = workspace / "runtime/distribution-install.json"
+    receipt = json.loads(receipt_path.read_text()) if receipt_path.exists() else None
+    configured = os.environ.get("AKASHIC_PLUGIN_DISTRIBUTION")
+    if receipt is not None and configured:
+        reserved.update(f"{item.plugin_name}@{item.marketplace}" for item in
+                        distribution_plugin_sources(Path(configured)))
+    # 2. 显式接管、同源升级，或官方仓库对未被选择身份的全新安装，跳过其余检查。
+    if plugin_id in takeover or (plugin_id not in reserved and (
+            is_same_source_upgrade(workspace, plugin_id, source)
+            or is_official_fresh_install(workspace, plugin_id, source))):
+        return
+    # 3. 发行版回执：同 marketplace 拒绝；发行版自带或历史归属的身份拒绝。
+    if receipt is not None and marketplace == receipt["marketplace"]:
+        raise ValueError(f"外置插件不能接管内置数据身份: {plugin_id}; 请使用独立 marketplace")
+    if plugin_id in reserved:
+        raise ValueError(f"外置插件不能接管内置数据身份: {plugin_id}; 请使用独立身份并显式停用原实现")
+
+
+# 同源升级：当前选择里该身份已是 installed 输入，且已装 artifact 的 origin 与本次来源相同。
+# 调用方已确认该身份不在发行版自带与历史归属里；pkg 与安装器共用这一个判定。
+def is_same_source_upgrade(workspace: Path, plugin_id: str, source: str) -> bool:
+    selection = PluginSelection(workspace)
+    if not selection.path.exists():
+        return False
+    reference = selection.read()
+    if reference is None:
+        return False
+    for identity in selection.components(reference):
+        record = selection.read_input(identity)
+        if record["plugin_id"] == plugin_id and record["source_type"] == "installed":
+            code = Path(cast(str, record["code"]))
+            try:
+                origin = _run_git(["config", "--get", "remote.origin.url"], cwd=code)
+            except (RuntimeError, OSError):
+                return False
+            return same_origin(origin, source)
+    return False
+
+
+# 官方身份的全新安装：当前选择里没有该身份的任何输入（没有内置输入可被接管，也不是升级），
+# 来源是配置的官方 extra 仓库。调用方已确认该身份不在发行版自带与历史归属里；pkg 与安装器共用。
+def is_official_fresh_install(workspace: Path, plugin_id: str, source: str) -> bool:
+    if not is_official_repo(source):
+        return False
+    selection = PluginSelection(workspace)
+    if not selection.path.exists():
+        return True
+    reference = selection.read()
+    if reference is None:
+        return True
+    return all(selection.read_input(identity)["plugin_id"] != plugin_id
+               for identity in selection.components(reference))
+
+
+# 来源地址比较：只去掉首尾空白和末尾斜杠，其余逐字比较。
+# x 与 x.git 在本地路径和 HTTP 服务上都可以是两个不同的仓库，不做会改变含义的归一化。
+
 
 
 def _clone_git_source(
@@ -269,10 +370,29 @@ def _clone_git_source(
             cwd=destination,
         )
         return
+    if re.fullmatch(r"[0-9a-f]{40}", ref_name) and fetch_sha_shallow(source, destination, ref_name):
+        return
     _ = _run_git(["clone", "--", source, str(destination)])
     if ref_name:
         checkout_ref = _resolve_git_ref(ref_name, destination)
         _ = _run_git(["checkout", "--detach", checkout_ref], cwd=destination)
+
+
+# 按 40 位 SHA 浅取单个提交；服务器不允许按 SHA 取时返回 False，由调用方回退到完整克隆。
+def fetch_sha_shallow(source: str, destination: Path, sha: str) -> bool:
+    # 1. 空仓库加 origin，让 origin.url 与完整克隆一致。
+    _ = _run_git(["init", "--quiet"], cwd=destination)
+    _ = _run_git(["remote", "add", "origin", "--", source], cwd=destination)
+    try:
+        # 2. 只取这一个提交，深度 1。
+        _ = _run_git(["fetch", "--quiet", "--depth", "1", "origin", sha], cwd=destination)
+    except RuntimeError:
+        # 3. 服务器拒绝按 SHA 取：清空目录交给完整克隆路径。
+        for child in destination.iterdir():
+            _remove_path(child)
+        return False
+    _ = _run_git(["checkout", "--quiet", "--detach", sha], cwd=destination)
+    return True
 
 
 def _resolve_git_ref(ref_name: str, repository: Path) -> str:
@@ -317,6 +437,7 @@ def _activate_plugin_version(
     refresh_existing_artifact: bool,
     journal: ReloadJournal, update_id: str, previous_enabled: bool | None,
     offline_wheels: OfflineWheels | None,
+    dependency_batch: DependencyBatch | None = None,
 ) -> _CacheActivation:
     """Prepare one immutable artifact and publish its direct install pointer."""
 
@@ -335,21 +456,10 @@ def _activate_plugin_version(
         and previous_pointers.stable != previous_pointers.latest
     ):
         raise RuntimeError(f"插件有未决历史指针对，须先恢复: {plugin_name}@{marketplace}")
-    stable = (
-        previous_pointers.stable
-        if previous_pointers is not None
-        else ArtifactPointer(None)
-    )
-
     artifacts_root = plugin_base / ".artifacts"
     _ensure_directory(artifacts_root)
     artifact_id = f"{plugin_version}-{source_revision[:16]}"
     base_target_root = artifacts_root / artifact_id
-    superseded_artifact = (
-        resolve_pointer(plugin_base, stable)
-        if refresh_existing_artifact and stable.path is not None
-        else None
-    )
     target_root = (
         artifacts_root / f"{artifact_id}-restaged-{uuid4().hex[:16]}"
         if refresh_existing_artifact and base_target_root.exists()
@@ -369,15 +479,10 @@ def _activate_plugin_version(
     try:
         # 2. 在不可发现的 staging 目录复制代码并准备依赖，旧版本保持可见
         _ = shutil.copytree(clone_root, staging_root, dirs_exist_ok=True)
-        if offline_wheels is None:
-            _prepare_static_python_runtimes(
-                staging_root, static_manifest, workspace=workspace
-            )
-        else:
-            _prepare_static_python_runtimes(
-                staging_root, static_manifest, workspace=workspace,
-                offline_wheels=offline_wheels,
-            )
+        _prepare_static_python_runtimes(
+            staging_root, static_manifest, workspace=workspace,
+            offline_wheels=offline_wheels, dependency_batch=dependency_batch, plugins_home=cache_root.parents[1],
+        )
 
         # 3. 先落完整 artifact，再原子切换 stable/latest 指针对。
         if target_root.exists():
@@ -453,7 +558,6 @@ def _activate_plugin_version(
         previous_pointers=previous_pointers,
         created_artifact=created_artifact,
         created_data_dir=created_data_dir,
-        superseded_artifact=superseded_artifact,
         journal=journal,
     )
 
@@ -576,11 +680,22 @@ def _prepare_static_python_runtimes(
     *,
     workspace: Path,
     offline_wheels: OfflineWheels | None = None,
+    dependency_batch: DependencyBatch | None = None,
+    plugins_home: Path | None = None,
 ) -> None:
     """在最终耐久路径准备环境；安装 cache 只保存不可变引用。"""
+    environments = PythonEnvironments(workspace)
+    refs: dict[str, str] = {}
+    # 1. 显式声明的进程内依赖独立成环境，引用与子进程 runtime 记在同一份安装记录里。
+    inprocess = inprocess_runtime(plugin_root)
+    if inprocess is not None:
+        # 约束只作用于进程内环境；临时约束文件在整个准备期间保持存在。离线（部署）与在线路径用同一份约束。
+        with tempfile.TemporaryDirectory(prefix="akashic-constraints-") as scratch:
+            constraints = build_constraints(workspace, manifest.name, environments, Path(scratch), dependency_batch, plugins_home)
+            refs[INPROCESS_KEY] = environments.prepare(
+                plugin_root, inprocess, constraints=constraints, offline_wheels=offline_wheels)
+    # 2. 根与子目录 requirements.txt 的子进程 runtime，行为不变。
     if manifest.python:
-        environments = PythonEnvironments(workspace)
-        refs = {}
         used_offline_wheels = False
         for runtime in manifest.python:
             requirements = (plugin_root / runtime.requirements).read_text(encoding="utf-8")
@@ -591,8 +706,11 @@ def _prepare_static_python_runtimes(
                 used_offline_wheels = True
             else:
                 refs[runtime.runtime_root] = environments.prepare(plugin_root, runtime)
-        if offline_wheels is not None and not used_offline_wheels:
+        if offline_wheels is not None and not used_offline_wheels and inprocess is None:
             raise ValueError("没有非空 Python requirements，不能提供离线 wheel")
+    # 3. 声明了资源（resources.json）的插件：取回并发布，引用记在同一份安装记录里；没有声明时不产生任何键。
+    refs.update(ensure_resources(plugin_root, workspace))
+    if refs:
         with (plugin_root / ENVIRONMENT_FILE).open("w") as stream:
             _ = stream.write(json.dumps(refs, sort_keys=True))
             stream.flush()

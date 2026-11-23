@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -36,6 +37,7 @@ status = json.loads(subprocess.check_output([
 ], text=True))
 assert any(plugin['plugin_id'] == 'gateway@release' and plugin['state'] == 'active'
            for plugin in status['plugins']), '本地控制入口没有加载 Gateway'
+assert status['preset']['missing'] == [], ('首装缺少 preset 启用的插件', status['preset'])
 patch = state / 'workspace/bundle.patch.toml'
 paths = ('startup.json', 'config.toml',
          'workspace/runtime/distribution-install.json',
@@ -47,9 +49,10 @@ print(json.dumps({'uid': os.getuid(), 'source_commit': report['source_commit'],
 """
 
 
-def check_web(origin: str) -> list[str]:
+def check_web(origin: str, secret: str) -> list[str]:
     """通过映射端口读取真实网页和插件模块，不发送模型请求。"""
     opener = build_opener(ProxyHandler({}))
+    opener.addheaders = [("Authorization", "Bearer " + secret)]
     with opener.open(origin + '/', timeout=10) as response:
         assert b'<html' in response.read().lower(), '网页没有返回 HTML'
     with opener.open(origin + '/api/shell/state', timeout=10) as response:
@@ -59,6 +62,12 @@ def check_web(origin: str) -> list[str]:
     assert modules, '默认插件没有提供 Web 模块'
     for module in modules:
         assert module['module'], module['pluginId']
+        # 内容寻址端点按当前目录校验摘要,字节必须与描述符一致。
+        with opener.open(origin + '/api/chat/web-ui/module?plugin_id='
+                         + module['pluginId'] + '&sha256=' + module['moduleSha256'],
+                         timeout=10) as asset:
+            body = asset.read()
+        assert hashlib.sha256(body).hexdigest() == module['moduleSha256'], module['pluginId']
     plugins = sorted(module['pluginId'] for module in modules)
     names = {plugin.split('@', 1)[0] for plugin in plugins}
     assert {'onboarding', 'conversation-ui', 'shell-ui'} <= names, plugins
@@ -99,7 +108,9 @@ def main() -> None:
         compose('up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600')
         address = compose('port', 'akashic', '2236', capture=True)
         origin = 'http://' + address
-        modules = check_web(origin)
+        secret = compose("exec", "-T", "akashic", "cat",
+                         "/data/workspace/web-auth/secret", capture=True)
+        modules = check_web(origin, secret)
         before = json.loads(compose('exec', '-T', 'akashic', 'python', '-c', SNAPSHOT, capture=True))
         assert before['source_commit'] == args.revision, before['source_commit']
         print('首次启动通过：普通用户、只读制品、真实网页和插件模块', flush=True)
@@ -111,7 +122,7 @@ def main() -> None:
         compose('down')
         compose('up', '-d', '--no-build', '--pull', 'never', '--wait', '--wait-timeout', '600')
         origin = 'http://' + compose('port', 'akashic', '2236', capture=True)
-        assert check_web(origin) == modules, '重启后的 Web 插件集合改变'
+        assert check_web(origin, secret) == modules, '重启后的 Web 插件集合改变'
         after = json.loads(compose('exec', '-T', 'akashic', 'python', '-c', SNAPSHOT, capture=True))
         assert after == before, '重启改写了安装记录、配置或插件选择'
         report = {'project': project, 'image': args.image, **after, 'web_modules': modules,

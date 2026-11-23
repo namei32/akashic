@@ -21,9 +21,8 @@ Core Web Host
     └── shell-ui                        普通插件，拥有品牌顶栏、页面导航与设置工作区
         ├── shell.pages                 顶带页面
         │   ├── conversation-ui         普通插件，拥有会话侧栏与对话页
-        │   ├── workbench-ui            普通插件，拥有工作台页
-        │   │   └── workbench.panels    Dashboard 面板迁入
-        │   └── runtime-ui              可选只读目录，分别读取各领域 owner
+        │   └── workbench-ui            普通插件，拥有工作台页
+        │       └── workbench.panels    Dashboard 面板迁入
         ├── shell.rail-actions          底栏动作目录
         ├── shell.settings              设置工作区顶层分节
         │   ├── onboarding              初始配置
@@ -35,11 +34,7 @@ Core Web Host
         └── shell.settings-plugins      普通插件配置分节（telegram、akasha、wake…）
 ```
 
-Chat 内置的“知识与运行”页面已删除。选择普通 `runtime-ui` 插件可显示只读运行目录；
-它通过 `shell.pages.v1` 登记页面，通过 Host HTTP client 访问自身 Dashboard 路由，
-再借用文档、任务和技能检查能力，或调用当前 runtime catalog/MCP detail 合同。
-目录分别处理读取失败；MCP 列表只展示注册目标，点击详情才打开真实 owner 会话。
-MCP、Skill、job、runtime inspection、Akasha 和移动端能力仍由各自 owner 提供。
+“知识与运行”独立 Web 页面已删除；MCP、Skill、job、runtime inspection、Akasha 和移动端能力仍由各自 owner 提供。
 
 ## 2. 用六岁小孩能懂的话解释
 
@@ -57,7 +52,7 @@ Core 只是一块有电的空地，留一个总插座：`web.root`。`shell-ui` 
 
 用户希望 L 形 2236 WebUI 本身由平等、非特权、可外置安装的普通插件拼成：
 
-- 顶部保留“对话”“工作台”“模型”，不再由 `frontend/dashboard` 写死。
+- 顶部保留“对话”“工作台”“模型”，不再由 `frontend/plugins/ui/dashboard` 写死。
 - 页面可以继续声明自己的嵌套 UI 扩展点；Provider UI 是第一条纵向组合证明。
 - `models`、`codex`、`opencode-go`、`openai-compatible` 即使移出本仓库，作为普通插件正式 install 后仍能提供同样页面和行为。
 - 新增第四种 Provider 只新增插件，不修改 Core、Shell 或 `models` 的 Provider 分支。
@@ -71,7 +66,7 @@ Core 只是一块有电的空地，留一个总插座：`web.root`。`shell-ui` 
 
 ### 4.1 实现后的真实调用链
 
-`frontend/dashboard/src/main.tsx` 只启动通用 Web Host。`shell-ui` 注册顶栏、history、
+`frontend/plugins/ui/dashboard/src/main.tsx` 只启动通用 Web Host。`shell-ui` 注册顶栏、history、
 `shell.pages.v1`、`shell.rail-actions.v1`、`shell.settings.v1` 与 `shell.settings-plugins.v1`；
 `conversation-ui` 与 `workbench-ui` 注册顶带页面，`onboarding` 与 `models` 注册设置分节，
 普通插件的配置表单注册进 `shell.settings-plugins.v1`。删除任一普通插件，
@@ -129,13 +124,13 @@ Web Chat 读取同一活动 Root 的目录。
 
 ### 4.3 已处理的现有决策冲突
 
-[0051](../decisions/0051-web-ui-composes-ordinary-plugin-modules.md) 将对话页面归普通 `conversation-ui` 插件组合；`frontend/chat` 仍是页面源码。Android Shell 加载这套 Web 页面，旧客户端发布和 Bridge 合同由 [0076](../decisions/0076-android-shell-retires-legacy-mobile-stack.md) 退役。
+[0051](../decisions/0051-web-ui-composes-ordinary-plugin-modules.md) 将对话页面归普通 `conversation-ui` 插件组合；`frontend/plugins/akashic_clients/chat` 仍是页面源码。Android Shell 加载这套 Web 页面，旧客户端发布和 Bridge 合同由 [0076](../decisions/0076-android-shell-retires-legacy-mobile-stack.md) 退役。
 
 2236 的 Web module catalog 是 exact plugin snapshot 的派生投影，没有独立 Stable 指针、journal、retired manager 或持久 generation。
 
 ### 4.4 保留边界
 
-- Conversation 继续复用 `frontend/chat` 的产品实现，但顶层 entry、readiness 与 adapter 由
+- Conversation 继续复用 `frontend/plugins/akashic_clients/chat` 的产品实现，但顶层 entry、readiness 与 adapter 由
   `conversation-ui` 普通插件拥有；Host 不提供 iframe 或 Chat 专用 API。
 - Workbench 面板只通过 `workbench.panels.v2` 登记。v2 固定结构化 entry，并让 Host 为计数、分页与详情读取提供 `AbortSignal`；旧 Dashboard browser ABI 已在最后一个仓库内
   consumer 迁完后删除；插件自己的 `UI.register(..., dashboard=loader)` HTTP route 保留。
@@ -165,6 +160,23 @@ Web Chat 读取同一活动 Root 的目录。
 │ 有调用：详情；缺调用：结果行 │
 └────────────────────────────┘
 ```
+
+工具业务的专用展示归工具 owner：消息投影给每个工具调用附上注册它的插件（`owner`），
+聊天页的 `tool.result` 插槽只把结果交给这个插件的渲染器（例如 shell 的命令块），
+渲染器 `accepts` 返回 false 或插件没有界面时退回上面的通用数据展示。其他插件不能认领
+或替换别人工具的结果展示；归档里没有 owner 的旧调用同样走通用展示。宿主只保留与业务
+无关的文本能力（长文本预览、统一 diff 着色、数据展开），并经 `@akashic/chat-ui-v1`
+导出给插件复用。
+
+工具 owner 还可以经 `tool.summary`（同步数据源，同样只问 owner）把一次调用描述成委派出去的任务：
+插件只给任务名、标签、说明、工作目录、预览与可选状态，宿主据此画任务卡、把连续的任务收成一组，
+并负责展开、悬停浮卡、键盘与读屏；返回 null 或插件尚未加载时仍是通用工具行。宿主不按参数形状猜测委派。
+
+工具图标默认来自插件后端注册时的声明（`ToolCatalog.declare_group(..., icon=...)` 设组级默认，
+`ToolCatalog.register(..., icon=...)` 设单工具覆写），支持 Lucide 语义名或经安全校验的单色线框 SVG
+（`currentColor`、`viewBox="0 0 24 24"`、白名单几何节点），由 `TOOL_DISPLAY` 投影到 `tool_call.icon`；
+多态工具如需按调用参数动态切换图标（如 `user_information_query` 按 `provider` 切图），owner 可额外通过
+`tool.icon`（同步数据源插槽）覆写，返回 null 或未声明时按“单工具 → 组级 → 默认 Wrench”逐级回退。
 
 本路径不增加、更新或减少持久消息、配置或工具效果。引用 owner 的 generation lease
 覆盖读取与投影；缺少专用回调时仍保留通用数据。恢复使用原源码版本，无 schema 或数据迁移。
@@ -320,7 +332,6 @@ shell.settings-plugins，分节自己声明子目录即可拥有更深层级。
 | `shell-ui` | `web.root.v1` | 唯一 Shell；声明 `shell.pages.v1`、`shell.rail-actions.v1`、`shell.settings.v1` 与 `shell.settings-plugins.v1` | 品牌顶栏、页面导航、route/history、底栏动作目录、设置工作区 |
 | `conversation-ui` | `shell.pages.v1` | `conversation` page | 会话侧栏、消息、composer、desktop adapter |
 | `workbench-ui` | `shell.pages.v1` | `workbench` page；声明 `workbench.panels.v2` | Session/Plugin 工作台布局、最新读取与 panel adapter |
-| `runtime-ui` | `shell.pages.v1` | `runtime` page | 各目录独立读取；MCP 详情按需查询 |
 | `onboarding` | `shell.settings.v1` | `onboarding` 设置分节 | 初始配置清单与首跑邀请 |
 | `models` | `shell.settings.v1` | `models` 设置分节；声明 `models.connection-types.v1` | catalog、Connection、Binding、默认 chat/embedding 的 UI |
 | 普通插件配置 | `shell.settings-plugins.v1` | 自己的配置分节（如 `telegram_channel`、`wake`） | 各自的配置表单与凭据动作 |
@@ -467,8 +478,10 @@ JS 语法、首次 `activate`、mount 冲突、首屏 render 和 disposer 由生
 
 `workbench-ui` 注册顶层 page 和 `workbench.panels.v2`。Shell 与 Workbench 的可编辑源码位于各自
 `plugins/*/web/`，聚合构建器按入口发现插件，只消费插件源码和 `@akashic/web-ui-v1` 的公开 Tailwind preset，
-不再把 `frontend/dashboard/src` 或 Dashboard 私有配置当作隐藏输入。面板迁为只依赖 Host SDK 的 Web module 后，旧 Shell dashboard 分支、浏览器 panel adapter、源码扫描和请求期编译一起删除；插件自己的 Dashboard
+不再把 `frontend/plugins/ui/dashboard/src` 或 Dashboard 私有配置当作隐藏输入。面板迁为只依赖 Host SDK 的 Web module 后，旧 Shell dashboard 分支、浏览器 panel adapter、源码扫描和请求期编译一起删除；插件自己的 Dashboard
 HTTP/data ABI 继续由 `UI.register(..., dashboard=loader)` 拥有。
+
+需要普通浏览器导航的页面可显式声明 `navigation_paths=("/plugin/page.html",)`。这些路径必须是已注册、无路径参数、仅支持 GET/HEAD 的页面，不能位于 `/api/dashboard` 命名空间。只有这些页面的 GET/HEAD 请求可省略 Web 模块身份；已有登录校验、owner 生命周期及携带身份时的目录校验仍然适用。其余路由保持原身份要求。
 
 ### 阶段 3：迁移模型页和 Provider 子 UI
 

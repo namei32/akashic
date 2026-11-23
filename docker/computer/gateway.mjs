@@ -1,14 +1,22 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { setTimeout as sleep } from "node:timers/promises";
 import { ComputerDriver } from "./driver/runtime.mjs";
+import { SpaceInputError } from "./driver/spaces.mjs";
 import { ComputerLifecycle, duration } from "./lifecycle.mjs";
 import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { createServer, request as httpRequest } from "node:http";
+import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { connect as tcpConnect } from "node:net";
+import { connect as tcpConnect, createServer as createTcpServer } from "node:net";
+import { dirname } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
+// 流服务的主令牌只在容器里生成；Dashboard 经网关取得后签发观看令牌、切换输入权限和传输方式。
+process.env.COMPUTER_STREAM_TOKEN ||= randomBytes(24).toString("hex");
+// WebRTC 的 ICE 服务器（远程用的 TURN）由 Dashboard 写入，流服务监视这个文件、新连接即生效。
+process.env.COMPUTER_RTC_FILE ||= "/tmp/computer-stream/rtc.json";
 let driver;
 let driverReady;
 const driverCalls = new Map();
@@ -55,11 +63,20 @@ const computer = new ComputerLifecycle({
     }
     if (failure) throw failure;
     // 重启后旧一代可能还有迟到的事件；只转发当前这一代的。
-    const owner = new ComputerDriver({ anonymousIdleMs: duration("COMPUTER_ANONYMOUS_IDLE_MS", 600000) });
+    const owner = new ComputerDriver({
+      anonymousIdleMs: duration("COMPUTER_ANONYMOUS_IDLE_MS", 600000),
+      maxSpaceConcurrency: Number(process.env.COMPUTER_SPACE_CONCURRENCY) || 4,
+      shouldAllowExternalFocus: () => foregroundOpenCliCount > 0,
+    });
     driver = owner;
     owner.on("cursor", (state) => { if (driver === owner) publishCursor(state); });
     owner.on("control", () => { if (driver === owner) scheduleState(); });
-    owner.on("activity", () => { if (driver === owner) scheduleState(); });
+    owner.on("activity", () => {
+      if (driver !== owner) return;
+      // 一次调用里连续的几步之间只隔几毫秒：最后一步做完再等 BUSY_TAIL_MS 才放开，人的输入权限不来回闪。
+      if (!owner.agentJobs.size) { busyUntil = Date.now() + BUSY_TAIL_MS; setTimeout(scheduleState, BUSY_TAIL_MS + 10); }
+      scheduleState();
+    });
     owner.on("targets", () => { if (driver === owner) scheduleState(); });
     driverReady = owner.start();
     await driverReady;
@@ -90,12 +107,13 @@ const legacyCall = new AsyncLocalStorage();
 // 订阅者 → 它最近收到的状态快照；按订阅者去重，新订阅者也能补到最新状态。
 const eventClients = new Map();
 let cursor = { revision: 0, point: null, error: "" };
+const BUSY_TAIL_MS = 300;
+let busyUntil = 0;
 let stateTimer = null;
 let stateDirty = false;
 
 function cursorEvent() {
-  const ttlMs = cursor.point ? Math.max(0, cursor.point.expiresAt - Date.now()) : 0;
-  return `data: ${JSON.stringify({ type: "cursor", ...cursor, ttlMs })}\n\n`;
+  return `data: ${JSON.stringify({ type: "cursor", ...cursor })}\n\n`;
 }
 
 /** 慢消费者直接断开，不能让操作等待显示或积压事件。 */
@@ -105,10 +123,9 @@ function broadcast(event) {
   }
 }
 
-/** 坐标只驻留内存。 */
+/** 坐标只驻留内存；最后的落点一直保留，直到 Agent 下一次操作。 */
 function publishCursor({ point, error = "" }) {
-  cursor = { revision: cursor.revision + 1,
-    point: point ? { ...point, expiresAt: Date.now() + 5000 } : null, error };
+  cursor = { revision: cursor.revision + 1, point: point ?? null, error };
   broadcast(cursorEvent());
 }
 
@@ -119,6 +136,8 @@ async function stateEvent() {
     type: "state",
     noticeId: activity.noticeId,
     active: activity.active || Boolean(driver?.agentJobs.size),
+    // Agent 正在执行单个浏览器操作；只有这时才挡住人的键鼠。
+    busy: Boolean(driver?.agentJobs.size) || Date.now() < busyUntil,
     turns: [...new Set([...computer.turns, ...[...(driver?.actives.values() ?? [])]
       .map(call => JSON.stringify([call.context.session_id, call.context.turn_id]))])],
     browser: { state: computer.state, error: computer.error },
@@ -155,23 +174,50 @@ async function publishState() {
 }
 
 class InputError extends Error {}
-// The Agent is using the browser; a viewer must take control before acting.
-class BusyError extends InputError {}
 
-// 人工直接操作：接管就绪时记进接管的操作，交还前会等它做完；没人接管、Agent 也没有回合和操作时直接执行。
-async function humanAction(id, task) {
-  const owner = driver, control = owner.control;
-  if (control ? !control.ready || control.id !== id
-    : id || activeOperations.size || computer.turns.size || owner.actives.size || owner.agentJobs.size)
-    throw new BusyError("The browser is in use; take control in this window first");
-  // Register before awaiting: Agent work and takeover must wait for admitted navigation.
-  const jobs = control ? control.jobs : owner.humanJobs;
-  const job = computer.use(task);
-  jobs.add(job);
-  try { return await job; } finally { jobs.delete(job); }
+// 人在画面上操作就持有短租约：Agent 做完当前这一步后停下，人停手 LEASE_MS 后自动交还。
+// 画面同一时刻只给一个窗口，租约不区分窗口。
+const LEASE_ID = "viewer";
+const LEASE_MS = 5000;
+let leaseTimer;
+let leasing = null;
+
+async function holdLease() {
+  if (!driver || computer.state !== "ready") throw new InputError("Computer is not awake");
+  const owner = driver;
+  // 1. 正在交还时等它结束再重新拿；正在拿时共用同一次。
+  while (owner.control?.release) await owner.control.release.catch(() => undefined);
+  if (!owner.control) {
+    leasing ??= (async () => {
+      const releaseWorkload = await computer.acquire();
+      try {
+        const front = (await owner.targets()).find(target => target.front)?.id ?? "";
+        await owner.takeControl(LEASE_ID, front);
+        owner.control.releaseWorkload = releaseWorkload;
+      } catch (error) { releaseWorkload(); throw error; }
+    })().finally(() => { leasing = null; });
+  }
+  if (leasing) await leasing;
+  if (owner.control?.id !== LEASE_ID || !owner.control.ready) throw new Error("Computer viewer lease has ended");
+  // 2. 每次人工输入都从头计时。
+  clearTimeout(leaseTimer);
+  leaseTimer = setTimeout(() => owner.releaseControl(LEASE_ID).catch(error => {
+    owner.closed = true;
+    owner.rejectAll(error);
+    console.error("Computer viewer lease release failed:", error.message);
+  }), LEASE_MS);
+  return owner.control;
 }
 
-// 地址栏只打开网页和空白页，不执行 javascript: 等会在页面里运行代码的地址。
+// 地址栏、标签条等人工操作同样持有租约；交还前等它做完。
+async function humanAction(task) {
+  const control = await holdLease();
+  const job = computer.use(task);
+  control.jobs.add(job);
+  try { return await job; } finally { control.jobs.delete(job); }
+}
+
+// 地址栏打开网页、本地文件和空白页，不执行 javascript: 等会在页面里运行代码的地址。
 function pageUrl(value) {
   const text = requiredString(value, "url", 8192);
   let url;
@@ -180,8 +226,8 @@ function pageUrl(value) {
     if (error instanceof TypeError) throw new InputError("Invalid page URL");
     throw error;
   }
-  if (!["http:", "https:"].includes(url.protocol) && url.href !== "about:blank")
-    throw new InputError("Only http, https and about:blank pages can be opened");
+  if (!["http:", "https:", "file:"].includes(url.protocol) && url.href !== "about:blank")
+    throw new InputError("Only http, https, file and about:blank pages can be opened");
   return url.href;
 }
 
@@ -523,6 +569,20 @@ async function screenshot(response, quiet) {
   response.end(bytes);
 }
 
+const openCliMaxBodyBytes = 4 * 1024 * 1024;
+let foregroundOpenCliCount = 0;
+
+async function readRawBody(request, limitBytes) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > limitBytes) throw new InputError("request body is too large");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
 async function proxyOpenCli(request, response) {
   const url = new URL(request.url ?? "/", "http://opencli.local");
   if (request.headers["x-opencli"] !== "1" || request.headers.upgrade) {
@@ -540,48 +600,141 @@ async function proxyOpenCli(request, response) {
     if (!response.writableFinished) controller.abort(new Error("OpenCLI caller disconnected"));
   });
   try {
+    let rawBody = null;
+    let isBackground = request.method === "GET" || request.method === "HEAD";
+    if (!isBackground) {
+      rawBody = await readRawBody(request, openCliMaxBodyBytes);
+      if (url.pathname === "/command" && rawBody.length > 0) {
+        try {
+          const parsed = JSON.parse(rawBody.toString("utf8"));
+          if (parsed?.windowMode === "background") isBackground = true;
+        } catch {
+          // Malformed JSON is forwarded to OpenCLI daemon as-is.
+        }
+      }
+    }
+
+    const forward = () => new Promise((resolve, reject) => {
+      if (response.destroyed) {
+        resolve();
+        return;
+      }
+      let settled = false;
+      const done = (err) => {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err);
+        else resolve();
+      };
+      response.once("finish", () => done());
+      response.once("close", () => done());
+      const headers = { ...request.headers, host: "127.0.0.1:19825" };
+      if (rawBody !== null) {
+        delete headers["transfer-encoding"];
+        headers["content-length"] = String(rawBody.length);
+      }
+      const upstream = httpRequest(
+        {
+          hostname: "127.0.0.1",
+          port: 19825,
+          method: request.method,
+          path: request.url,
+          headers,
+        },
+        (upstreamResponse) => {
+          response.writeHead(
+            upstreamResponse.statusCode ?? 502,
+            upstreamResponse.headers,
+          );
+          const failStream = (err) => {
+            const error = err ?? new Error("OpenCLI upstream response aborted");
+            if (!response.destroyed) response.destroy(error);
+            done(error);
+          };
+          upstreamResponse.on("error", failStream);
+          upstreamResponse.on("aborted", () => failStream(new Error("OpenCLI upstream response aborted")));
+          upstreamResponse.on("close", () => {
+            if (!upstreamResponse.complete) failStream(new Error("OpenCLI upstream response closed prematurely"));
+          });
+          upstreamResponse.pipe(response);
+        },
+      );
+      upstream.setTimeout(125_000, () =>
+        upstream.destroy(new Error("OpenCLI daemon timed out")),
+      );
+      upstream.on("error", (error) => {
+        if (!response.headersSent)
+          json(response, 502, { error: error.message });
+        else if (!response.destroyed) response.destroy(error);
+        done(error);
+      });
+      response.once("close", () => upstream.destroy());
+      upstream.end(rawBody ?? undefined);
+    });
+
     await computer.use(async () => {
       await readyDriver();
-      return driver.agentOperation(() => new Promise((resolve, reject) => {
-          if (response.destroyed) {
-            resolve();
-            return;
-          }
-          response.once("finish", resolve);
-          response.once("close", resolve);
-          const upstream = httpRequest(
-            {
-              hostname: "127.0.0.1",
-              port: 19825,
-              method: request.method,
-              path: request.url,
-              headers: { ...request.headers, host: "127.0.0.1:19825" },
-            },
-            (upstreamResponse) => {
-              response.writeHead(
-                upstreamResponse.statusCode ?? 502,
-                upstreamResponse.headers,
-              );
-              upstreamResponse.pipe(response);
-            },
-          );
-          upstream.setTimeout(125_000, () =>
-            upstream.destroy(new Error("OpenCLI daemon timed out")),
-          );
-          upstream.on("error", (error) => {
-            if (!response.headersSent)
-              json(response, 502, { error: error.message });
-            else response.destroy(error);
-            reject(error);
-          });
-          response.once("close", () => upstream.destroy());
-          request.pipe(upstream);
-        }), controller.signal);
+      if (isBackground) return await forward();
+      foregroundOpenCliCount++;
+      try {
+        return await driver.agentOperation(forward, controller.signal);
+      } finally {
+        foregroundOpenCliCount--;
+      }
     });
   } catch (error) {
+    if (error instanceof InputError) {
+      if (!response.headersSent && !response.destroyed) json(response, 400, { error: error.message });
+      return;
+    }
     if (!response.headersSent && !response.destroyed)
       json(response, 502, { error: error.message });
     else console.error("OpenCLI proxy:", error.message);
+  }
+}
+
+async function handleSpacesRequest(request, response) {
+  if (stopping) {
+    json(response, 503, { ok: false, error: "Computer is stopping" });
+    return;
+  }
+  const url = new URL(request.url ?? "/", "http://spaces.local");
+  const controller = new AbortController();
+  response.once("close", () => {
+    if (!response.writableFinished) controller.abort(new Error("Space caller disconnected"));
+  });
+  try {
+    if (request.method === "GET" && url.pathname === "/spaces/health") {
+      json(response, 200, {
+        ok: true,
+        state: computer.state,
+        active: driver?.spaces?.activeCount ?? 0,
+        queued: driver?.spaces?.queuedCount ?? 0,
+        maxConcurrency: driver?.spaces?.maxConcurrency ?? (Number(process.env.COMPUTER_SPACE_CONCURRENCY) || 4),
+      });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/spaces/run") {
+      const payload = await body(request);
+      const output = await computer.use(async () => {
+        await readyDriver();
+        return await driver.spaces.run(payload, controller.signal);
+      });
+      json(response, 200, { ok: true, ...output });
+      return;
+    }
+    json(response, 404, { ok: false, error: "not found" });
+  } catch (error) {
+    if (driver?.closed && computer.state === "ready") {
+      computer.fail(error);
+    }
+    const status = error instanceof InputError || error instanceof SpaceInputError || error instanceof SyntaxError ? 400 : 500;
+    if (!response.headersSent && !response.destroyed) {
+      json(response, status, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 }
 
@@ -720,70 +873,50 @@ const server = createServer(async (request, response) => {
     } else if (request.method === "POST" && ["/view/navigate", "/view/open", "/view/close"].includes(url.pathname)) {
       const payload = await body(request);
       if (!driver || computer.state !== "ready") throw new InputError("Computer is not awake");
-      const id = payload.control === undefined ? "" : requiredString(payload.control, "control", 128);
       if (url.pathname === "/view/open") {
         const address = payload.url === undefined ? "about:blank" : pageUrl(payload.url);
-        json(response, 200, { target: await humanAction(id, () => driver.openPage(address)) });
+        json(response, 200, { target: await humanAction(() => driver.openPage(address)) });
         return;
       }
       const target = requiredString(payload.target, "target", 128);
-      if (url.pathname === "/view/close") await humanAction(id, () => driver.closePage(target));
+      if (url.pathname === "/view/close") await humanAction(() => driver.closePage(target));
       else if (!["go", "back", "forward", "reload"].includes(payload.action))
         throw new InputError("action must be go, back, forward or reload");
       else {
         const address = payload.action === "go" ? pageUrl(payload.url) : "";
-        await humanAction(id, () => driver.navigate(target, payload.action, address));
+        await humanAction(() => driver.navigate(target, payload.action, address));
       }
       json(response, 200, { done: true });
     } else if (request.method === "POST" && url.pathname === "/view/touch") {
-      // 观看者直接操作页面不经过网关；面板代理转发输入时续期，人在用时不休眠。
+      // 观看者直接操作页面不经过网关：续期防止休眠；input 表示人刚按下键鼠，持有租约让 Agent 停下。
+      const payload = await body(request);
       if (computer.state === "ready") computer.touch();
+      // 拿不到租约（浏览器正在休眠或重启）不影响人的输入，也不能断开画面。
+      if (payload.input === true && computer.state === "ready")
+        await holdLease().catch(error => console.error("Computer viewer lease:", error.message));
       json(response, 200, { touched: computer.state === "ready" });
     } else if (request.method === "GET" && url.pathname === "/activity") {
       json(response, 200, { ...activity, browser: computer.status(), control: driver?.control ? { active: true } : { active: false } });
-    } else if (request.method === "POST" && url.pathname.startsWith("/control/")) {
-      const payload = await body(request);
-      requiredString(payload.id, "id", 128);
-      if (url.pathname === "/control/take") {
-        if (!driver || computer.state !== "ready") throw new InputError("Computer is not awake");
-        const target = payload.target ?? "";
-        if (driver.control) throw new InputError("Another viewer controls this Computer");
-        if (target) await driver.show(target);
-        const controller = new AbortController();
-        const disconnected = () => {
-          if (!response.writableFinished) controller.abort(new Error("Control caller disconnected"));
-        };
-        response.once("close", disconnected);
-        if (response.destroyed) disconnected();
-        const releaseWorkload = await computer.acquire();
-        try {
-          await driver.takeControl(payload.id, target, controller.signal);
-          if (driver.control?.id !== payload.id) throw new Error("Control connection has ended");
-          driver.control.releaseWorkload = releaseWorkload;
-        } catch (error) { releaseWorkload(); throw error; }
-        finally { response.removeListener("close", disconnected); }
-      } else if (url.pathname === "/control/release") {
-        if (driver) await driver.releaseControl(payload.id);
-      } else if (url.pathname !== "/control/renew") {
-        throw new InputError("Unknown control operation");
-      }
-      if (url.pathname !== "/control/release") {
-        if (driver?.control?.id !== payload.id || !driver.control.ready)
-          throw new InputError("Control connection has ended");
-        clearTimeout(controlTimer);
-        const owner = driver;
-        controlTimer = setTimeout(() => owner.releaseControl(payload.id).catch(error => {
-          owner.closed = true;
-          owner.rejectAll(error);
-          console.error("Computer control release failed:", error.message);
-        }), 30000);
-      }
-      json(response, 200, { controlled: url.pathname !== "/control/release" });
     } else if (request.method === "POST" && url.pathname === "/restart") {
       await computer.restart();
       json(response, 200, computer.status());
     } else if (request.method === "POST" && url.pathname === "/wake") {
       json(response, 200, computer.status());
+    } else if (request.method === "GET" && url.pathname === "/stream/token") {
+      json(response, 200, { token: process.env.COMPUTER_STREAM_TOKEN });
+    } else if (request.method === "PUT" && url.pathname === "/stream/rtc") {
+      const { iceServers } = await body(request);
+      if (!Array.isArray(iceServers) || !iceServers.every(item => item && typeof item === "object" && item.urls)) {
+        throw new InputError("iceServers must be a list of servers with urls");
+      }
+      // 流服务只信任属主自己、不可被他人写的文件；整文件换名，监视方不会读到半截。
+      const target = process.env.COMPUTER_RTC_FILE;
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      // 每次写自己的临时文件，并发请求不会互相换走对方写到一半的内容。
+      const next = `${target}.${randomBytes(6).toString("hex")}`;
+      await writeFile(next, JSON.stringify({ iceServers }), { mode: 0o600 });
+      await rename(next, target);
+      json(response, 200, { ok: true });
     } else if (request.method === "GET" && url.pathname === "/screenshot") {
       await screenshot(response, url.searchParams.get("quiet") === "1");
     } else if (request.method === "POST" && url.pathname === "/input") {
@@ -801,8 +934,7 @@ const server = createServer(async (request, response) => {
     if (driver?.closed && computer.state === "ready") {
       computer.fail(error);
     }
-    const status = error instanceof BusyError ? 409
-      : error instanceof InputError || error instanceof SyntaxError ? 400 : 500;
+    const status = error instanceof InputError || error instanceof SyntaxError ? 400 : 500;
     json(response, status, {
       error: error instanceof Error ? error.message : String(error),
     });
@@ -816,9 +948,20 @@ const server = createServer(async (request, response) => {
 }).listen(8080, "0.0.0.0");
 
 const openCliServer = createServer(proxyOpenCli).listen(19826, "0.0.0.0");
+const spacesServer = createServer(handleSpacesRequest).listen(19827, "0.0.0.0");
+// 宿主出口：Controller 挂入 Host Bridge 的 SOCKS5 socket 时转成容器本机端口给 Chromium（它不能直接用 unix socket 代理）。
+const HOST_EGRESS = "/run/akashic/host-egress";
+if (existsSync(HOST_EGRESS)) {
+  createTcpServer((client) => {
+    const upstream = tcpConnect({ path: `${HOST_EGRESS}/socks.sock` });
+    const drop = () => { client.destroy(); upstream.destroy(); };
+    client.on("error", drop);
+    upstream.on("error", drop);
+    client.pipe(upstream).pipe(client);
+  }).listen(1080, "127.0.0.1");
+}
 let stopping = false;
 let refreshTimer;
-let controlTimer;
 /** 一次刷新持有完整占用；失败回执与下一次计划均保留在控制服务。 */
 async function refreshIdentity() {
   try {
@@ -900,6 +1043,7 @@ async function stop() {
   server.close();
   for (const client of eventClients.keys()) client.end();
   openCliServer.close();
+  spacesServer.close();
   const timer = setTimeout(() => {
     console.error("Computer shutdown timed out");
     process.exit(1);

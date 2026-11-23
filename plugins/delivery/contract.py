@@ -82,6 +82,9 @@ class GuardedDeliveries(Protocol):
 
     async def prepare_async(self, reader: MessageReader, message: Message,
                             sinks: tuple[Mapping[str, object], ...], *, passive: bool = False) -> Selection: ...
+    async def reject_async(self, reader: MessageReader, message: Message, reason: str) -> Selection:
+        """Save a routing failure and a visible notice without inventing a destination."""
+        ...
     async def publish_async(self, writer: MessageWriter, message_id: str, body: Body,
                             sinks: tuple[Mapping[str, object], ...], *, passive: bool = False) -> tuple[Message, Selection]: ...
     async def consume_async(self, reader: MessageReader, message: Message,
@@ -111,15 +114,6 @@ class GuardedDelivery(Protocol):
     def open(self, consumer: Context) -> GuardedDeliveries: ...
 
 
-class GuardedDeliveriesV2(GuardedDeliveries, Protocol):
-    async def retry(self, message_id: str, sink: str, *,
-                    start_guard: StartGuard | None = None) -> Receipt: ...
-
-
-class GuardedDeliveryV2(Protocol):
-    def open(self, consumer: Context) -> GuardedDeliveriesV2: ...
-
-
 class DeliveredMessage(Protocol):
     @property
     def message(self) -> Message: ...
@@ -140,20 +134,6 @@ class DeliveryHistory(Protocol):
     def status(self, message_id: str, sink: str) -> Mapping[str, object] | None: ...
 
 
-class ScopedDeliveryHistory(Protocol):
-    """Read confirmed deliveries for one exact Session before applying the limit."""
-
-    def recent_for_session(
-        self,
-        session_id: str,
-        *,
-        since: datetime,
-        until: datetime,
-        limit: int,
-        excluded_sources: frozenset[str] = frozenset(),
-    ) -> tuple[DeliveredMessage, ...]: ...
-
-
 class FinalOutputTurn(Protocol):
     @property
     def source(self) -> str: ...
@@ -168,16 +148,14 @@ class FinalOutputWaiter(Protocol):
 
 
 class FinalOutputDelivery(FinalOutputWaiter, Protocol):
-    def require_source(self, source: str) -> None: ...
+    def supports(self, source: str) -> bool: ...
     def register(self, source: str, provider: FinalOutputWaiter) -> None: ...
     def unregister(self, source: str, provider: FinalOutputWaiter) -> None: ...
 
 
 DELIVERY_GUARDED_START = ServiceKey[GuardedDelivery]("delivery.guarded-start.v1")
-DELIVERY_GUARDED_START_V2 = ServiceKey[GuardedDeliveryV2]("delivery.guarded-start.v2")
 DELIVERY_SENDERS = ServiceKey[Senders]("delivery.senders.v1")
 DELIVERY_READ = ServiceKey[DeliveryHistory]("delivery.read.v1")
-DELIVERY_SCOPED_READ = ServiceKey[ScopedDeliveryHistory]("delivery.scoped-read.v1")
 FINAL_OUTPUT_DELIVERY = ServiceKey[FinalOutputDelivery]("delivery.final_output.v1")
 
 

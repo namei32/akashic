@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Annotated, Any, Literal, Protocol
 
 from fastapi import APIRouter, HTTPException, Request
@@ -48,7 +48,7 @@ from .settings import (
     CancelConnectionAuth,
     CreateConnectionWithModel,
     DisableConnection,
-    ExtendModelReasoningEfforts,
+    EnableConnection,
     FinishConnectionAuth,
     ModelChange,
     MODEL_SETTINGS,
@@ -56,11 +56,13 @@ from .settings import (
     RemoveModel,
     SettingsReceipt,
     StartConnectionAuth,
+    SetCatalogMode,
     SyncModels,
     UpdateConnection,
     UpdateModel,
     VerifyModel,
 )
+from .quota import ConnectionQuota
 from .selection import MODEL_SELECTION
 
 # 模型失败值由标准异常承载；未知程序错误由映射入口原样抛出。
@@ -85,6 +87,8 @@ class ModelControl(Protocol):
     async def apply(self, command: ModelChange) -> SettingsReceipt: ...
 
     async def read_saved(self, metadata: Mapping[str, object]) -> ChatModelSelection: ...
+
+    async def quotas(self, *, fresh: bool, connection_id: str | None = None) -> tuple[ConnectionQuota, ...]: ...
 
 
 class _ServiceResolver(Protocol):
@@ -123,6 +127,9 @@ class BoundModelControl:
     async def read_saved(self, metadata: Mapping[str, object]) -> ChatModelSelection:
         return self._resolver.require(MODEL_SELECTION).read_saved(metadata)
 
+    async def quotas(self, *, fresh: bool, connection_id: str | None = None) -> tuple[ConnectionQuota, ...]:
+        return await self._resolver.require(MODEL_SETTINGS).quotas(fresh=fresh, connection_id=connection_id)
+
 
 class _Payload(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -156,6 +163,15 @@ class EmbeddingProbePayload(_Payload):
 
 class AddConnectionPayload(ConnectionInput):
     type: Literal["add_connection"]
+    catalog_mode: Literal["picked", "all"] = "picked"
+    adopt_models: list[str] = Field(default_factory=list, max_length=500)
+
+
+class SetCatalogModePayload(_Payload):
+    type: Literal["set_catalog_mode"]
+    expected_revision: int = Field(ge=0)
+    connection_id: str = Field(min_length=1, max_length=128)
+    mode: Literal["picked", "all"]
 
 
 class UpdateConnectionPayload(_Payload):
@@ -167,10 +183,17 @@ class UpdateConnectionPayload(_Payload):
     auth_identity: str = Field(min_length=1, max_length=128)
     credential: dict[str, str] | None = None
     driver_config: dict[str, JsonValue] | None = None
+    remove_model_ids: list[str] = Field(default_factory=list)
 
 
 class DisableConnectionPayload(_Payload):
     type: Literal["disable_connection"]
+    expected_revision: int = Field(ge=0)
+    connection_id: str = Field(min_length=1, max_length=128)
+
+
+class EnableConnectionPayload(_Payload):
+    type: Literal["enable_connection"]
     expected_revision: int = Field(ge=0)
     connection_id: str = Field(min_length=1, max_length=128)
 
@@ -224,14 +247,17 @@ class AddModelPayload(ModelInput):
 class SetDefaultPayload(_Payload):
     type: Literal["set_default"]
     expected_revision: int = Field(ge=0)
-    role: Literal["default", "fast", "agent", "vision"] | None
-    model_id: str = Field(min_length=1, max_length=128)
+    # 聊天只有全局默认一个绑定，各插件在自己的设置里指定；None 表示默认向量模型。
+    role: Literal["default"] | None
+    model_id: str = Field(max_length=128)
     verify_embedding: bool = False
 
     @model_validator(mode="after")
     def check_verification_kind(self) -> SetDefaultPayload:
         if self.verify_embedding and self.role is not None:
             raise ValueError("向量重验只能用于默认向量模型。")
+        if not self.model_id:
+            raise ValueError("全局默认模型与默认向量模型不能清空。")
         return self
 
 
@@ -259,13 +285,6 @@ class UpdateModelPayload(_Payload):
     context_window: int | None = Field(default=None, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
     image_input: bool
-
-
-class ExtendModelReasoningEffortsPayload(_Payload):
-    type: Literal["extend_model_reasoning_efforts"]
-    expected_revision: int = Field(ge=0)
-    model_id: str = Field(min_length=1, max_length=128)
-    efforts: list[str] = Field(min_length=1, max_length=16)
 
 
 class SyncModelsPayload(_Payload):
@@ -302,13 +321,14 @@ CommandPayload = Annotated[
     AddConnectionPayload
     | UpdateConnectionPayload
     | DisableConnectionPayload
+    | EnableConnectionPayload
     | AddModelPayload
     | VerifyModelPayload
     | RemoveModelPayload
     | UpdateModelPayload
-    | ExtendModelReasoningEffortsPayload
     | SetDefaultPayload
     | SyncModelsPayload
+    | SetCatalogModePayload
     | StartAuthPayload
     | FinishAuthPayload
     | CancelAuthPayload
@@ -325,6 +345,11 @@ class CallStatsParams(_Payload):
 
 class EmptyParams(_Payload):
     """Parameters for an RPC that takes no business input."""
+
+
+class QuotasParams(_Payload):
+    fresh: bool = False
+    connection_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class CommandParams(RootModel[CommandPayload]):
@@ -398,6 +423,11 @@ async def _catalog_body(control: ModelControl) -> dict[str, object]:
     return _catalog_payload(await control.catalog())
 
 
+async def _quotas_body(control: ModelControl, params: QuotasParams) -> dict[str, object]:
+    quotas = await control.quotas(fresh=params.fresh, connection_id=params.connection_id)
+    return {"quotas": [quota.payload() for quota in quotas]}
+
+
 async def _discover_body(
     control: ModelControl,
     payload: ConnectionInput,
@@ -441,6 +471,14 @@ def create_model_settings_router(
     async def catalog() -> dict[str, object]:
         try:
             return await _catalog_body(control)
+        except RuntimeError as error:
+            raise _http_error(error, operation="catalog") from error
+
+    # 额度只读：fresh=1 是用户点了刷新，仍受服务端最短间隔约束。
+    @router.get("/quotas")
+    async def quotas(fresh: bool = False, connection_id: str | None = None) -> dict[str, object]:
+        try:
+            return await _quotas_body(control, QuotasParams(fresh=fresh, connection_id=connection_id))
         except RuntimeError as error:
             raise _http_error(error, operation="catalog") from error
 
@@ -508,6 +546,10 @@ def rpc_methods(control: ModelControl) -> dict[str, RpcMethod]:
             EmptyParams, lambda params: _catalog_body(control),
             errors=(RuntimeError,), operation="catalog",
         ),
+        "models/quotas": _rpc_method(
+            QuotasParams, lambda params: _quotas_body(control, params),
+            errors=(RuntimeError,), operation="catalog",
+        ),
         "models/discover": _rpc_method(
             ConnectionInput, lambda params: _discover_body(control, params),
             errors=_HTTP_MODEL_ERRORS, operation="discover",
@@ -529,7 +571,13 @@ def rpc_methods(control: ModelControl) -> dict[str, RpcMethod]:
 
 def _command(payload: CommandPayload) -> ModelChange:
     if isinstance(payload, AddConnectionPayload):
-        return _add_connection(payload)
+        return replace(
+            _add_connection(payload),
+            catalog_mode=payload.catalog_mode,
+            adopt_models=tuple(payload.adopt_models),
+        )
+    if isinstance(payload, SetCatalogModePayload):
+        return SetCatalogMode(payload.expected_revision, payload.connection_id, payload.mode)
     if isinstance(payload, UpdateConnectionPayload):
         return UpdateConnection(
             expected_revision=payload.expected_revision,
@@ -539,9 +587,12 @@ def _command(payload: CommandPayload) -> ModelChange:
             auth_identity=payload.auth_identity,
             credential=payload.credential,
             driver_config=payload.driver_config,
+            remove_model_ids=tuple(payload.remove_model_ids),
         )
     if isinstance(payload, DisableConnectionPayload):
         return DisableConnection(payload.expected_revision, payload.connection_id)
+    if isinstance(payload, EnableConnectionPayload):
+        return EnableConnection(payload.expected_revision, payload.connection_id)
     if isinstance(payload, AddModelPayload):
         return _add_model(payload)
     if isinstance(payload, VerifyModelPayload):
@@ -556,8 +607,6 @@ def _command(payload: CommandPayload) -> ModelChange:
             max_output_tokens=payload.max_output_tokens,
             image_input=payload.image_input,
         )
-    if isinstance(payload, ExtendModelReasoningEffortsPayload):
-        return ExtendModelReasoningEfforts(payload.expected_revision, payload.model_id, tuple(payload.efforts))
     if isinstance(payload, SetDefaultPayload):
         return SetDefaultModel(
             payload.expected_revision,
@@ -667,6 +716,9 @@ def _catalog_payload(snapshot: ModelCatalogSnapshot) -> dict[str, object]:
                 "driverId": item.driver_id,
                 "authIdentity": item.auth_identity,
                 "availability": item.availability,
+                "endpoint": item.endpoint,
+                "endpointHost": item.endpoint_host,
+                "catalogMode": item.catalog_mode,
             }
             for item in snapshot.connections
         ],

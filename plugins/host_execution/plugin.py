@@ -10,10 +10,12 @@ from agent.plugin_composition.execution import EXECUTION
 from agent.plugin_composition.host import HOST_INFO
 from core.common.file_io import run_file_io
 from infra.persistence.json_store import load_json, atomic_save_json
-from plugins.host_execution.contract import HOST_STATUS, WORKLOAD_CONTROLLER, PROCESSES, FILES, TERMINALS
+from plugins.host_execution.contract import (
+    HOST_STATUS, WORKLOAD_CONTROLLER, PROCESSES, FILES, TERMINALS, PROCESS_STREAMS,
+)
 from .bridge.factory import HostBridgeRpcError, build_file_bridge
-from plugins.ui.contract import UI
-from .processes import PluginProcesses, PluginTerminals
+from plugins.ui.contract import UI, UI_SLOTS, PluginUiDefinition, PluginUiRpcInvalidRequest
+from .processes import PluginProcesses, PluginTerminals, PluginProcessStreams
 from .files import Files
 from .bridge.boot import claim_host_bridge_boot
 from .monitor import HostBridgeStatus, _monitor
@@ -38,6 +40,7 @@ async def apply(ctx: Context) -> None:
     processes = PluginProcesses(formal=not ctx.require(HOST_INFO).validation)
     await ctx.effect(lambda: processes.close, label="host.processes")
     await ctx.provide(PROCESSES, processes)
+    await ctx.provide(PROCESS_STREAMS, PluginProcessStreams(processes))
     await ctx.provide(TERMINALS, PluginTerminals(processes))
     await start_monitor(ctx)
     socket = os.environ.get("AKASHIC_WORKLOAD_SOCKET", "").strip()
@@ -52,6 +55,7 @@ async def apply(ctx: Context) -> None:
         if previous is not missing and (not isinstance(previous, str) or not previous or previous.strip() != previous):
             raise ValueError("宿主执行启动清理标记损坏")
         if previous != boot_id:
+            await controller.wait_ready()
             await cleanup_workloads_for_boot(controller, workspace_id)
             await run_file_io(lambda: atomic_save_json(marker, boot_id))
     await ctx.provide(WORKLOAD_CONTROLLER, ControllerAccess(ctx, controller, workspace_id))
@@ -94,3 +98,18 @@ async def start_monitor(ctx: Context) -> None:
         await child.require(UI).register(child, dashboard=lambda: dashboard)
 
     await ctx.inject((UI, HOST_STATUS), register_status, name="host-status-ui")
+
+    # 4. 聊天输入框上方的执行状态提示由本插件的界面模块经插件查询读取，宿主不认识这条路由。
+    async def register_notice(child: Context) -> None:
+        status = child.require(HOST_STATUS)
+
+        async def query(method: str, payload: dict[str, object], *,
+                        session_id: str | None, turn_id: str | None) -> dict[str, object]:
+            if method != "bridge.state" or payload:
+                raise PluginUiRpcInvalidRequest("宿主状态查询不接受参数")
+            return status.snapshot()
+
+        _ = await child.require(UI_SLOTS).register_plugin_ui(
+            child, PluginUiDefinition(module="plugin_ui.js", slots=("chat.notice",)), query=query)
+
+    _ = await ctx.inject((UI_SLOTS, HOST_STATUS), register_notice, name="host-status-notice")

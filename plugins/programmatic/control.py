@@ -13,16 +13,18 @@ from plugins.gateway.contract import (
 from plugins.ledger.contract import (
     MESSAGE_CATALOG,
     SESSION_ADMISSION,
+    Message,
     MessageReader,
     SessionAttributes,
 )
 from plugins.gateway.contract import RequestTransport, RpcMethod
-from plugins.ledger.contract import ContentPart, Input
+from plugins.ledger.contract import ContentPart, Control, Input
+from plugins.sources.contract import GuardedSourceSession
 from plugins.delivery.contract import (
     FinalOutputTurn as FinalOutputTurn,
 )
 
-from .contract import (PROGRAMMATIC, SessionIdParams, AdmitParams, SendParams, PauseParams, ResumeParams, ResultParams)
+from .contract import (SessionIdParams, AdmitParams, SendParams, PauseParams, ResumeParams, ResultParams)
 from .result import TURN_PROJECTION, TurnProjection, read_result, read_result_snapshot
 
 
@@ -30,6 +32,7 @@ PARAMS: dict[str, type[BaseModel]] = {
     "programmatic/session/admit": AdmitParams,
     "programmatic/message/send": SendParams,
     "programmatic/message/pause": PauseParams,
+    "programmatic/message/abandon": PauseParams,
     "programmatic/message/resume": ResumeParams,
     "programmatic/message/result": ResultParams,
 }
@@ -176,6 +179,24 @@ class Programmatic:
         check_session(session_id)
         return await self._call(method, params, transport, session_id)
 
+    # Reuse source admission and the original prefix when the caller retries its control ID.
+    async def _abandon(self, source: GuardedSourceSession, params: PauseParams) -> Message:
+        reader = self.ctx.require(MESSAGE_CATALOG).reader(params.session_id)
+        def read(reader: MessageReader) -> tuple[Control, int]:
+            existing = reader.get(params.message_id)
+            head = reader.head(source="programmatic")
+            if existing is not None:
+                if not isinstance(existing.body, Control) or existing.body.action != "abandon":
+                    raise ValueError("放弃身份已被其他消息使用")
+                return existing.body, head
+            if head < 0:
+                raise ValueError("当前来源没有可放弃的消息")
+            return Control("abandon", head, "调用方放弃本轮未完成的工作；外部效果不会撤销。"), head
+        body, head = await reader.read_async(read)
+        task = await source.active_task()
+        return await source.control(params.message_id, body, expected_head=head,
+                                    handle=None if task is None else task.handle)
+
     async def _call(
         self, method: str, params: BaseModel,
         transport: RequestTransport | None, session_id: str,
@@ -185,13 +206,17 @@ class Programmatic:
 
         ctx = self.ctx
         # 1. 创建时提交不可变资格；ACK 丢失可用调用方原身份幂等重试。
+        #    scope 让程序来源把记忆策略交给范围内的策略决定（可同时关掉学习与召回）；
+        #    不传 scope 时与旧的 SessionAttributes(...) 行为完全一致。
         if method == "programmatic/session/admit":
             create = cast(AdmitParams, params)
-            attributes = await ctx.require(SESSION_ADMISSION).ensure_async(ctx, session_id, SessionAttributes(
-                visibility="internal", learning="eligible" if create.persist_memory else "excluded",
-            ))
+            learning = "eligible" if create.persist_memory else "excluded"
+            attributes = await ctx.require(SESSION_ADMISSION).ensure_async(
+                ctx, session_id,
+                SessionAttributes.scoped(create.scope or {}, visibility="internal", learning=learning),
+            )
             return {"version": 2, "session_id": session_id, "visibility": attributes.visibility,
-                    "learning": attributes.learning}
+                    "learning": attributes.learning, "scope": dict(attributes.scope)}
 
         # 2. 来源只读取已创建属性，后续输入无改变学习资格的字段。
         if method == "programmatic/message/result":
@@ -224,6 +249,8 @@ class Programmatic:
                 raise
         elif method == "programmatic/message/pause":
             message = await source.pause(cast(PauseParams, params).message_id)
+        elif method == "programmatic/message/abandon":
+            message = await self._abandon(source, cast(PauseParams, params))
         elif method == "programmatic/message/resume":
             resume = cast(ResumeParams, params)
             stage = self._stage_before_resume(session_id, resume.input_id, transport)

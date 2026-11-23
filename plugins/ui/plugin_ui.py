@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 from collections.abc import Callable
@@ -12,7 +13,7 @@ from uuid import uuid4
 from agent.plugin_composition import Context, CompositionError, Effect, FiberState
 from plugins.ui.contract import (
     UI_SLOTS, PLUGIN_UI_SLOTS, PluginUiAsset, PluginUiBinding, PluginUiDefinition,
-    PluginUiDescriptor, PluginUiNavigation, PluginUiQueryHandler,
+    PluginUiDescriptor, PluginUiFollowHandler, PluginUiQueryHandler,
 )
 
 
@@ -22,6 +23,7 @@ class PluginUiSlots:
     def __init__(self, ctx: Context) -> None:
         self._ctx = ctx
         self._registrations: dict[str, PluginUiBinding] = {}
+        self._changed = asyncio.Event()
 
     def contributors(self) -> tuple[Context, ...]:
         self._ctx._require_current()  # pyright: ignore[reportPrivateUsage]
@@ -33,6 +35,14 @@ class PluginUiSlots:
     def root_instance_token(self) -> object:
         self._ctx._require_current()  # pyright: ignore[reportPrivateUsage]
         return self._ctx.root_instance_token
+
+    def changed(self) -> asyncio.Event:
+        return self._changed
+
+    # 唤醒等待者并换一个新事件，下一次变化重新等待。
+    def _notify(self) -> None:
+        self._changed.set()
+        self._changed = asyncio.Event()
 
     def bindings(self) -> tuple[PluginUiBinding, ...]:
         """Return the current registration projection without running callbacks."""
@@ -52,6 +62,7 @@ class PluginUiSlots:
         *,
         query: PluginUiQueryHandler,
         available: Callable[[], bool] | None = None,
+        follow: PluginUiFollowHandler | None = None,
     ) -> Effect:
         """Register one plugin UI declaration as an Effect of the calling Fiber."""
 
@@ -66,11 +77,10 @@ class PluginUiSlots:
             raise TypeError("插件 Plugin UI 声明必须是 PluginUiDefinition")
         if not callable(query):
             raise TypeError("插件 Plugin UI query 必须可调用")
+        if follow is not None and not callable(follow):
+            raise TypeError("插件 Plugin UI follow 必须可调用")
         if available is not None:
             _validate_sync_callable(available, "available")
-        navigation = definition.navigation
-        if navigation is not None and not isinstance(navigation, PluginUiNavigation):
-            raise TypeError("插件 Plugin UI navigation 必须是 PluginUiNavigation")
         runtime = ctx.runtime
         if ctx.fiber.state is not FiberState.LOADING and ctx.fiber.state is not FiberState.ACTIVE:
             raise CompositionError(
@@ -81,10 +91,6 @@ class PluginUiSlots:
             runtime.plugin_dir,
             module=definition.module,
             stylesheet=definition.stylesheet,
-            navigation_label=None if navigation is None else navigation.label,
-            navigation_description=(
-                None if navigation is None else navigation.description
-            ),
             slots=tuple(definition.slots),
         )
         binding = PluginUiBinding(
@@ -94,8 +100,6 @@ class PluginUiSlots:
                 module_bytes=asset.module_bytes,
                 stylesheet_sha256=asset.stylesheet_sha256,
                 stylesheet_bytes=asset.stylesheet_bytes,
-                navigation_label=asset.navigation_label,
-                navigation_description=asset.navigation_description,
                 slots=asset.slots,
             ),
             asset=asset,
@@ -103,11 +107,19 @@ class PluginUiSlots:
             available=_always_available if available is None else available,
             context=ctx,
             registration_uuid=uuid4().hex,
+            follow=follow,
         )
-        return await ctx.effect(
+        undo = await ctx.effect(
             lambda: self._register(ctx, binding),
             label=f"ui-slot:plugin:{definition.module}",
         )
+        # LOADING 期间登记的界面在 activation 就绪后才可见；就绪时再通知一次，跟随方据此开流。
+        if ctx.fiber.state is FiberState.LOADING:
+            _ = await ctx.spawn(self._announce_active(), name="plugin-ui-active")
+        return undo
+
+    async def _announce_active(self) -> None:
+        self._notify()
 
     def _register(
         self,
@@ -133,9 +145,11 @@ class PluginUiSlots:
 
         # 2. 每个 owner 只持有一条注册，Effect 关闭后解除归属。
         self._registrations[plugin_id] = binding
+        self._notify()
 
         def cleanup() -> None:
             del self._registrations[plugin_id]
+            self._notify()
 
         return cleanup
 
@@ -145,8 +159,6 @@ def resolve_plugin_ui_asset(
     *,
     module: str,
     stylesheet: str | None,
-    navigation_label: str | None,
-    navigation_description: str | None,
     slots: tuple[str, ...],
 ) -> PluginUiAsset:
     """Validate and freeze plugin-owned plugin UI static assets."""
@@ -155,8 +167,6 @@ def resolve_plugin_ui_asset(
     _validate_plugin_ui_metadata(
         module=module,
         stylesheet=stylesheet,
-        navigation_label=navigation_label,
-        navigation_description=navigation_description,
         slots=slots,
     )
 
@@ -176,8 +186,6 @@ def resolve_plugin_ui_asset(
     return _build_plugin_ui_asset(
         module_path,
         stylesheet_path,
-        navigation_label=navigation_label,
-        navigation_description=navigation_description,
         slots=slots,
     )
 
@@ -186,8 +194,6 @@ def _validate_plugin_ui_metadata(
     *,
     module: str,
     stylesheet: str | None,
-    navigation_label: str | None,
-    navigation_description: str | None,
     slots: tuple[str, ...],
 ) -> None:
     if (
@@ -204,17 +210,6 @@ def _validate_plugin_ui_metadata(
         or Path(stylesheet).is_absolute()
     ):
         raise RuntimeError("插件 UI stylesheet 必须是非空相对路径")
-    if (navigation_label is None) != (navigation_description is None):
-        raise RuntimeError("插件 UI navigation 无效")
-    if navigation_label is not None and (
-        not isinstance(navigation_label, str)
-        or not navigation_label.strip()
-        or len(navigation_label) > 64
-        or not isinstance(navigation_description, str)
-        or not navigation_description.strip()
-        or len(navigation_description) > 160
-    ):
-        raise RuntimeError("插件 UI navigation 无效")
     if not isinstance(slots, tuple) or any(
         not isinstance(slot, str) or slot not in PLUGIN_UI_SLOTS for slot in slots
     ):
@@ -227,8 +222,6 @@ def _build_plugin_ui_asset(
     module_path: Path,
     stylesheet_path: Path | None,
     *,
-    navigation_label: str | None,
-    navigation_description: str | None,
     slots: tuple[str, ...],
 ) -> PluginUiAsset:
     """Read validated assets and attach content hashes and byte sizes."""
@@ -252,14 +245,6 @@ def _build_plugin_ui_asset(
             else None
         ),
         stylesheet_bytes=len(stylesheet_encoded),
-        navigation_label=(
-            None if navigation_label is None else navigation_label.strip()
-        ),
-        navigation_description=(
-            None
-            if navigation_description is None
-            else navigation_description.strip()
-        ),
         slots=slots,
     )
 

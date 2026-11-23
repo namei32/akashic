@@ -7,6 +7,7 @@ from typing import Protocol, cast
 
 from plugins.host_execution.contract import (
     WorkloadEffectUnknown,
+    WorkloadStartRejected,
     WorkloadEndpoint,
     WorkloadLease,
     WorkloadMode,
@@ -61,6 +62,20 @@ class UnixWorkloadController:
     async def status(self) -> dict[str, object]:
         """读取当前 Controller 身份，供宿主核对精确停止证据。"""
         return await self._call("status", {})
+
+    # Controller 与 Core 并行启动；首次使用前用只读 status 等到 socket 接受连接。
+    async def wait_ready(self, timeout_seconds: float = 60.0) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        while True:
+            try:
+                _ = await self.status()
+                return
+            except WorkloadEffectUnknown as error:
+                not_listening = isinstance(error.__cause__, (FileNotFoundError, ConnectionRefusedError))
+                if not not_listening or loop.time() >= deadline:
+                    raise
+            await asyncio.sleep(0.1)
 
     async def stop(self, lease: WorkloadLease) -> WorkloadStopReceipt:
         payload = await self._call("stop", {"lease": _lease_dict(lease)})
@@ -124,11 +139,10 @@ class UnixWorkloadController:
                     raise RuntimeError("Workload Controller 回执不是对象")
                 if result.get("ok") is not True:
                     error = result.get("error")
-                    raise RuntimeError(
-                        error
-                        if isinstance(error, str) and error
-                        else "Workload Controller 失败"
-                    )
+                    message = error if isinstance(error, str) and error else "Workload Controller 失败"
+                    if result.get("residual") == "none":
+                        raise WorkloadStartRejected(message)
+                    raise RuntimeError(message)
                 payload = result.get("body")
                 if not isinstance(payload, dict):
                     raise RuntimeError("Workload Controller 回执缺少 body")

@@ -13,14 +13,26 @@ from plugins.ledger.contract import (
     MessageReader,
     OwnerStore,
     OwnerTransaction,
+    PreparedAppend,
 )
-from plugins.ledger.contract import Message, json_value
+from plugins.ledger.contract import json_value
 from plugins.compaction.contract import (
     COMPACTION_SUMMARIES as COMPACTION_SUMMARIES,
 )
 
 Text = Annotated[str, Field(min_length=1)]
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+# 与 context.summary_indexes 同一规则：允许跳过未覆盖消息，但不能重排、重复或引用不存在的消息。
+def _source_indexes(message_ids: tuple[str, ...], source_message_ids: tuple[str, ...]) -> tuple[int, ...]:
+    positions = {identity: index for index, identity in enumerate(message_ids)}
+    if not source_message_ids or any(identity not in positions for identity in source_message_ids):
+        raise ValueError("摘要来源缺少实际消息")
+    indexes = tuple(positions[identity] for identity in source_message_ids)
+    if any(left >= right for left, right in zip(indexes, indexes[1:])):
+        raise ValueError("摘要来源必须按实际消息顺序排列且不能重复")
+    return indexes
 
 
 class _SummaryIdentity(BaseModel):
@@ -67,13 +79,14 @@ class NativeSummaryRecordV1(_SummaryIdentity):
 class SummaryRecord(_SummaryIdentity):
     """一次单窗口压缩的覆盖范围、真实输入与生成条件。"""
 
-    version: Literal[2] = 2
+    # v2 为连续前缀；v3 以消息身份累计覆盖，旧记录只读保留。
+    version: Literal[2, 3] = 3
     # 空表示本代只重写父摘要（覆盖范围与父代相同）。
     summary_message_ids: tuple[Text, ...] = ()
     omitted_message_ids: tuple[Text, ...] = ()
     # 一次生成，加上过长时的一次缩写。
     model_call_ids: tuple[Text, ...] = Field(min_length=1, max_length=2)
-    trigger: Literal["soft_limit", "context_overflow"]
+    trigger: Literal["soft_limit", "context_overflow", "idle"]
     context_window: Annotated[int, Field(gt=0)]
     max_output_tokens: Annotated[int, Field(gt=0)]
     keep_recent_tokens: Annotated[int, Field(gt=0)]
@@ -197,14 +210,19 @@ def _check_lineage(
     record: StoredSummary,
     read: Callable[[str], StoredSummary | None],
     session_id: str,
+    known: Callable[[str], StoredSummary | None] | None = None,
 ) -> StoredSummary:
-    """核对完整父链，以及每代 v2 对新增覆盖的精确分区。"""
+    """核对完整父链，以及每代分区记录对新增覆盖的精确分区。
+
+    记录不可变：known 给出的父代已核对过它自己往上的父链，这里仍核对当前一代与它的父子边，只是不再往上走。
+    """
     current = record
     while True:
+        trusted = None if current.parent is None or known is None else known(current.parent)
         if current.parent is None:
             parent = None
         else:
-            parent = read(current.parent)
+            parent = trusted if trusted is not None else read(current.parent)
             if parent is None or parent.session_id != session_id:
                 raise ValueError("摘要父链缺失或跨 Session")
             generation_matches = (
@@ -212,13 +230,16 @@ def _check_lineage(
                 if isinstance(current, ImportedSummaryRecord)
                 else parent.generation + 1 == current.generation
             )
+            parent_ids = set(parent.source_message_ids)
+            inherited = (current.source_message_ids[:len(parent.source_message_ids)] if current.version < 3 else
+                         tuple(identity for identity in current.source_message_ids if identity in parent_ids))
             if (not generation_matches
                     or len(parent.source_message_ids) > len(current.source_message_ids)
-                    or current.source_message_ids[:len(parent.source_message_ids)] != parent.source_message_ids):
-                raise ValueError("摘要父链的 generation 或来源前缀不连续")
+                    or inherited != parent.source_message_ids):
+                raise ValueError("摘要父链的 generation 或累计来源不连续")
         if isinstance(current, SummaryRecord):
-            parent_size = 0 if parent is None else len(parent.source_message_ids)
-            added = current.source_message_ids[parent_size:]
+            parent_ids = set() if parent is None else set(parent.source_message_ids)
+            added = tuple(identity for identity in current.source_message_ids if identity not in parent_ids)
             summarized = set(current.summary_message_ids)
             omitted = set(current.omitted_message_ids)
             if ((parent is None or added) and not summarized
@@ -226,7 +247,7 @@ def _check_lineage(
                     or tuple(item for item in added if item in summarized) != current.summary_message_ids
                     or tuple(item for item in added if item in omitted) != current.omitted_message_ids):
                 raise ValueError("摘要本代覆盖没有被模型输入与省略消息完整分区")
-        if parent is None:
+        if parent is None or trusted is not None:
             return record
         current = parent
 
@@ -245,7 +266,10 @@ class SummaryRef(BaseModel):
 
 
 class SummaryLookup:
-    """归档提供的窄读取口；不能发布摘要、推进 head 或启动模型。"""
+    """归档提供的窄读取口；不能发布摘要、推进 head 或启动模型。
+
+    read 必须像 SummaryRecords.read 一样只返回已核对完整父链的记录。
+    """
 
     def __init__(
         self, read: Callable[[str], StoredSummary | None],
@@ -258,15 +282,19 @@ class SummaryLookup:
         """读取当前已发布摘要；状态面板不取得发布或模型调用权限。"""
         return self._head(session_id)
 
-    def resolve(self, metadata: Mapping[str, object], *, session_id: str) -> StoredSummary:
-        """只解析 binding 固定的原始记录，并核对完整父链。"""
+    def reference(self, metadata: Mapping[str, object], *, session_id: str) -> str:
+        """只核对 binding 归属并给出原始记录身份，不读取记录或父链。"""
         reference = SummaryRef.model_validate(dict(metadata))
         if reference.session_id != session_id:
             raise ValueError("摘要 binding 不属于当前 Session")
-        record = self._read(reference.record_ref)
+        return reference.record_ref
+
+    def resolve(self, metadata: Mapping[str, object], *, session_id: str) -> StoredSummary:
+        """只解析 binding 固定的原始记录；读取口已核对完整父链，这里不再逐代重读。"""
+        record = self._read(self.reference(metadata, session_id=session_id))
         if record is None or record.session_id != session_id:
             raise ValueError("摘要 binding 没有对应 Session 的原始记录")
-        return _check_lineage(record, self._read, session_id)
+        return record
 
 
 class SummaryRecords:
@@ -289,7 +317,7 @@ class SummaryRecords:
             record: StoredSummary = ImportedSummaryRecord.model_validate_json(raw)
         elif version == 1:
             record = NativeSummaryRecordV1.model_validate_json(raw)
-        elif version == 2:
+        elif version in (2, 3):
             record = SummaryRecord.model_validate_json(raw)
         else:
             raise ValueError("摘要记录 version 无效")
@@ -297,18 +325,22 @@ class SummaryRecords:
             raise ValueError("摘要记录的身份或不可变版本损坏")
         return record
 
-    def read(self, reference: str) -> StoredSummary | None:
+    def read(
+        self, reference: str, *, known: Callable[[str], StoredSummary | None] | None = None,
+    ) -> StoredSummary | None:
         record = self._read_record(reference)
         if record is None:
             return None
-        return _check_lineage(record, self._read_record, record.session_id)
+        return _check_lineage(record, self._read_record, record.session_id, known)
 
-    def head(self, session_id: str) -> StoredSummary | None:
+    def head(
+        self, session_id: str, *, known: Callable[[str], StoredSummary | None] | None = None,
+    ) -> StoredSummary | None:
         row = self._state.read("head:" + session_id)
         if row is None:
             return None
         head = _Head.model_validate_json(json.dumps(json_value(row.value)))
-        record = self.read(head.reference)
+        record = self.read(head.reference, known=known)
         if record is None or record.session_id != session_id:
             raise ValueError("摘要 head 没有对应 Session 的已发布记录")
         return record
@@ -318,23 +350,26 @@ class SummaryRecords:
     ) -> tuple[int, StoredSummary] | None:
         """读取 head 行版本；known 版本一致时复用已核对记录，跳过完整父链核对。
 
-        摘要记录只增且不可变，head 行版本随发布单调递增，版本一致即内容一致。
+        摘要记录只增且不可变，head 行版本随发布单调递增，版本一致即内容一致；
+        新 head 只核对到 known 为止，新增的几代逐代核对。
         """
         row = self._state.read("head:" + session_id)
         if row is None:
             return None
         if known is not None and known[0] == row.version:
             return known
-        record = self.head(session_id)
+        record = self.head(session_id, known=None if known is None else {known[1].reference: known[1]}.get)
         assert record is not None
         return (row.version, record)
 
     async def publish(
         self, record: SummaryRecord, reader: MessageReader, *, parent: StoredSummary | None,
-        summary_range: Callable[[tuple[Message, ...], tuple[str, ...]], range],
+        boundary: PreparedAppend | None = None,
     ) -> SummaryRecord:
-        """原子检查 parent 与消息前缀，再只增摘要并推进本 Session 指针。"""
+        """原子检查 parent 与精确消息覆盖，再只增摘要并推进本 Session 指针。"""
         self._state.check_access(reader)
+        if boundary is not None and boundary.session_id != record.session_id:
+            raise ValueError("压缩边界与摘要必须属于同一 Session")
         if reader.session_id != record.session_id:
             raise ValueError("摘要 reader 与记录必须属于同一 Session")
 
@@ -352,20 +387,26 @@ class SummaryRecords:
             reference = None if parent is None else parent.reference
             if record.generation != generation or record.parent != reference:
                 raise ValueError("摘要 generation 与 parent 不连续")
+            parent_ids = set() if parent is None else set(parent.source_message_ids)
             if parent is not None and (len(record.source_message_ids) < len(parent.source_message_ids)
-                    or record.source_message_ids[:len(parent.source_message_ids)] != parent.source_message_ids):
+                    or tuple(identity for identity in record.source_message_ids
+                             if identity in parent_ids) != parent.source_message_ids):
                 raise ValueError("后续摘要不能撤回已有来源")
 
             _check_lineage(record, self._read_record, record.session_id)
 
-            # 2. 源消息与摘要在同一 authority 的事务中校验；读取模块无正文写权。
-            _ = summary_range(tuple(reader.snapshot()), record.source_message_ids)
+            # 2. 源消息身份与顺序在同一 authority 的事务中校验；只读身份序列，不在写锁内解码整段正文。
+            indexes = _source_indexes(reader.message_ids(), record.source_message_ids)
+            if record.version == 2 and indexes != tuple(range(indexes[0], indexes[-1] + 1)):
+                raise ValueError("v2 摘要来源必须连续")
             _ = tx.save("summary:" + record.reference,
                         cast(Mapping[str, object], record.model_dump(mode="json")), expected_version=None)
             key = "head:" + record.session_id
             previous = tx.read(key)
             _ = tx.save(key, {"reference": record.reference},
                         expected_version=None if previous is None else previous.version)
+            if boundary is not None:
+                _ = tx.append_prepared(boundary)
             return record
 
         return await self._state.transact_async(commit)

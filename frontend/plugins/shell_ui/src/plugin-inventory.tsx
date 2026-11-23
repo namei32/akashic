@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { WebHostContextV1 } from "@akashic/web-ui-v1";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import type { WebHostContextV1, WebResource } from "@akashic/web-ui-v1";
+import { markup } from "./brand";
+import { InstallablePackages } from "./plugin-installable";
 
 type Phase = "active" | "pending" | "failed" | "disabled" | "stopping" | "loading";
 
@@ -18,6 +20,7 @@ interface PluginRow {
 }
 
 type Http = WebHostContextV1["http"];
+export type InventoryResource = WebResource<{ plugins: PluginRow[] }>;
 type Filter = "all" | "attention";
 /** 行内的操作结果：进行中、需要重启，或失败原因。 */
 type RowNote = { kind: "busy"; enabled: boolean } | { kind: "restart" } | { kind: "error"; text: string };
@@ -36,10 +39,19 @@ async function call<T>(http: Http, path: string, init?: RequestInit): Promise<T>
   return body as T;
 }
 
+// 插件清单归 Shell 模块所有：宿主空闲时预热，再次打开设置直接画上次的结果。
+export function inventoryResource(ctx: WebHostContextV1): InventoryResource {
+  return ctx.data.resource("plugins", (signal) => call<{ plugins: PluginRow[] }>(ctx.http, "/api/dashboard/plugins", { signal }), { warm: true });
+}
+
 // 插件列表：内置 / 外置两组，被其他插件依赖的内置插件收进“基础组件”子组；行展开才显示说明与开关。
-export function PluginInventory({ http }: { http: Http }): React.ReactElement {
-  const [rows, setRows] = useState<PluginRow[] | null>(null);
-  const [loadError, setLoadError] = useState("");
+export function PluginInventory({ http, inventory, active }: {
+  http: Http;
+  inventory: InventoryResource;
+  active: boolean;
+}): React.ReactElement {
+  const rows = useSyncExternalStore(inventory.subscribe, () => inventory.current)?.plugins ?? null;
+  const loadError = useSyncExternalStore(inventory.subscribe, () => inventory.error)?.message ?? "";
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
@@ -47,23 +59,17 @@ export function PluginInventory({ http }: { http: Http }): React.ReactElement {
   const [notes, setNotes] = useState<ReadonlyMap<string, RowNote>>(new Map());
   // 分组按本次打开时见过的依赖关系固定，停用基础组件后它不会跳到别的分组。
   const infra = useRef(new Set<string>());
+  for (const row of rows ?? []) if (row.source === "builtin" && row.dependents.length > 0) infra.current.add(row.id);
 
-  const load = useCallback(async () => {
-    try {
-      const body = await call<{ plugins: PluginRow[] }>(http, "/api/dashboard/plugins");
-      for (const row of body.plugins) if (row.source === "builtin" && row.dependents.length > 0) infra.current.add(row.id);
-      setRows(body.plugins);
-      setLoadError("");
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : String(error));
-    }
-  }, [http]);
+  const load = useCallback(() => inventory.refresh().then(() => undefined, () => undefined), [inventory]);
 
+  // 每次变为可见即在后台核对一次，可见期间每 5 秒刷新；隐藏时不请求。已有数据时不显示读取状态。
   useEffect(() => {
+    if (!active) return;
     void load();
     const timer = window.setInterval(() => void load(), 5000);
     return () => window.clearInterval(timer);
-  }, [load]);
+  }, [load, active]);
 
   const toggle = useCallback(async (row: PluginRow, enabled: boolean) => {
     const note = (value: RowNote | null) => setNotes((current) => {
@@ -80,8 +86,9 @@ export function PluginInventory({ http }: { http: Http }): React.ReactElement {
     } catch (error) {
       note({ kind: "error", text: error instanceof Error ? error.message : String(error) });
     }
-    await load();
-  }, [http, load]);
+    // 启停之后另起一次读取，不并入启停之前发出的轮询。
+    await inventory.refresh({ fresh: true }).catch(() => undefined);
+  }, [http, inventory]);
 
   const all = rows ?? [];
   const attention = all.filter(needsAttention).length;
@@ -120,16 +127,17 @@ export function PluginInventory({ http }: { http: Http }): React.ReactElement {
       {list(builtin)}
       {base.length > 0 && <div className="shell-inventory-sub">
         <button type="button" className="shell-inventory-sub-head" aria-expanded={searching || infraOpen} onClick={() => setInfraOpen(!infraOpen)}>
-          <span className="shell-inventory-chevron" aria-hidden="true" dangerouslySetInnerHTML={{ __html: CHEVRON }} />
+          <span className="shell-inventory-chevron" aria-hidden="true" dangerouslySetInnerHTML={markup(CHEVRON)} />
           基础组件 <span>{base.length}</span><small>通常不需要改动</small>
         </button>
-        {(searching || infraOpen) && list(base)}
+        <ShellDisclosure open={searching || infraOpen} instant={searching}>{list(base)}</ShellDisclosure>
       </div>}
     </section>}
     {external.length > 0 && <section className="shell-inventory-group">
       <h4>外置插件 <span>{external.length}</span></h4>
       {list(external)}
     </section>}
+    <InstallablePackages http={http} active={active} onInstalled={load} />
     {visible.length === 0 && <div className="shell-inventory-empty">
       <p>{query.trim() ? `没有匹配“${query.trim()}”的插件` : "没有需要处理的插件"}</p>
       <button type="button" onClick={() => { setQuery(""); setFilter("all"); }}>显示全部插件</button>
@@ -153,35 +161,55 @@ function InventoryRow({ row, rows, open, note, flip, toggle }: {
   const waiting = row.enabled ? row.dependents.map((id) => rows.find((item) => item.id === id)?.name ?? id) : [];
   const hint = waiting.length === 0 ? ""
     : `停用后，${waiting.slice(0, 2).join("、")}${waiting.length > 2 ? ` 等 ${waiting.length} 个插件` : ""}会等待依赖`;
+  const [techOpen, setTechOpen] = useState(false);
   return <li className="shell-inventory-row" data-phase={row.phase === "stopping" && row.error ? "failed" : row.phase}>
     <button type="button" className="shell-inventory-head" aria-expanded={open} onClick={flip}>
-      <strong>{row.name}</strong>
+      <span className="shell-inventory-name"><strong>{row.name}</strong>{row.description && <small>{row.description}</small>}</span>
       {status
         ? <span className="shell-inventory-status">{status}</span>
         : <span className="shell-inventory-dot" role="img" aria-label="运行中" />}
-      <span className="shell-inventory-chevron" aria-hidden="true" dangerouslySetInnerHTML={{ __html: CHEVRON }} />
+      <span className="shell-inventory-chevron" aria-hidden="true" dangerouslySetInnerHTML={markup(CHEVRON)} />
     </button>
-    {open && <div className="shell-inventory-body">
-      {row.description && <p>{row.description}</p>}
-      {row.error && <p className="shell-inventory-error">{row.error}</p>}
-      {note?.kind === "error" && <p className="shell-inventory-error" role="alert">{note.text}</p>}
-      {row.missing_services.length > 0 && <p>缺少 <code>{row.missing_services.join("、")}</code>，依赖恢复后自动运行。</p>}
-      {row.locked
-        ? <p className="shell-inventory-hint">插件管理依赖它，不能停用</p>
-        : <label className="shell-inventory-switch">
-          <input type="checkbox" role="switch" checked={busy ? note.enabled : row.enabled} disabled={busy}
-            onChange={(event) => toggle(event.target.checked)} />
-          启用
-          {hint && <small>{hint}</small>}
-        </label>}
-      <details>
-        <summary>技术信息</summary>
-        <dl>
-          <dt>ID</dt><dd><code>{row.id}</code></dd>
-          {row.version && <><dt>版本</dt><dd><code>{row.version}</code></dd></>}
-          <dt>运行</dt><dd><code>{row.phase}</code></dd>
-        </dl>
-      </details>
-    </div>}
+    <ShellDisclosure open={open}>
+      <div className="shell-inventory-body">
+        {row.error && <p className="shell-inventory-error">{row.error}</p>}
+        {note?.kind === "error" && <p className="shell-inventory-error" role="alert">{note.text}</p>}
+        {row.missing_services.length > 0 && <p>缺少 <code>{row.missing_services.join("、")}</code>，依赖恢复后自动运行。</p>}
+        {row.locked
+          ? <p className="shell-inventory-hint">插件管理依赖它，不能停用</p>
+          : <label className="shell-inventory-switch">
+            <input type="checkbox" role="switch" checked={busy ? note.enabled : row.enabled} disabled={busy}
+              onChange={(event) => toggle(event.target.checked)} />
+            启用
+            {hint && <small>{hint}</small>}
+          </label>}
+        <div className="shell-inventory-tech">
+          <button type="button" className="shell-inventory-tech-trigger" aria-expanded={techOpen} onClick={() => setTechOpen((value) => !value)}>
+            <span className="shell-inventory-chevron" aria-hidden="true" dangerouslySetInnerHTML={markup(CHEVRON)} />
+            <span>技术信息</span>
+          </button>
+          <ShellDisclosure open={techOpen}>
+            <dl>
+              <dt>ID</dt><dd><code>{row.id}</code></dd>
+              {row.version && <><dt>版本</dt><dd><code>{row.version}</code></dd></>}
+              <dt>运行</dt><dd><code>{row.phase}</code></dd>
+            </dl>
+          </ShellDisclosure>
+        </div>
+      </div>
+    </ShellDisclosure>
   </li>;
+}
+
+function ShellDisclosure({ open, instant = false, children }: {
+  open: boolean;
+  instant?: boolean;
+  children: React.ReactNode;
+}): React.ReactElement {
+  const [mounted, setMounted] = useState(open);
+  if (open && !mounted) setMounted(true);
+  return <div className={`shell-disclosure${open ? " open" : ""}${instant ? " is-instant" : ""}`}
+    aria-hidden={!open} inert={!open ? true : undefined}>
+    <div className="shell-disclosure__inner">{mounted ? children : null}</div>
+  </div>;
 }
