@@ -78,6 +78,10 @@ replay。新 Summary 正常开启新上下文，旧搜索结果只是
 普通 ToolResult；保留原文中的 schema 继续可见，只有摘要覆盖它后才不再提供原 schema。
 不专门删除 raw tail，也不改变调用权限。工具目录不写入新的 reminder replay。
 
+旧 Output 缺少成功回执与自带的 replay 字段时，若调用账缺行或仍为 started，历史请求
+保留已提交正文和原 ToolCall/ToolResult 配对，省略 provider 原生续接及元数据。调用账、
+消息正文和工具执行状态维持原记录。调用账已有失败终态时，投影仍报错。
+
 模型调用格式或名称不属于当前展示时，展示层抛出 `InvalidToolCall`；ReAct 将原 wire 请求和
 拒绝原因作为 `model.tool_rejection` 内容随同一个成功模型 Output 提交，不生成 binding、
 真实 ToolCall、ToolResult 或 effect。Model 投影重放原请求与“调用未执行”的协议反馈。

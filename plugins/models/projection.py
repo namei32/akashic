@@ -951,12 +951,11 @@ class MessageProjection:
                     # 字符估算最多差约 3 倍（1 字符 1 token）。远超它的 usage 与请求大小无关：压缩后比例只会更离谱，
                     # 用它校准会让每条输入都付一次摘要费。这里不看窗口，静默超窗（200 + 超窗 usage）仍能触发压缩。
                     fold.token_calibration = None if actual > estimated * _MAX_USAGE_RATIO else (estimated, actual)
-        elif replay is not None and (receipt is None or receipt["state"] == "started"):
-            binding_id = replay["binding_id"]
+        elif receipt is None or receipt["state"] == "started":
+            # 旧 Output 已提交时仍可读出正文和工具配对；原生续接需要可信 binding。
+            binding_id = None if replay is None else replay["binding_id"]
             same_model = binding_id == descriptor.binding_id
             metadata = None
-        elif receipt is None:
-            raise KeyError(call_id)
         else:
             raise ValueError("已提交模型事实必须引用成功结算的真实调用")
         if same_model:
@@ -980,7 +979,7 @@ class MessageProjection:
         state = value["continuation"]
         message_continuation = (
             None
-            if state is None
+            if state is None or binding_id is None
             else ModelContinuation(state["binding_id"], state["payload"])
         )
         if (
