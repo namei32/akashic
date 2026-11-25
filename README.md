@@ -40,7 +40,7 @@ docker compose exec akashic python main.py web-login
 
 构建完成后的第一次启动只装核心；期间终端只显示等待；想看进度，另开一个终端运行 `docker compose logs -f`。其余功能在网页引导里挑选安装。最后一条命令会打印一个登录链接，在浏览器里打开它就能进入。
 
-如果报错 `address already in use`，说明 2236 端口被别的程序占了：在同一目录创建 `.env` 文件，写一行 `AKASHIC_PORT=2237`，再运行一次 `docker compose up -d --wait`。
+如果报错 `address already in use`，说明 2236 端口被别的程序占了：编辑同一目录已有的 `.env`，保留 `AKASHIC_REVISION`，追加 `AKASHIC_PORT=2237`，再运行一次 `docker compose up -d --wait`。
 
 ## 第一次打开
 

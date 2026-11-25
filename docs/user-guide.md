@@ -24,7 +24,8 @@ docker compose stop
 docker run --rm -v akashic_data:/data -v "$PWD":/backup alpine tar czf /backup/akashic-data.tgz -C /data .
 git switch main
 git pull --ff-only origin main
-printf 'AKASHIC_REVISION=%s\n' "$(git rev-parse HEAD)" > .env
+git rev-parse HEAD
+# 将上一步输出填入现有 .env 的 AKASHIC_REVISION，保留端口等其他配置。
 docker compose up -d --build --wait
 ```
 
