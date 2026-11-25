@@ -66,8 +66,8 @@ Use isolated HOME, state, plugin home, cache, browser profile and Compose projec
 Linux、macOS 或 WSL2：
 
 ```bash
-git clone --branch v0.2.0 https://github.com/kachofugetsu09/akashic-agent.git
-cd akashic-agent
+git clone --branch main https://github.com/namei32/akashic.git
+cd akashic
 printf 'AKASHIC_REVISION=%s\n' "$(git rev-parse HEAD)" > .env
 docker compose up -d --build --wait
 ```
@@ -75,8 +75,8 @@ docker compose up -d --build --wait
 Windows PowerShell：
 
 ```powershell
-git clone --branch v0.2.0 https://github.com/kachofugetsu09/akashic-agent.git
-cd akashic-agent
+git clone --branch main https://github.com/namei32/akashic.git
+cd akashic
 "AKASHIC_REVISION=$(git rev-parse HEAD)" | Set-Content .env
 docker compose up -d --build --wait
 ```

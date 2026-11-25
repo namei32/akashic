@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-origin="${AKASHIC_INSTALL_ORIGIN:-https://github.com/kachofugetsu09/akashic-agent.git}"
+origin="${AKASHIC_INSTALL_ORIGIN:-https://github.com/namei32/akashic.git}"
 requested_commit=""
 # 函数内 shift 不改变调用者参数；路径按原始 argv 转发，不用字符串拆词。
 parse_args() {

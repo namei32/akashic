@@ -16,6 +16,7 @@ import time
 
 from scripts.akashic_release.doctor import read_environment
 from scripts.akashic_release.manifest import read_json, write_json, release_lock
+from scripts.akashic_release.source import DEFAULT_ORIGIN
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk/python/src"))
@@ -286,7 +287,7 @@ def _exec_target(path: Path, request: dict[str, Any]) -> None:
     """准备目标产物后用其解释器替换当前 worker，保持同一 job 和 writer。"""
     source = path.with_suffix(".source")
     root = Path(request["root"])
-    origin = "https://github.com/kachofugetsu09/akashic-agent.git"
+    origin = DEFAULT_ORIGIN
     source.mkdir()
     subprocess.run(["git", "init", "--quiet", str(source)], check=True)
     subprocess.run(["git", "remote", "add", "origin", origin], cwd=source, check=True)
@@ -369,7 +370,7 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
         ready = read_json(Path(current["AKASHIC_WORKSPACE"]) / ".runtime-ready.json")
         if ready["bootId"] != request["stop"]["boot_id"]:
             raise RuntimeError("原 boot 已被替换，不停止新实例")
-        origin = "https://github.com/kachofugetsu09/akashic-agent.git"
+        origin = DEFAULT_ORIGIN
         if not args.prepared:
             _exec_target(path, request)
         record["phase"] = "preparing"

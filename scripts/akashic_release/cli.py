@@ -20,11 +20,11 @@ from scripts.akashic_release.prepare import (
     prepare_generation,
     verify_host_prerequisites,
 )
-from scripts.akashic_release.source import commit_subject, resolve_target
+from scripts.akashic_release.source import DEFAULT_ORIGIN, commit_subject, resolve_target
 from scripts.akashic_release.source import verify_bootstrap_checkout
 from scripts.akashic_release.warm import StateCacheWarmer
 
-_DEFAULT_ORIGIN = "https://github.com/kachofugetsu09/akashic-agent.git"
+_DEFAULT_ORIGIN = DEFAULT_ORIGIN
 _DEFAULT_ROOT = Path("/srv/data/services/akashic")
 _DEFAULT_ENV = Path.home() / ".config/akashic-container/runtime.env"
 _DEFAULT_MISE = Path.home() / ".local/bin/mise"

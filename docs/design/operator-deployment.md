@@ -113,7 +113,7 @@ python scripts/upgrade_plugin_selection.py \
 bootstrap 会固定目标 main SHA，使用目标版本的发布器：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kachofugetsu09/akashic-agent/main/scripts/install-akashic.sh \
+curl -fsSL https://raw.githubusercontent.com/namei32/akashic/main/scripts/install-akashic.sh \
   | sh -s -- --yes
 ```
 

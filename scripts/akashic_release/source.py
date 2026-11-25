@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
+DEFAULT_ORIGIN = "https://github.com/namei32/akashic.git"
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 Run = Callable[..., subprocess.CompletedProcess[str]]
 

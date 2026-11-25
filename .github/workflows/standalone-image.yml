@@ -34,7 +34,9 @@ jobs:
         with:
           context: .
           file: docker/standalone/Dockerfile
-          build-args: AKASHIC_REVISION=${{ env.SOURCE_REVISION }}
+          build-args: |
+            AKASHIC_REVISION=${{ env.SOURCE_REVISION }}
+            AKASHIC_SOURCE_REPOSITORY=${{ github.server_url }}/${{ github.repository }}.git
           load: true
           tags: akashic-standalone:candidate
           cache-from: type=gha,scope=standalone-${{ matrix.arch }}

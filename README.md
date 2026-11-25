@@ -24,20 +24,21 @@ cd akashic
 
 首次启动会准备运行环境并引导选择功能。装好后浏览器会打开登录页面。按 Ctrl+C 停止。
 
-### 体验上游 Docker 发行版
+### 从本仓库构建 Docker 镜像
 
-以下命令下载上游发布的镜像配置。要运行本仓库的个人主线，请使用上面的源码安装方式。
+以下命令构建本仓库的已提交版本。发行版发布到 [本仓库 Releases](https://github.com/namei32/akashic/releases)；没有对应发行版时使用源码构建。
 
 先安装 [Docker Desktop](https://docs.docker.com/get-docker/)，并打开它。然后在终端里依次运行：
 
 ```bash
-mkdir akashic && cd akashic
-curl -fsSLO https://github.com/kachofugetsu09/akashic-agent/releases/latest/download/compose.yaml
-docker compose up -d --wait
+git clone --branch main https://github.com/namei32/akashic.git
+cd akashic
+printf 'AKASHIC_REVISION=%s\n' "$(git rev-parse HEAD)" > .env
+docker compose up -d --build --wait
 docker compose exec akashic python main.py web-login
 ```
 
-第一次启动只装核心，大约 1 分钟，主要是下载镜像；期间终端只显示等待；想看进度，另开一个终端运行 `docker compose logs -f`。其余功能在网页引导里挑选安装。最后一条命令会打印一个登录链接，在浏览器里打开它就能进入。
+构建完成后的第一次启动只装核心；期间终端只显示等待；想看进度，另开一个终端运行 `docker compose logs -f`。其余功能在网页引导里挑选安装。最后一条命令会打印一个登录链接，在浏览器里打开它就能进入。
 
 如果报错 `address already in use`，说明 2236 端口被别的程序占了：在同一目录创建 `.env` 文件，写一行 `AKASHIC_PORT=2237`，再运行一次 `docker compose up -d --wait`。
 
@@ -57,7 +58,7 @@ docker compose exec akashic python main.py web-login
 Akashic 把“核心闭环”和“功能扩展”拆开维护：
 
 - **核心仓库（本仓库，Core）**：只保留长程主循环（账本、上下文、压缩、基础文件与 Shell）、Web 宿主与包管理，更新 Core 需要重新部署并重启一次。
-- **官方扩展仓库（[akashic-plugins](https://github.com/kachofugetsu09/akashic-plugins)，`extra`）**：浏览器、记忆、值班、子任务、画布、手机端侧等非核心功能都在这里，按单个插件的 `release/<插件名>` 分支发布，Core 镜像默认不内置。
+- **官方扩展仓库（[akashic-plugins](https://github.com/namei32/akashic-plugins)，`extra`）**：浏览器、记忆、值班、子任务、画布、手机端侧等非核心功能都在这里，按单个插件的 `release/<插件名>` 分支发布，Core 镜像默认不内置。
 - **安装与热更新**：在网页端“功能设置”→“插件”→“可安装”里可一键安装；也可以让 Akashic 帮忙装，或在容器/终端里用 `akashic pkg` 管理（`list` / `groups` / `install <名|@组>` / `upgrade`）。官方扩展插件与私人插件都支持**热安装与热更新**，改完或升级不需要重启 Core。
 - **自建插件**：想让 Akashic 自己扩展新能力时，它会按内置 Skill [`develop-akashic-plugin`](./skills/develop-akashic-plugin/SKILL.md) 写插件源码并热加载。
 
@@ -84,7 +85,7 @@ Akashic 把“核心闭环”和“功能扩展”拆开维护：
 
 如果你是正在帮用户安装 Akashic 的 AI 助手，按下面做：
 
-- **上游 Docker 发行版**：按上面 Docker 小节的命令依次运行。
+- **本仓库 Docker 构建**：按上面 Docker 小节的命令依次运行。
   - `docker compose up -d --wait` 返回 0 就表示已就绪。如果返回非 0，运行 `docker compose logs --tail=200 akashic` 查看原因。
   - 把 `web-login` 打印的链接交给用户。这个链接 2 分钟内有效，只能用一次。
 - **源码**：运行 `./start --no-browser --yes`。
@@ -103,7 +104,7 @@ Akashic 把“核心闭环”和“功能扩展”拆开维护：
 | 主题 | 文档 |
 | --- | --- |
 | 使用手册（更新、备份、远程访问、登录） | [使用手册](./docs/user-guide.md) |
-| 官方插件仓库（extra） | [akashic-plugins](https://github.com/kachofugetsu09/akashic-plugins) |
+| 官方插件仓库（extra） | [akashic-plugins](https://github.com/namei32/akashic-plugins) |
 | 插件开发与安装 | [插件能力手册](./docs/design/plugin-v3-capabilities.md)、[`develop-akashic-plugin`](./skills/develop-akashic-plugin/SKILL.md)、[`plugin-system`](./plugins/plugin_update/skills/plugin-system/SKILL.md) |
 | 手机接入 | [Android Shell](https://github.com/kachofugetsu09/akashic-android-shell) |
 | Python 客户端与协议 | [Python SDK](./sdk/python/README.md)、[协议 schema](./schema/app-server-v2.json) |
