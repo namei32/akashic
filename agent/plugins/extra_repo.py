@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-DEFAULT_EXTRA_REPO = "https://github.com/kachofugetsu09/akashic-plugins.git"
+DEFAULT_EXTRA_REPO = "https://github.com/namei32/akashic-plugins.git"
 BRANCH_PREFIX = "refs/heads/release/"
 INDEX_REF = "refs/heads/index"
 _GIT_TIMEOUT_S = 60

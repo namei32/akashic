@@ -3,6 +3,7 @@
 - 状态：accepted / implemented
 - 日期：2026-11-22
 - 取代：[0148](0148-plugins-stay-in-core.md)
+- 仓库归属勘误：[0168](0168-namei-owns-release-sources.md)；安装与发布协议不变。
 - 过程记录：[插件外移与包管理迁移计划](../design/plugin-packages-migration.md)
 
 ## 背景

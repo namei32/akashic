@@ -15,15 +15,18 @@
 
 ## 更新
 
-### 上游 Docker 发行版
+### 本仓库 Docker 构建
 
-先停止服务，备份数据，再下载新版 `compose.yaml` 并启动：
+先准备好目标版本及必要的数据恢复点，再停止服务并构建新版：
 
 ```bash
 docker compose stop
 docker run --rm -v akashic_data:/data -v "$PWD":/backup alpine tar czf /backup/akashic-data.tgz -C /data .
-curl -fsSLO https://github.com/kachofugetsu09/akashic-agent/releases/latest/download/compose.yaml
-docker compose up -d --wait
+git switch main
+git pull --ff-only origin main
+git rev-parse HEAD
+# 将上一步输出填入现有 .env 的 AKASHIC_REVISION，保留端口等其他配置。
+docker compose up -d --build --wait
 ```
 
 备份命令里的 `akashic_data` 要换成你的数据卷名（见上表）。
@@ -39,6 +42,8 @@ git pull --ff-only origin main
 ```
 
 ### 插件
+
+本仓库默认从 `namei32/akashic-plugins` 安装。已有实例仍记录旧仓库的插件需要显式切换来源；修改默认地址不会自动替换旧选择，见 [源码与发布归属](decisions/0168-namei-owns-release-sources.md)。
 
 功能插件单独更新，不需要更新整个程序。可以直接对 Akashic 说“检查一下插件更新”，也可以在“功能设置”→“插件”里操作。不用 Docker 时用这两种方式即可；Docker 的命令行用法：
 

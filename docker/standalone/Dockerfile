@@ -2,8 +2,9 @@ FROM node:22-bookworm-slim AS node
 FROM python:3.12-slim-bookworm AS source
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 ARG AKASHIC_REVISION
+ARG AKASHIC_SOURCE_REPOSITORY=https://github.com/namei32/akashic.git
 WORKDIR /source
-RUN git init && git remote add origin https://github.com/kachofugetsu09/akashic-agent.git \
+RUN git init && git remote add origin "${AKASHIC_SOURCE_REPOSITORY}" \
     && git fetch --depth=1 origin "${AKASHIC_REVISION}" && git checkout --detach FETCH_HEAD
 
 FROM python:3.12-slim-bookworm AS build
@@ -23,7 +24,7 @@ RUN /opt/venv/bin/python scripts/build_plugin_distribution.py --revision HEAD --
 
 FROM python:3.12-slim-bookworm
 ARG AKASHIC_REVISION
-LABEL org.opencontainers.image.source="https://github.com/kachofugetsu09/akashic-agent" \
+LABEL org.opencontainers.image.source="https://github.com/namei32/akashic" \
       org.opencontainers.image.revision=$AKASHIC_REVISION
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates zsh curl libstdc++6 libatomic1 \
     && rm -rf /var/lib/apt/lists/* \

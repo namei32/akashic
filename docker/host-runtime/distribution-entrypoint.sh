@@ -61,7 +61,7 @@ print("1" if path.exists() and json.loads(path.read_text(encoding="utf-8")).get(
 PY
 )"
 if [[ "$selection_committed" != "1" ]]; then
-    extra_args=(--extra-repo "${AKASHIC_EXTRA_REPO:-https://github.com/kachofugetsu09/akashic-plugins.git}")
+    extra_args=(--extra-repo "${AKASHIC_EXTRA_REPO:-https://github.com/namei32/akashic-plugins.git}")
 fi
 
 /opt/venv/bin/python /opt/akashic/source/scripts/install_plugin_distribution.py \

@@ -13,7 +13,7 @@ RUN node /build/build-stream-client.mjs selkies-ws-core.js \
 # 只有浏览器：一个 Chromium 带个人 profile；不装桌面环境，matchbox 只负责让每个窗口铺满屏幕。
 FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5
 
-LABEL org.opencontainers.image.source="https://github.com/kachofugetsu09/akashic-agent"
+LABEL org.opencontainers.image.source="https://github.com/namei32/akashic"
 
 ARG OPENCLI_VERSION=1.8.7
 ARG OPENCLI_EXTENSION_VERSION=1.0.23
