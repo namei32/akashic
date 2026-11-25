@@ -16,6 +16,8 @@
 └──────────────────────────┘
 ```
 
+本仓库的 `origin` 是 `https://github.com/namei32/akashic.git`。日常开发和 PR 以 `my-changes` 为目标分支，`main` 保留用于上游对照。合并使用普通 merge，保留原始提交。
+
 ## 1. 理解本次边界
 
 先按 [INDEX.md](INDEX.md) 读取设计原则、相关条款、有效决策与真实实现。普通任务用一段说明写目标和完成标准。涉及持久数据、owner、生命周期、公共接口或外部效果时，在动手前补充：**改变什么、保持什么、依据哪条决定、怎样验证**。不必填写 YAML 或另建任务文档；复杂任务可用 [简短合同](templates/agent-task-contract.md) 交接。
@@ -29,8 +31,8 @@
 非简单修改使用从最新目标分支建立的独立 worktree，记录基线，保护原 checkout 的未提交内容。每个 worktree 同时只有一个 writer；交接按 GOV-005 记录分支、HEAD、dirty state 和下一位 owner，旧 writer 先结束写入，不用 reset 或清理制造 clean 状态。
 
 ```bash
-git fetch origin main
-git worktree add -b codex/<task> ../<task> origin/main
+git fetch origin my-changes
+git worktree add -b codex/<task> ../<task> origin/my-changes
 ```
 
 需要代码索引时，为该 worktree 单独执行 `codegraph init <worktree>` 并用 `codegraph status <worktree>` 核对路径；不共享 `.codegraph/`。需要 Python 时先核对环境；依赖未变可软链接原 `.venv`，依赖变化则使用独立环境，不向共享 venv 安装分支依赖。纯文档任务无需初始化代码索引或语言环境。

@@ -15,7 +15,7 @@
 
 ## 更新
 
-### Docker
+### 上游 Docker 发行版
 
 先停止服务，备份数据，再下载新版 `compose.yaml` 并启动：
 
@@ -28,13 +28,13 @@ docker compose up -d --wait
 
 备份命令里的 `akashic_data` 要换成你的数据卷名（见上表）。
 
-### 不用 Docker
+### 本仓库的源码安装
 
-先按 Ctrl+C 停止，再切换到新版本，然后重新运行：
+按 Ctrl+C 停止程序，在源码目录更新个人主线并重新启动。
 
 ```bash
-git fetch --tags
-git checkout <新版本号，例如 v0.3.0>
+git switch my-changes
+git pull --ff-only origin my-changes
 ./start
 ```
 
@@ -60,7 +60,7 @@ docker compose exec akashic python main.py pkg upgrade         # 全部升级
 
 - **一次性登录链接**：在运行 Akashic 的机器上执行下面的命令，会得到一条 2 分钟内有效、只能用一次的登录链接。
   ```bash
-  ./start --login                                       # 不用 Docker（在 akashic-agent 目录里）
+  ./start --login                                       # 不用 Docker（在源码目录里）
   docker compose exec akashic python main.py web-login  # Docker（在 akashic 目录里）
   ```
 - **记住设备**：默认 90 天内免登录。在别人的电脑上登录时，请取消勾选“记住这台设备”。

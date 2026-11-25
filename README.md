@@ -1,14 +1,32 @@
-[![欢迎加入交流群](https://img.shields.io/badge/QQ%E4%BA%A4%E6%B5%81%E7%BE%A4-%E6%AC%A2%E8%BF%8E%E5%8A%A0%E5%85%A5-2ea44f?style=for-the-badge)](./COMMUNICATION.md)
+# Akashic
 
-# Akashic Agent
+Akashic 是一个可以在本机运行的 AI 助手，支持跨会话回忆，也能根据用户的嘱托主动发消息。本仓库由 Pengju Wang（namei32）维护，基于 [Akashic Agent](https://github.com/kachofugetsu09/akashic-agent) 开发，个人主线为 `my-changes`。[MIT 许可证](./LICENSE)
 
-Akashic 是一个会主动找你的 AI 伙伴：能聊天，能根据你订阅的信息主动发消息，空闲时还会在后台帮你做事。
+## 这个版本做过哪些改进
+
+- **主动反馈**。在上游 Watch 的基础上，给 EventMail 增加到期告警的只读查询，让 Watch 按作用域分流事件、统一调度主动联系，并让权限检查识别已安装的 Watch 发行版。[事件分流](https://github.com/namei32/akashic/commit/8a991fd893a5408159d541b6ff29b1d532e2774c) · [调度收口](https://github.com/namei32/akashic/commit/babf72865f5a8e1547d1ff564808e9aaa075e06e) · [发送权限](https://github.com/namei32/akashic/commit/fb9b256ee568ac3923529ac1693ca0bd6ef0c2c4)
+- **跨会话记忆**。为 Akasha 实现按需回读。例如用户在新会话里问“上次定的周报时间是什么”，召回先给出历史消息的时间、短预览和引用，模型需要核实细节时，再按引用读取当前作用域允许访问的原文。已在窗口里出现的消息会去重。[实现提交](https://github.com/namei32/akashic/commit/7a3f3134821b7b38aef50d0e56fa699e80cc731d) · [设计与回放结果](./docs/decisions/0141-akasha-recall-injects-an-index.md)
+- **WSL 部署与恢复**。为原生 WSL 安装增加自更新流程，将部署结果送回发起会话，并在新版本启动失败时根据发布记录回滚。[原生部署](https://github.com/namei32/akashic/commit/e970e0b0fa6987aa6d9e19c4eb33fd45edc581e9) · [结果回传](https://github.com/namei32/akashic/commit/997cbbf7613091c9339362e4d87aefc9c0bc51e9) · [失败回滚](https://github.com/namei32/akashic/commit/fbeb83603772dae66af05560572b447aaab85e28)
+
+上述提交可查看个人实现时的完整改动。当前版本将 Watch 和 Akasha 等扩展独立分发，插件来源见下文。
 
 ## 安装
 
-两种方式选一种。不确定选哪个，就用 Docker。
+### 从源码运行本仓库（Linux 或 WSL2）
 
-### 方式一：Docker（Windows、macOS、Linux 都可以）
+需要 Git、Python 3.12+、Node.js 20+ 和 npm。
+
+```bash
+git clone --branch my-changes https://github.com/namei32/akashic.git
+cd akashic
+./start
+```
+
+首次启动会准备运行环境并引导选择功能。装好后浏览器会打开登录页面。按 Ctrl+C 停止。
+
+### 体验上游 Docker 发行版
+
+以下命令下载上游发布的镜像配置。要运行本仓库的个人主线，请使用上面的源码安装方式。
 
 先安装 [Docker Desktop](https://docs.docker.com/get-docker/)，并打开它。然后在终端里依次运行：
 
@@ -22,18 +40,6 @@ docker compose exec akashic python main.py web-login
 第一次启动只装核心，大约 1 分钟，主要是下载镜像；期间终端只显示等待；想看进度，另开一个终端运行 `docker compose logs -f`。其余功能在网页引导里挑选安装。最后一条命令会打印一个登录链接，在浏览器里打开它就能进入。
 
 如果报错 `address already in use`，说明 2236 端口被别的程序占了：在同一目录创建 `.env` 文件，写一行 `AKASHIC_PORT=2237`，再运行一次 `docker compose up -d --wait`。
-
-### 方式二：不用 Docker（Linux 或 WSL2）
-
-需要 Git、Python 3.12+ 和 Node.js 20+。
-
-```bash
-git clone --branch v0.3.0 https://github.com/kachofugetsu09/akashic-agent.git
-cd akashic-agent
-./start
-```
-
-第一次运行会在终端里问你装哪些功能，直接回车就是全部安装，大约需要 10 分钟。装好后浏览器会自动打开，并且已经登录。按 Ctrl+C 停止。
 
 ## 第一次打开
 
@@ -57,7 +63,7 @@ Akashic 把“核心闭环”和“功能扩展”拆开维护：
 
 ## 常用操作
 
-| 想做的事 | Docker（在 `akashic` 目录里运行） | 不用 Docker（在 `akashic-agent` 目录里运行） |
+| 想做的事 | Docker（在 `akashic` 目录里运行） | 不用 Docker（在源码目录里运行） |
 | --- | --- | --- |
 | 停止 | `docker compose stop` | 按 Ctrl+C |
 | 再次启动 | `docker compose up -d --wait` | `./start` |
@@ -72,13 +78,13 @@ Akashic 把“核心闭环”和“功能扩展”拆开维护：
 
 1. 先看日志（见上表）里最后的报错。
 2. 处理后重新运行启动命令。中途失败了，直接再运行一次即可，已完成的步骤不会重做。
-3. 还是不行，就带上日志的最后 200 行，到 [Issues](https://github.com/kachofugetsu09/akashic-agent/issues) 提问，或者加[交流群](./COMMUNICATION.md)。
+3. 还是不行，就带上日志的最后 200 行，到[本仓库的 Issues](https://github.com/namei32/akashic/issues) 提问。分享前请删去日志里的登录链接和凭据。
 
 ## 给 AI 助手的安装说明
 
 如果你是正在帮用户安装 Akashic 的 AI 助手，按下面做：
 
-- **Docker**：按“方式一”的命令依次运行。
+- **上游 Docker 发行版**：按上面 Docker 小节的命令依次运行。
   - `docker compose up -d --wait` 返回 0 就表示已就绪。如果返回非 0，运行 `docker compose logs --tail=200 akashic` 查看原因。
   - 把 `web-login` 打印的链接交给用户。这个链接 2 分钟内有效，只能用一次。
 - **源码**：运行 `./start --no-browser --yes`。
