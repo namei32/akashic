@@ -1,6 +1,6 @@
 # Akashic
 
-Akashic 是一个可以在本机运行的 AI 助手，支持跨会话回忆，也能根据用户的嘱托主动发消息。本仓库由 Pengju Wang（namei32）维护，基于 [Akashic Agent](https://github.com/kachofugetsu09/akashic-agent) 开发，个人主线为 `my-changes`。[MIT 许可证](./LICENSE)
+Akashic 是一个可以在本机运行的 AI 助手，支持跨会话回忆，也能根据用户的嘱托主动发消息。本仓库由 Pengju Wang（namei32）维护，基于 [Akashic Agent](https://github.com/kachofugetsu09/akashic-agent) 开发，个人主线为 `main`。[MIT 许可证](./LICENSE)
 
 ## 这个版本做过哪些改进
 
@@ -17,7 +17,7 @@ Akashic 是一个可以在本机运行的 AI 助手，支持跨会话回忆，�
 需要 Git、Python 3.12+、Node.js 20+ 和 npm。
 
 ```bash
-git clone --branch my-changes https://github.com/namei32/akashic.git
+git clone --branch main https://github.com/namei32/akashic.git
 cd akashic
 ./start
 ```

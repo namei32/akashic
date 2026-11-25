@@ -33,8 +33,8 @@ docker compose up -d --wait
 按 Ctrl+C 停止程序，在源码目录更新个人主线并重新启动。
 
 ```bash
-git switch my-changes
-git pull --ff-only origin my-changes
+git switch main
+git pull --ff-only origin main
 ./start
 ```
 
