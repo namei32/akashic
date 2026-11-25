@@ -2,13 +2,6 @@
 
 这份文件只保存 Akashic Agent 当前仍未完成的工作。事项完成后删除，不保留“已完成”记录。
 
-## P0 · 个人仓库来源接管
-
-按 [0168](decisions/0168-namei-owns-release-sources.md) 完成两仓 CI、个人镜像发布、
-隔离安装与升级验证，再逐项迁移正式实例中仍指向作者仓库、本地 bundle 的插件。
-迁移保持身份、配置引用和数据目录；生产切换单独授权。Feed 源码与 Watch 接口接入
-仍需独立完成，以原 8 个订阅继续轮询、Watch 实际收到事件验收。
-
 ## P0 · Issue 1179 后续边界
 
 边界②非账本 Core 收口与边界③ Ledger/整体验收已交付 stacked Draft PR，
