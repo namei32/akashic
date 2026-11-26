@@ -40,6 +40,7 @@ description: 用户明确授权 Akashic 合并 PR 并更新当前 Docker 实例�
    ```
 
    仅在本次明确要求备份时加 `--backup`；默认不备份。
+   本次只更新 Core/内置、需要保留已安装扩展版本时加 `--no-extra`。
    CLI 自动读取 Shell 的当前调用身份，不需要填写 session、Turn 或 boot ID。
    部署失败时，宿主会把失败原因送回本会话并唤醒你；用户要求把结果送到另一个对话会话时，
    加 `--session <会话编号>`。

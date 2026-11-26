@@ -237,6 +237,7 @@ def _parser() -> argparse.ArgumentParser:
     submit_parser.add_argument("--mise", type=Path, default=None)
     submit_parser.add_argument("--timeout", type=int, default=600)
     submit_parser.add_argument("--backup", action="store_true")
+    submit_parser.add_argument("--no-extra", action="store_true", help="保留已安装扩展版本，只发布 Core 和内置代码")
     submit_parser.add_argument("--session", help="部署失败时注入并唤醒的会话；默认是发起调用的会话")
     submit_parser.set_defaults(handler=submit)
     diff_parser = subparsers.add_parser("preset-diff", help="只读：列出本实例相对 preset 的启停与配置覆盖")

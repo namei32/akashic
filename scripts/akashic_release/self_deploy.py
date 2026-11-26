@@ -88,6 +88,8 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
         "unit": unit,
         "notifySession": session,
     }
+    if getattr(args, "no_extra", False):
+        request["noExtra"] = True
     with release_lock(path.with_suffix(".lock")):
         if path.exists():
             record = read_json(path)
@@ -395,6 +397,7 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
                 plan=None,
                 inputs=None,
                 backup=request["backup"],
+                no_extra=request.get("noExtra", False),
             ),
             self_deploy=record,
         )

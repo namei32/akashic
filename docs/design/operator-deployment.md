@@ -287,6 +287,7 @@ workload runtime 必须保持同一状态目录；布局不匹配时明确拒绝
 部署者需要额外 Compose 文件时，在环境文件配置 `AKASHIC_COMPOSE_ARGS=--file /绝对路径/compose.local.yaml`。
 本地 systemd 定制放在 drop-in 中，避免被发行版单元替换。root 更新回执时保留既有属主，
 新回执沿用所在目录的属主；历史 root 独占回执需由部署者单独核对和修正。
+本次只发布 Core/内置时可用 `submit --no-extra`，保持已安装扩展的版本选择；不改变默认扩展更新策略。
 
 部署者可以安装 `scripts/akashic_release/worker_permissions.py` 为 root 所有的固定入口，
 并设置 `AKASHIC_DEPLOY_WORKER_HELPER`。其 root 所有、不可由普通用户改写的
