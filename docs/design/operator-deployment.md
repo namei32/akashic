@@ -280,6 +280,22 @@ Source body-kind reads also use `message_source_kind_seq` on Session, source, `j
 
 ## Shell 自部署
 
+### 已授权 PR 的免人工准备
+
+`akashic-release prepare-pr --pr <编号> --head <完整SHA> --wait` 只接受同一仓库中指向
+`main` 的 PR。宿主核对完整文件清单和 CI，用固定 head 合并。控制面和工作流改动保留管理员流程。
+独立 GitHub Actions 构建合并提交，宿主确认合并后 CI、构建工作流内容、仓库、提交和制品摘要后，
+导入固定制品，写入批准记录。接着仍从正常对话回合调用 `submit`。
+
+管理员安装 `akashic-prepare@.service`，更新受保护发布器的代码，在
+`/etc/akashic-publisher/promotion.json` 固定 `app_id`、`installation_id`、`private_key`
+和 `workflow_sha256`。GitHub App 只装到本仓库，授予 Contents 写、Pull requests 和 Actions 读，
+由宿主生成短期安装令牌。私钥保存在管理员独占目录。设置 GitHub 规则时避免该 App 拥有绕过权限；
+保护工作流和正式分支的管理权。可选 `promotion-network.env` 只由管理员配置网络。
+
+准备回执与批准文件由宿主追加并推进状态，聊天进程只通过窄接口读取。普通应用发布的备份、
+数据迁移和宿主配置权限与 [独立发布权](../decisions/0169-publisher-authority-is-independent.md) 一致。
+
 采用 [独立发布权](../decisions/0169-publisher-authority-is-independent.md) 的实例保留
 `submit` 与 `status`。发布入口只接纳管理员批准的固定提交，默认保留外置插件版本。
 应用发布不更新宿主发布器、Compose、Controller 镜像、工作负载政策或系统单元。

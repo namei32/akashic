@@ -95,6 +95,9 @@ def _submit(policy: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
 
 
 def dispatch(policy: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+    if message.get("action") in ("prepare-pr", "preparation-status"):
+        from scripts.akashic_release.promotion import request
+        return request(policy, message)
     if message == {"action": "check"}:
         return {"authority": "administrator", "preparedReleasesOnly": True}
     if set(message) == {"action", "commit"} and message["action"] == "eligible":
@@ -187,12 +190,15 @@ def worker(identity: str) -> None:
 def main() -> None:
     sys.path.insert(0, str(protected(Path(__file__).resolve().parents[2])))
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("serve", "worker"))
+    parser.add_argument("action", choices=("serve", "worker", "prepare-worker"))
     parser.add_argument("identity", nargs="?")
     args = parser.parse_args()
     if args.action == "serve":
         os.environ["AKASHIC_PUBLISHER_POLICY"] = str(POLICY)
         serve()
+    elif args.action == "prepare-worker":
+        from scripts.akashic_release.promotion import worker as prepare_worker
+        prepare_worker(_identity(args.identity))
     else:
         worker(_identity(args.identity))
 
