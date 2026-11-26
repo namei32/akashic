@@ -67,6 +67,9 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
     root = args.root.resolve()
     environment_file = args.runtime_env.resolve(strict=True)
     current = read_environment(environment_file)
+    helper = current.get("AKASHIC_DEPLOY_WORKER_HELPER")
+    if helper:
+        subprocess.run(["sudo", "-n", helper, "check"], check=True, capture_output=True, text=True)
     ready = read_json(Path(current["AKASHIC_WORKSPACE"]) / ".runtime-ready.json")
     if ready["bootId"] != stop.boot_id or ready["state"] != "ready":
         raise RuntimeError("Shell 调用不属于当前就绪 boot")
@@ -110,6 +113,10 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
         write_json(path, record)
         try:
             asyncio.run(_arm_stop(request, current))
+            command = (["sudo", "-n", helper, "run", identity] if helper else [
+                request["mise"], "exec", "--", sys.executable, "-m",
+                "scripts.akashic_release.cli", "self-deploy-worker", "--request", str(path),
+            ])
             subprocess.run(
                 [
                     "systemd-run",
@@ -119,15 +126,7 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
                     "--property=KillMode=control-group",
                     "--property=TimeoutStartSec=infinity",
                     f"--working-directory={Path(__file__).resolve().parents[2]}",
-                    request["mise"],
-                    "exec",
-                    "--",
-                    sys.executable,
-                    "-m",
-                    "scripts.akashic_release.cli",
-                    "self-deploy-worker",
-                    "--request",
-                    str(path),
+                    *command,
                 ],
                 check=True,
                 capture_output=True,

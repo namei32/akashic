@@ -288,6 +288,15 @@ workload runtime 必须保持同一状态目录；布局不匹配时明确拒绝
 本地 systemd 定制放在 drop-in 中，避免被发行版单元替换。root 更新回执时保留既有属主，
 新回执沿用所在目录的属主；历史 root 独占回执需由部署者单独核对和修正。
 
+部署者可以安装 `scripts/akashic_release/worker_permissions.py` 为 root 所有的固定入口，
+并设置 `AKASHIC_DEPLOY_WORKER_HELPER`。其 root 所有、不可由普通用户改写的
+`/etc/akashic/deploy-worker.json` 只配置 `user`、`root`、`runtime_env`。
+sudoers 按安装文件摘要仅放行 `check` 和 `run <32 位请求 ID>`。入口核对实例和独立
+worker cgroup 后，以发布用户身份及 Docker 附加组执行原 worker；不把整个用户账户加入
+Docker 组，不以 root 执行候选发布代码。Docker 访问仍具有很高权限，限于受信任的发布任务。
+系统服务授权只允许启停既有 Akashic Core/Bridge 单元及启用这两个单元；更新系统单元仍由
+部署者审阅安装，不授予通用文件安装、任意 systemctl 或免密 root Shell 权限。
+
 Docker 默认执行 `gateway`；AppRuntime 拥有 Web Shell、readiness 和关闭顺序，
 Docker init 负责回收子进程，systemd 负责服务生命周期。原生直接运行模式仍使用 Supervisor。
 首次启用需由部署者用既有安装流程启动支持 [0091](../decisions/0091-shell-self-deployment.md)
