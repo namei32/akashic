@@ -1,5 +1,7 @@
 # Akashic Agent 项目阅读索引
 
+自部署权限收口沿 [0169 · 独立发布权](decisions/0169-publisher-authority-is-independent.md) 核对；受保护发布器不随应用更新。
+
 本分支的 Core、extra 与镜像来源以 [0168 · 个人源码与发布归属](decisions/0168-namei-owns-release-sources.md)
 为准。涉及来源接管时，先读该勘误；历史 fleet 清单不能替代当前实例盘点。
 

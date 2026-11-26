@@ -4,6 +4,7 @@
 - 日期：2026-10-06
 - 关联：RUN-004、RUN-013、SH-003、STA-002、MIG
 - 范围：Docker 生产路径；直接 Python 的 Supervisor 入口保留。
+- 后续勘误：[0169](0169-publisher-authority-is-independent.md) 将高权限发布器独立安装，取代目标代码的高权限交接；停止与数据保留协议不变。
 
 ## 决定与理由
 

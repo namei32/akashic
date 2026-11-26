@@ -6,6 +6,7 @@
 
 | ID | 状态 | 主题 | 关联条款 |
 |---|---|---|---|
+| [0169](0169-publisher-authority-is-independent.md) | accepted | 发布权独立于聊天与候选代码，固定宿主政策和已批准制品 | CAP、RUN、STA |
 | [0168](0168-namei-owns-release-sources.md) | accepted | namei32 拥有 Core、插件和发布来源；勘误 0167 的仓库归属 | PLG、MIG |
 | [0167](0167-plugins-ship-from-extra.md) | accepted / implemented for review | 非核心插件由官方 extra 仓库提供，Core 用 pkg 管理；取代 0148 | PLG-001 |
 | [0151](0151-watch-closes-every-loop.md) | proposed / implemented for review | 值班：每件事要有着落，来源可以是一个脚本 | PRO-004～PRO-006 |
