@@ -184,10 +184,11 @@ def _installed_account(unit: Path | None) -> tuple[str, str, Path] | None:
     if not user or not group:
         return None
     try:
-        account = pwd.getpwnam(user)
+        account = pwd.getpwuid(int(user)) if user.isdecimal() else pwd.getpwnam(user)
+        group_name = grp.getgrgid(int(group)).gr_name if group.isdecimal() else group
     except KeyError as error:
-        raise RuntimeError(f"已安装单元引用了不存在的用户: {user}") from error
-    return account.pw_name, group, Path(account.pw_dir)
+        raise RuntimeError(f"已安装单元引用了不存在的用户或组: {user}:{group}") from error
+    return account.pw_name, group_name, Path(account.pw_dir)
 
 
 def _file_owner(path: Path | None) -> tuple[str, str, Path] | None:

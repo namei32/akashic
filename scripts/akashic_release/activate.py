@@ -220,6 +220,13 @@ def release_environment(
         if not inherited:
             raise RuntimeError("首次安装必须通过环境提供 OPENCODE_GO_API_KEY")
         values["OPENCODE_GO_API_KEY"] = inherited
+    if configured := publisher_policy():
+        values.update(AKASHIC_PUBLISHER_SOCKET="/run/akashic-publisher/control.sock",
+                      AKASHIC_DEPLOY_STATUS_DIR=str(paths.run / "self-deploy"),
+                      AKASHIC_CONTROLLER_STATE_ROOT=configured["controller_state"],
+                      GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.directory",
+                      GIT_CONFIG_VALUE_0=str(paths.source(commit)))
+        values.pop("AKASHIC_DEPLOY_WORKER_HELPER", None)
     return values
 
 
@@ -544,7 +551,7 @@ def activate_release(
     if self_deploy is not None:
         self_deploy["activationAttempt"] = str(attempt_path)
         self_deploy["phase"] = "waiting_for_turn"
-        write_json(Path(str(self_deploy["recordPath"])), self_deploy)
+        write_json(Path(str(self_deploy["recordPath"])), self_deploy, mode=0o640 if publisher_policy() else 0o600)
     # 预热有界等待放在关闭准入之前：旧服务等它时仍照常接纳工作。
     if warmer is not None:
         warmer.wait()
@@ -563,7 +570,7 @@ def activate_release(
         write_json(attempt_path, attempt)
         if self_deploy is not None:
             self_deploy["phase"] = "restarting"
-            write_json(Path(str(self_deploy["recordPath"])), self_deploy)
+            write_json(Path(str(self_deploy["recordPath"])), self_deploy, mode=0o640 if publisher_policy() else 0o600)
     except BaseException:
         if self_deploy is not None and stop_ack is not None:
             from scripts.akashic_release.self_deploy import cancel_stop
@@ -582,7 +589,8 @@ def activate_release(
             closed_boot = verify_closed(stop_ack, current)
         # 旧 Core 排空后才固定恢复点；预检期间的插件换代仍属于旧版本。
         if root_ref is not None:
-            stopped_selection = selection_path.read_text(encoding="utf-8")
+            stopped_selection = (state_action("read-selection", {"state": str(paths.state)})
+                                 if publisher_policy() else selection_path.read_text(encoding="utf-8"))
             if json.loads(stopped_selection)["root_ref"] != root_ref:
                 raise RuntimeError("预检后插件选择已更新，请基于当前选择重新部署")
             selection_snapshot = stopped_selection
@@ -683,6 +691,8 @@ def _roll_back(
 ) -> None:
     # 1. 候选可能已部分启动；先停下，再把选择文件改回停机前的原文。
     stop_runtime(run=run)
+    if configured := publisher_policy():
+        previous = {**previous, "AKASHIC_CONTROLLER_STATE_ROOT": configured["controller_state"]}
     published = publication.get("new_root_ref") if isinstance(publication, dict) else None
     if publisher_policy():
         state_action("restore", {"state": str(paths.state), "selection": snapshot, "published": published,

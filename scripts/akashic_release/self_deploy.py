@@ -72,6 +72,7 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
         from scripts.akashic_release.authority import exchange
         if args.backup:
             raise ValueError("受保护发布只激活已批准制品；备份和迁移由管理员单独执行")
+        exchange({"action": "eligible", "commit": args.commit}, authority)
         request = {"stop": stop.model_dump()}
         asyncio.run(_arm_stop(request, current))
         return exchange({"action": "submit", "commit": args.commit, "stop": stop.model_dump(),
@@ -186,6 +187,7 @@ async def _prepare_stop(
     from akashic_sdk import AsyncAkashic
     from plugins.gateway.cli import find_endpoint, read_token
     from plugins.host_execution.controller_client import UnixWorkloadController
+    from scripts.akashic_release.publisher_mode import policy, state_action
 
     workspace = Path(current["AKASHIC_WORKSPACE"])
     endpoint = find_endpoint(workspace)
@@ -195,9 +197,11 @@ async def _prepare_stop(
             if (not isinstance(result, dict) or result.get("state") != "drained"
                     or result.get("bootId") != request["stop"]["boot_id"]):
                 raise RuntimeError("Core 未确认正常回合和排空")
-            controller = await UnixWorkloadController(
-                Path(current["AKASHIC_WORKLOAD_RUNTIME_DIR"]) / "controller.sock"
-            ).status()
+            controller_socket = Path(current["AKASHIC_WORKLOAD_RUNTIME_DIR"]) / "controller.sock"
+            if policy():
+                controller = state_action("controller-status", {"socket": str(controller_socket)})
+            else:
+                controller = await UnixWorkloadController(controller_socket).status()
             result["controllerId"] = controller["controller_id"]
             result["containerId"] = subprocess.check_output(
                 [
@@ -237,18 +241,24 @@ def cancel_stop(record: dict[str, Any], current: dict[str, str]) -> None:
 def verify_closed(ack: dict[str, object], current: dict[str, str]) -> str:
     """核对 boot 回执、实际容器及 Controller 退出，返回可由发布器结算的 boot。"""
     from bootstrap.runtime_readiness import read_closed_boot
+    from scripts.akashic_release.publisher_mode import policy, state_action
 
     boot_id = ack["bootId"]
     if not isinstance(boot_id, str):
         raise RuntimeError("停止回执缺少 boot ID")
-    root, _pending = read_closed_boot(Path(current["AKASHIC_WORKSPACE"]), boot_id)
+    if policy():
+        root, _pending = state_action("read-closed", {"workspace": current["AKASHIC_WORKSPACE"], "boot": boot_id})
+    else:
+        root, _pending = read_closed_boot(Path(current["AKASHIC_WORKSPACE"]), boot_id)
     if root != ack["rootIdentity"]:
         raise RuntimeError("旧 Core 关闭回执与排空的 Root 不符")
+    controller_id = ack["controllerId"]
+    if not isinstance(controller_id, str) or not re.fullmatch(r"[0-9a-f]{32}", controller_id):
+        raise RuntimeError("旧 Controller 关闭回执缺少合法 ID")
     controller = read_json(
-        Path(current["AKASHIC_EXPERIMENT_ROOT"])
-        / "workload-controller"
+        Path(current.get("AKASHIC_CONTROLLER_STATE_ROOT", str(Path(current["AKASHIC_EXPERIMENT_ROOT"]) / "workload-controller")))
         / "closed"
-        / f"{ack['controllerId']}.json"
+        / f"{controller_id}.json"
     )
     if controller["controller"] != {"id": ack["controllerId"], "leases_empty": True}:
         raise RuntimeError("旧 Controller 缺少精确租约清理证据")

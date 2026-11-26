@@ -49,6 +49,7 @@ def _submit(policy: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
     from plugins.gateway.runtime_stop import StopParams
     from scripts.akashic_release.doctor import read_environment
     from scripts.akashic_release.manifest import read_json, release_lock, write_json
+    from scripts.akashic_release.publisher_mode import state_action
     from scripts.akashic_release.self_deploy import _utc_now_iso
 
     if set(message) != {"action", "commit", "stop", "session"}:
@@ -62,7 +63,7 @@ def _submit(policy: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("通知会话无效")
     root = Path(policy["root"])
     current = read_environment(Path(policy["runtime_env"]))
-    ready = read_json(Path(current["AKASHIC_WORKSPACE"]) / ".runtime-ready.json")
+    ready = state_action("read-object", {"path": str(Path(current["AKASHIC_WORKSPACE"]) / ".runtime-ready.json")})
     if ready["bootId"] != stop.boot_id or ready["state"] != "ready":
         raise RuntimeError("调用不属于当前就绪实例")
     directory = root / "run/self-deploy"
@@ -81,14 +82,13 @@ def _submit(policy: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
                 if read_json(protected(existing))["status"] in {"accepted", "running"}:
                     raise RuntimeError("已有发布任务；请先查询其结果")
             saved = {"request": request, "status": "accepted", "phase": "accepted", "submittedAt": _utc_now_iso()}
-            write_json(path, saved)
-            path.chmod(0o644)  # Core may recover failure notices; it cannot change the receipt.
+            write_json(path, saved, mode=0o640)
             try:
                 subprocess.run(["/usr/bin/systemctl", "start", "--no-block", request["unit"]], check=True,
                                capture_output=True, text=True, timeout=15)
             except Exception:
                 saved.update(status="failed", phase="failed", error="宿主未启动发布任务", notice="not-accepted")
-                write_json(path, saved)
+                write_json(path, saved, mode=0o640)
                 raise
     return {"requestId": identity, "status": saved["status"], "unit": request["unit"],
             "targetCommit": commit, "notifySession": session}
@@ -97,12 +97,20 @@ def _submit(policy: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
 def dispatch(policy: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
     if message == {"action": "check"}:
         return {"authority": "administrator", "preparedReleasesOnly": True}
+    if set(message) == {"action", "commit"} and message["action"] == "eligible":
+        approval(policy, message["commit"])
+        return {"approved": True}
     if message.get("action") == "submit":
         return _submit(policy, message)
     if set(message) == {"action", "requestId"} and message["action"] == "status":
         identity = _identity(message["requestId"])
-        return json.loads(protected(Path(policy["root"]) / "run/self-deploy" / f"{identity}.json").read_text())
-    raise ValueError("发布入口只接受 check、submit、status")
+        record = json.loads(protected(Path(policy["root"]) / "run/self-deploy" / f"{identity}.json").read_text())
+        record["service"] = subprocess.run(
+            ["/usr/bin/systemctl", "show", record["request"]["unit"], "-p", "ActiveState", "-p", "Result"],
+            check=False, text=True, capture_output=True, timeout=5,
+        ).stdout.strip()
+        return record
+    raise ValueError("未知发布操作")
 
 
 def serve() -> None:
@@ -134,7 +142,7 @@ def worker(identity: str) -> None:
     from scripts.akashic_release.extra import ExtraOptions
     from scripts.akashic_release.manifest import read_json, release_lock, write_json
     from scripts.akashic_release.model import ReleasePaths
-    from scripts.akashic_release.publisher_mode import run
+    from scripts.akashic_release.publisher_mode import run, state_action
     from scripts.akashic_release.self_deploy import _utc_now_iso, notify_failure
 
     if os.geteuid() != 0:
@@ -147,7 +155,7 @@ def worker(identity: str) -> None:
         if record["status"] != "accepted":
             raise RuntimeError("任务未接纳或已经执行")
         record.update(status="running", phase="preparing", recordPath=str(path), startedAt=_utc_now_iso())
-        write_json(path, record)
+        write_json(path, record, mode=0o640)
         try:
             request = record["request"]
             release = approval(policy, request["targetCommit"])
@@ -156,10 +164,10 @@ def worker(identity: str) -> None:
             approval(policy, current["AKASHIC_RUNTIME_COMMIT"])
             if request["root"] != str(root) or request["runtimeEnv"] != str(environment):
                 raise ValueError("发布任务不属于固定实例")
-            ready = read_json(Path(current["AKASHIC_WORKSPACE"]) / ".runtime-ready.json")
+            os.environ["AKASHIC_PUBLISHER_POLICY"] = str(POLICY)
+            ready = state_action("read-object", {"path": str(Path(current["AKASHIC_WORKSPACE"]) / ".runtime-ready.json")})
             if ready["bootId"] != request["stop"]["boot_id"]:
                 raise RuntimeError("原 boot 已被替换")
-            os.environ["AKASHIC_PUBLISHER_POLICY"] = str(POLICY)
             paths = ReleasePaths(root, state_root=Path(policy["state"]))
             status = activate_release(paths=paths, manifest_path=root / "releases" / f"{request['targetCommit']}.json",
                                       environment_file=environment, mise=Path(current["AKASHIC_MISE"]),
@@ -168,13 +176,12 @@ def worker(identity: str) -> None:
                           "imageId": release["imageId"], "degradedExternal": read_json(root / "activation/active.json")["runtimeCheck"]["degraded_external"]})
         except Exception as error:
             record.update(status="failed", phase="failed", error=f"{type(error).__name__}: {error}")
-            write_json(path, record)
+            write_json(path, record, mode=0o640)
             record["notice"] = notify_failure(record)
             raise
         finally:
             record["finishedAt"] = _utc_now_iso()
-            write_json(path, record)
-            path.chmod(0o644)
+            write_json(path, record, mode=0o640)
 
 
 def main() -> None:
@@ -184,6 +191,7 @@ def main() -> None:
     parser.add_argument("identity", nargs="?")
     args = parser.parse_args()
     if args.action == "serve":
+        os.environ["AKASHIC_PUBLISHER_POLICY"] = str(POLICY)
         serve()
     else:
         worker(_identity(args.identity))

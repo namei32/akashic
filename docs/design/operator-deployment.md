@@ -280,6 +280,26 @@ Source body-kind reads also use `message_source_kind_seq` on Session, source, `j
 
 ## Shell 自部署
 
+采用 [独立发布权](../decisions/0169-publisher-authority-is-independent.md) 的实例保留
+`submit` 与 `status`。发布入口只接纳管理员批准的固定提交，默认保留外置插件版本。
+应用发布不更新宿主发布器、Compose、Controller 镜像、工作负载政策或系统单元。
+
+管理员在独立构建环境运行 `install --no-activate` 准备精确提交的镜像、清单及 Bridge venv，
+核验来源、提交和镜像摘要后，将制品交给宿主。宿主使用 `install_authority.py` 准备固定路径和
+系统单元，再用已安装的 `approve.py` 导入镜像所对应的制品。此步骤只导入已构建输入，
+Bridge venv 的基础解释器重新指向管理员维护的工具链。源目录、解释器以及受信任工具链必须位于
+运行用户不可写的目录，请一并核对父目录和软链接。
+
+切换前审查 `runtime.env`，确保挂载源、执行路径和代理配置来自管理员。按实际使用的工作负载
+批准镜像、命令、资源上限、固定挂载和出口。为 Bridge 隔离环境只映射原应用数据、所需的只读工具链、
+Bridge socket 目录和发布 socket。WSL 的 Windows 互操作入口、磁盘挂载及宿主管理 socket 不应进入隔离环境。
+如系统对用户命名空间有发行版级限制，先验证 Bubblewrap 可用，并使用发行版提供的配置。
+
+首次切换由管理员在维护窗口执行。保留原单元、入口和运行配置的恢复副本，先用当前版本验收新单元，
+再移除原免密发布规则。通过真实会话验证批准版本更新、拒绝未批准版本、日常 Shell、Controller
+和浏览器。验证回退须使用独立内核的虚拟机。确认启动健康、原数据及外置插件可回读后再交付。
+批准文件和发布回执保留在宿主目录，运行用户可查询任务结果，失败任务不会自动重放。
+
 宿主 CLI 从当前 `runtime.env` 解析发布根、mise 和既有状态目录；显式参数优先。
 `akashic-release paths` 只读列出这些路径。已有实例的 workspace、配置、plugin home 与
 workload runtime 必须保持同一状态目录；布局不匹配时明确拒绝，不创建另一套空状态。

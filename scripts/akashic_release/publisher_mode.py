@@ -27,7 +27,7 @@ def state_action(action: str, payload: dict[str, object]) -> Any:
     environment = {"HOME": account.pw_dir, "PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
     result = subprocess.run(
         [sys.executable, "-I", "-B", str(Path(__file__).with_name("state_action.py")), action],
-        input=json.dumps(payload), capture_output=True, text=True, check=True, cwd="/",
+        input=json.dumps(payload), capture_output=True, text=True, check=True, cwd="/", timeout=30,
         env=environment, user=account.pw_uid, group=account.pw_gid, extra_groups=[],
     )
     return json.loads(result.stdout)
@@ -42,7 +42,7 @@ def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
     if command[0] == "docker":
         command[0] = "/usr/bin/docker"
     if command[:2] == ["/usr/bin/docker", "run"]:
-        from scripts.akashic_release.authority_policy import protected
+        from scripts.akashic_release.authority_policy import pinned_directory, protected
         state = configured["state"]
         roots = configured["mounts"]
         for index, argument in enumerate(command):
@@ -52,9 +52,7 @@ def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
             source = next(item[4:] for item in fields if item.startswith("src="))
             if source in roots:
                 source = roots[source]
-                protected(Path(source).parent)
-                if Path(source).is_symlink() or not os.path.ismount(source):
-                    raise PermissionError("发布数据源必须是管理员固定的挂载点")
+                pinned_directory(Path(source))
             elif source == state or Path(source).is_relative_to(state):
                 raise PermissionError("未批准的数据挂载")
             else:

@@ -1,0 +1,8 @@
+[Unit]
+Description=Pin Akashic application state mounts
+Before=akashic-core.service akashic-host-bridge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I -B /opt/akashic-publisher/current/source/scripts/akashic_release/bind_state.py
+RemainAfterExit=yes
