@@ -67,6 +67,15 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
     root = args.root.resolve()
     environment_file = args.runtime_env.resolve(strict=True)
     current = read_environment(environment_file)
+    authority = current.get("AKASHIC_PUBLISHER_SOCKET")
+    if authority:
+        from scripts.akashic_release.authority import exchange
+        if args.backup:
+            raise ValueError("受保护发布只激活已批准制品；备份和迁移由管理员单独执行")
+        request = {"stop": stop.model_dump()}
+        asyncio.run(_arm_stop(request, current))
+        return exchange({"action": "submit", "commit": args.commit, "stop": stop.model_dump(),
+                         "session": args.session or stop.session_id}, authority)
     helper = current.get("AKASHIC_DEPLOY_WORKER_HELPER")
     if helper:
         subprocess.run(["sudo", "-n", helper, "check"], check=True, capture_output=True, text=True)
@@ -467,6 +476,10 @@ async def _send_notice(current: dict[str, str], params: dict[str, object]) -> No
 
 
 def status(args: argparse.Namespace) -> dict[str, object]:
+    current = read_environment(args.runtime_env)
+    if address := current.get("AKASHIC_PUBLISHER_SOCKET"):
+        from scripts.akashic_release.authority import exchange
+        return exchange({"action": "status", "requestId": args.request_id}, address)
     record = read_json(_request_path(args.root.resolve(), args.request_id))
     record["service"] = subprocess.check_output(
         [
