@@ -18,6 +18,14 @@ _SYSTEM_UNIT_ROOT = Path("/etc/systemd/system")
 _UNIT_STAGING_ROOT = Path("/tmp")
 
 
+def _service_command(action: str, *arguments: str) -> list[str]:
+    helper = os.environ.get("AKASHIC_DEPLOY_WORKER_HELPER")
+    request = os.environ.get("AKASHIC_DEPLOY_REQUEST")
+    if helper and request:
+        return ["sudo", "-n", helper, "control", request, action]
+    return ["sudo", "systemctl", *arguments]
+
+
 def require_unit_install(
     *, checkout: Path, run: Run, unit_root: Path = _SYSTEM_UNIT_ROOT, runtime_env: Path | None = None,
 ) -> None:
@@ -56,7 +64,7 @@ def install_units(
     verify_rendered_units(rendered_units)
     if not changed:
         if unit_root == _SYSTEM_UNIT_ROOT:
-            run(["sudo", "systemctl", "enable", *_UNITS], check=True)
+            run(_service_command("enable", "enable", *_UNITS), check=True)
         return False
 
     backup = None
@@ -79,7 +87,7 @@ def install_units(
                 run(["sudo", "install", "-m", "0644", str(staged), str(target)], check=True)
     if unit_root == _SYSTEM_UNIT_ROOT:
         run(["sudo", "systemctl", "daemon-reload"], check=True)
-        run(["sudo", "systemctl", "enable", *_UNITS], check=True)
+        run(_service_command("enable", "enable", *_UNITS), check=True)
     return True
 
 
@@ -284,14 +292,14 @@ def install_operator_entrypoint(
 
 
 def stop_runtime(*, run: Run) -> None:
-    run(["sudo", "systemctl", "stop", *_UNITS[::-1]], check=True)
+    run(_service_command("stop", "stop", *_UNITS[::-1]), check=True)
 
 
 def start_bridge(*, run: Run) -> None:
-    run(["sudo", "systemctl", "start", _UNITS[0]], check=True)
+    run(_service_command("start-bridge", "start", _UNITS[0]), check=True)
     run(["systemctl", "is-active", "--quiet", _UNITS[0]], check=True)
 
 
 def start_core(*, run: Run) -> None:
-    run(["sudo", "systemctl", "start", _UNITS[1]], check=True)
+    run(_service_command("start-core", "start", _UNITS[1]), check=True)
     run(["systemctl", "is-active", "--quiet", _UNITS[1]], check=True)

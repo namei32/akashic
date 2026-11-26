@@ -13,6 +13,12 @@ import subprocess
 import sys
 
 PROFILE = Path("/etc/akashic/deploy-worker.json")
+SERVICE_ACTIONS = {
+    "stop": ["stop", "akashic-core.service", "akashic-host-bridge.service"],
+    "start-bridge": ["start", "akashic-host-bridge.service"],
+    "start-core": ["start", "akashic-core.service"],
+    "enable": ["enable", "akashic-host-bridge.service", "akashic-core.service"],
+}
 
 
 def owned_file(path: Path, owners: set[int]) -> str:
@@ -32,10 +38,10 @@ def main() -> None:
     if os.geteuid() != 0:
         raise RuntimeError("通过管理员安装的精确 sudo 规则调用")
     arguments = sys.argv[1:]
-    if arguments != ["check"] and not (
-        len(arguments) == 2 and arguments[0] == "run" and re.fullmatch(r"[0-9a-f]{32}", arguments[1])
-    ):
-        raise RuntimeError("只接受 check 或 run <32 位请求 ID>")
+    run = len(arguments) == 2 and arguments[0] == "run"
+    control = len(arguments) == 3 and arguments[0] == "control" and arguments[2] in SERVICE_ACTIONS
+    if arguments != ["check"] and not ((run or control) and re.fullmatch(r"[0-9a-f]{32}", arguments[1])):
+        raise RuntimeError("只接受 check、run 或固定的 control 动作")
     profile = json.loads(owned_file(PROFILE, {0}))
     account = pwd.getpwnam(profile["user"])
     if account.pw_uid == 0 or os.environ.get("SUDO_UID") != str(account.pw_uid):
@@ -58,7 +64,7 @@ def main() -> None:
     if Path(values["AKASHIC_RUNTIME_CHECKOUT"]) != source or Path(values["AKASHIC_BRIDGE_PYTHON"]) != python:
         raise RuntimeError("实例代码或解释器不属于配置的发布根")
     request_path = None
-    if arguments[0] == "run":
+    if run or control:
         identity = arguments[1]
         if f"/akashic-deploy-{identity}.service" not in Path("/proc/self/cgroup").read_text():
             raise RuntimeError("worker 必须位于自己的 systemd service 中")
@@ -68,6 +74,10 @@ def main() -> None:
                 or Path(request["runtimeEnv"]).resolve() != environment_file
                 or Path(request["mise"]).resolve() != Path(values["AKASHIC_MISE"]).resolve()):
             raise RuntimeError("部署请求与固定实例不符")
+    if control:
+        subprocess.run(["/usr/bin/systemctl", *SERVICE_ACTIONS[arguments[2]]], check=True, timeout=180,
+                       cwd="/", env={"PATH": "/usr/bin:/bin", "HOME": "/root", "LC_ALL": "C"})
+        return
     # 代码、解释器和 mise 全部在降权之后执行；不把 Docker 权限加到用户账户或 Host Bridge。
     os.initgroups(account.pw_name, account.pw_gid)
     os.setgroups(sorted({*os.getgroups(), grp.getgrnam("docker").gr_gid}))
@@ -76,6 +86,8 @@ def main() -> None:
     environment = {"HOME": account.pw_dir, "USER": account.pw_name, "LOGNAME": account.pw_name,
                    "PATH": "/usr/local/bin:/usr/bin:/bin", "XDG_RUNTIME_DIR": f"/run/user/{account.pw_uid}",
                    "AKASHIC_RUNTIME_ENV": str(environment_file), "PYTHONDONTWRITEBYTECODE": "1"}
+    if run:
+        environment.update(AKASHIC_DEPLOY_REQUEST=arguments[1], AKASHIC_DEPLOY_WORKER_HELPER=str(Path(__file__).resolve()))
     for key in ("PATH", "MISE_DATA_DIR", "MISE_CACHE_DIR", "MISE_CONFIG_DIR", "DOCKER_CONFIG",
                 "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME",
                 "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",

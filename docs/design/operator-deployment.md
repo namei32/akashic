@@ -291,10 +291,10 @@ workload runtime 必须保持同一状态目录；布局不匹配时明确拒绝
 部署者可以安装 `scripts/akashic_release/worker_permissions.py` 为 root 所有的固定入口，
 并设置 `AKASHIC_DEPLOY_WORKER_HELPER`。其 root 所有、不可由普通用户改写的
 `/etc/akashic/deploy-worker.json` 只配置 `user`、`root`、`runtime_env`。
-sudoers 按安装文件摘要仅放行 `check` 和 `run <32 位请求 ID>`。入口核对实例和独立
+sudoers 按安装文件摘要仅放行 `check`、`run <32 位请求 ID>` 和固定的 `control <请求 ID> <动作>`。入口核对实例和独立
 worker cgroup 后，以发布用户身份及 Docker 附加组执行原 worker；不把整个用户账户加入
 Docker 组，不以 root 执行候选发布代码。Docker 访问仍具有很高权限，限于受信任的发布任务。
-系统服务授权只允许启停既有 Akashic Core/Bridge 单元及启用这两个单元；更新系统单元仍由
+系统服务授权同样要求该 worker cgroup，只允许启停既有 Akashic Core/Bridge 单元及启用这两个单元；更新系统单元仍由
 部署者审阅安装，不授予通用文件安装、任意 systemctl 或免密 root Shell 权限。
 
 Docker 默认执行 `gateway`；AppRuntime 拥有 Web Shell、readiness 和关闭顺序，

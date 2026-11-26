@@ -36,6 +36,7 @@ def verify_host_prerequisites(*, mise: Path, run: Run) -> None:
     if not mise.is_file() or not os.access(mise, os.X_OK):
         raise RuntimeError(f"mise 不存在或不可执行: {mise}")
     run(["docker", "compose", "version"], check=True, capture_output=True, text=True)
+    run(["docker", "buildx", "version"], check=True, capture_output=True, text=True)
     run(["docker", "info"], check=True, capture_output=True, text=True)
 
 
