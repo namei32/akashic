@@ -589,7 +589,8 @@ def activate_release(
             closed_boot = verify_closed(stop_ack, current)
         # 旧 Core 排空后才固定恢复点；预检期间的插件换代仍属于旧版本。
         if root_ref is not None:
-            stopped_selection = selection_path.read_text(encoding="utf-8")
+            stopped_selection = (state_action("read-selection", {"state": str(paths.state)})
+                                 if publisher_policy() else selection_path.read_text(encoding="utf-8"))
             if json.loads(stopped_selection)["root_ref"] != root_ref:
                 raise RuntimeError("预检后插件选择已更新，请基于当前选择重新部署")
             selection_snapshot = stopped_selection

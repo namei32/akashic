@@ -187,7 +187,8 @@ def main() -> None:
     # Docker Compose receives an administrator-owned file and a fixed executable search path.
     for key in ("AKASHIC_COMPOSE_ARGS", "AKASHIC_DEPLOY_WORKER_HELPER", "DOCKER_CONFIG"):
         values.pop(key, None)
-    values.update(PATH="/usr/bin:/bin", HOME=str(ROOT), AKASHIC_PUBLISHER_SOCKET="/run/akashic-publisher/control.sock",
+    values.update(PATH="/usr/local/bin:/usr/bin:/bin", HOME=str(ROOT),
+                  AKASHIC_PUBLISHER_SOCKET="/run/akashic-publisher/control.sock",
                   AKASHIC_DEPLOY_STATUS_DIR=str(ROOT / "run/self-deploy"))
     path = ROOT / "runtime.env"
     _install_text(path, "".join(f"{key}={value}\n" for key, value in sorted(values.items())), 0o640)

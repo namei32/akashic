@@ -38,6 +38,15 @@ def main() -> None:
     elif action == "read-object":
         from scripts.akashic_release.manifest import read_json
         result = read_json(Path(payload["path"]))
+    elif action == "read-closed":
+        from bootstrap.runtime_readiness import read_closed_boot
+        result = read_closed_boot(Path(payload["workspace"]), payload["boot"])
+    elif action == "read-selection":
+        result = (Path(payload["state"]) / "workspace/runtime/plugin-stable.json").read_text(encoding="utf-8")
+    elif action == "controller-status":
+        import asyncio
+        from plugins.host_execution.controller_client import UnixWorkloadController
+        result = asyncio.run(UnixWorkloadController(Path(payload["socket"])).status())
     else:
         raise ValueError("未知的应用状态操作")
     print(json.dumps(result))
