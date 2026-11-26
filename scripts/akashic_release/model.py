@@ -7,6 +7,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class ReleasePaths:
     root: Path
+    state_root: Path | None = None
 
     @property
     def sources(self) -> Path:
@@ -34,7 +35,7 @@ class ReleasePaths:
 
     @property
     def state(self) -> Path:
-        return self.root / "state"
+        return self.state_root if self.state_root is not None else self.root / "state"
 
     @property
     def backups(self) -> Path:

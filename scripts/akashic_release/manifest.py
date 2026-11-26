@@ -27,6 +27,10 @@ def atomic_write(path: Path, content: str, *, mode: int = 0o600) -> None:
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, mode)
+        if os.geteuid() == 0:
+            # sudo 发布仍由既有操作者读写回执；新文件沿用所在目录的属主。
+            owner = path.stat() if path.exists() else path.parent.stat()
+            os.fchown(descriptor, owner.st_uid, owner.st_gid)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             descriptor = -1
             stream.write(content)
@@ -57,7 +61,10 @@ def release_lock(path: Path, *, wait: bool = False) -> Iterator[None]:
     """默认拒绝并发发布；只有接单与 worker 交接可显式等待。"""
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    owner = path.stat() if path.exists() else path.parent.stat()
     with path.open("a+", encoding="utf-8") as stream:
+        if os.geteuid() == 0:
+            os.fchown(stream.fileno(), owner.st_uid, owner.st_gid)
         try:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except BlockingIOError as error:

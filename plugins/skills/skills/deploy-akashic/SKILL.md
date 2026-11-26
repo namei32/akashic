@@ -29,7 +29,7 @@ description: 用户明确授权 Akashic 合并 PR 并更新当前 Docker 实例�
 
 1. 从用户请求确定允许合并的 PR 和备份选择；“提 PR”不授权合并或部署。
 2. 用 Shell 的 `gh pr view` / `gh pr checks` 核对目标 head、依赖和 CI。
-   合并使用 `gh pr merge <number> --squash --match-head-commit <head-sha>`。
+   合并使用 `gh pr merge <number> --merge --match-head-commit <head-sha>`，保留原始提交。
    检查失败、head 改变或未解决冲突时停止部署，说明真实原因。
 3. 所有获授权 PR 合并后，用 `git ls-remote --exit-code origin refs/heads/main`
    取得唯一完整 40 位 SHA。宿主会准备干净 checkout；不需要在运行目录拉代码。
@@ -40,6 +40,7 @@ description: 用户明确授权 Akashic 合并 PR 并更新当前 Docker 实例�
    ```
 
    仅在本次明确要求备份时加 `--backup`；默认不备份。
+   本次只更新 Core/内置、需要保留已安装扩展版本时加 `--no-extra`。
    CLI 自动读取 Shell 的当前调用身份，不需要填写 session、Turn 或 boot ID。
    部署失败时，宿主会把失败原因送回本会话并唤醒你；用户要求把结果送到另一个对话会话时，
    加 `--session <会话编号>`。
