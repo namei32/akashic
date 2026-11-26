@@ -88,7 +88,8 @@ def main() -> None:
                    "AKASHIC_RUNTIME_ENV": str(environment_file), "PYTHONDONTWRITEBYTECODE": "1"}
     if run:
         environment.update(AKASHIC_DEPLOY_REQUEST=arguments[1], AKASHIC_DEPLOY_WORKER_HELPER=str(Path(__file__).resolve()))
-    for key in ("PATH", "MISE_DATA_DIR", "MISE_CACHE_DIR", "MISE_CONFIG_DIR", "DOCKER_CONFIG",
+    for key in ("PATH", "MISE_DATA_DIR", "MISE_CACHE_DIR", "MISE_CONFIG_DIR", "MISE_STATE_DIR",
+                "MISE_TRUSTED_CONFIG_PATHS", "DOCKER_CONFIG",
                 "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME",
                 "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
                 "http_proxy", "https_proxy", "all_proxy", "no_proxy"):

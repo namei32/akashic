@@ -164,6 +164,12 @@ def release_environment(
     # 拆仓期间（ADR 0148 撤回）写入的制品库路径：宿主桥接会按它加载旧发行版里的插件，发行版只认镜像内的。
     for key in ("AKASHIC_PLUGIN_DISTRIBUTION", "AKASHIC_PLUGIN_STORE"):
         values.pop(key, None)
+    if values.get("MISE_TRUSTED_CONFIG_PATHS") and current.get("AKASHIC_RUNTIME_CHECKOUT"):
+        # 只替换跟随旧发行版的信任路径；操作者额外声明的路径保持原样。
+        values["MISE_TRUSTED_CONFIG_PATHS"] = os.pathsep.join(
+            str(paths.source(commit)) if item == current["AKASHIC_RUNTIME_CHECKOUT"] else item
+            for item in values["MISE_TRUSTED_CONFIG_PATHS"].split(os.pathsep)
+        )
     values.update(
         {
             "AKASHIC_BRIDGE_PYTHON": str(bridge_python),
