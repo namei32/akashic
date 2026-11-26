@@ -26,8 +26,11 @@ jobs:
         run: |
           set -euo pipefail
           prepared="$RUNNER_TEMP/akashic-prepared"
+          origin="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git remote set-url origin "$origin"
+          export MISE_TRUSTED_CONFIG_PATHS="$GITHUB_WORKSPACE:$prepared/runtime-sources/$GITHUB_SHA"
           mise exec -- python scripts/akashic_release/cli.py install --no-activate --yes \
-            --source-checkout "$GITHUB_WORKSPACE" --commit "$GITHUB_SHA" \
+            --source-checkout "$GITHUB_WORKSPACE" --origin "$origin" --commit "$GITHUB_SHA" \
             --root "$prepared" --runtime-env "$prepared/runtime.env" --mise "$(command -v mise)"
           mkdir "$RUNNER_TEMP/wsl-artifact"
           tar -C "$prepared" --dereference --hard-dereference -czf "$RUNNER_TEMP/wsl-artifact/bridge.tar.gz" \
