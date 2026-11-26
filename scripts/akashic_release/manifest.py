@@ -27,6 +27,10 @@ def atomic_write(path: Path, content: str, *, mode: int = 0o600) -> None:
     temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, mode)
+        if os.geteuid() == 0:
+            # sudo 发布仍由既有操作者读写回执；新文件沿用所在目录的属主。
+            owner = path.stat() if path.exists() else path.parent.stat()
+            os.fchown(descriptor, owner.st_uid, owner.st_gid)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             descriptor = -1
             stream.write(content)

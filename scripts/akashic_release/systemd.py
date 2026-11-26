@@ -104,7 +104,15 @@ def _unit_changes(
         target = unit_root / name
         if not source.is_file():
             raise RuntimeError(f"release 缺少 systemd unit: {source}")
-        rendered = _render_unit(source, service_user, service_group, service_home)
+        environment_file = runtime_env
+        if target.is_file():
+            installed_files = environment_files(target.read_bytes())
+            if len(installed_files) == 1:
+                installed_file = Path(installed_files[0])
+                if runtime_env is not None and installed_file.resolve() != runtime_env.resolve():
+                    raise RuntimeError(f"{name} 的环境文件与本次发布不一致")
+                environment_file = installed_file
+        rendered = _render_unit(source, service_user, service_group, service_home, environment_file)
         _require_preserved_environment_file(target, rendered)
         rendered_units[name] = rendered
         if not target.exists() or target.read_bytes() != rendered:
@@ -226,6 +234,7 @@ def _render_unit(
     service_user: str,
     service_group: str,
     service_home: Path,
+    environment_file: Path | None = None,
 ) -> bytes:
     text = source.read_text(encoding="utf-8")
     if text.count("User=huashen") != 1 or text.count("Group=huashen") != 1:
@@ -235,6 +244,13 @@ def _render_unit(
         .replace("Group=huashen", f"Group={service_group}")
         .replace("%h", str(service_home))
     )
+    if environment_file is not None:
+        if not environment_file.is_absolute() or any(char in str(environment_file) for char in "\n\r\x00"):
+            raise RuntimeError("runtime.env 必须是绝对路径且不能包含换行")
+        rendered = rendered.replace(
+            f"EnvironmentFile={service_home}/.config/akashic-container/runtime.env",
+            f"EnvironmentFile={environment_file}",
+        )
     if (
         rendered.count(f"User={service_user}") != 1
         or rendered.count(f"Group={service_group}") != 1

@@ -280,6 +280,14 @@ Source body-kind reads also use `message_source_kind_seq` on Session, source, `j
 
 ## Shell 自部署
 
+宿主 CLI 从当前 `runtime.env` 解析发布根、mise 和既有状态目录；显式参数优先。
+`akashic-release paths` 只读列出这些路径。已有实例的 workspace、配置、plugin home 与
+workload runtime 必须保持同一状态目录；布局不匹配时明确拒绝，不创建另一套空状态。
+`AKASHIC_RUNTIME_ENV` 可选择环境文件。更新单元保留已安装的 EnvironmentFile 路径；
+部署者需要额外 Compose 文件时，在环境文件配置 `AKASHIC_COMPOSE_ARGS=--file /绝对路径/compose.local.yaml`。
+本地 systemd 定制放在 drop-in 中，避免被发行版单元替换。root 更新回执时保留既有属主，
+新回执沿用所在目录的属主；历史 root 独占回执需由部署者单独核对和修正。
+
 Docker 默认执行 `gateway`；AppRuntime 拥有 Web Shell、readiness 和关闭顺序，
 Docker init 负责回收子进程，systemd 负责服务生命周期。原生直接运行模式仍使用 Supervisor。
 首次启用需由部署者用既有安装流程启动支持 [0091](../decisions/0091-shell-self-deployment.md)

@@ -15,7 +15,6 @@ from scripts.akashic_release.doctor import verify_release
 from scripts.akashic_release.extra import ExtraOptions
 from scripts.akashic_release.manifest import read_json, release_lock
 from scripts.akashic_release.migrate import migration_plan
-from scripts.akashic_release.model import ReleasePaths
 from scripts.akashic_release.prepare import (
     prepare_generation,
     verify_host_prerequisites,
@@ -23,11 +22,9 @@ from scripts.akashic_release.prepare import (
 from scripts.akashic_release.source import DEFAULT_ORIGIN, commit_subject, resolve_target
 from scripts.akashic_release.source import verify_bootstrap_checkout
 from scripts.akashic_release.warm import StateCacheWarmer
+from scripts.akashic_release.configuration import release_paths, resolve_arguments
 
 _DEFAULT_ORIGIN = DEFAULT_ORIGIN
-_DEFAULT_ROOT = Path("/srv/data/services/akashic")
-_DEFAULT_ENV = Path.home() / ".config/akashic-container/runtime.env"
-_DEFAULT_MISE = Path.home() / ".local/bin/mise"
 
 
 _run = subprocess.run
@@ -48,7 +45,7 @@ def _confirm(commit: str, subject: str, current: str | None, *, yes: bool) -> No
 
 
 def install(args: argparse.Namespace, *, self_deploy: dict[str, object] | None = None) -> dict[str, object]:
-    paths = ReleasePaths(args.root.resolve())
+    paths = release_paths(args.root, args.runtime_env)
     checkout = args.source_checkout.resolve(strict=True)
     commit = resolve_target(args.origin, args.commit, run=_run)
     verify_bootstrap_checkout(checkout, commit, args.origin, run=_run)
@@ -123,8 +120,15 @@ def doctor(args: argparse.Namespace) -> dict[str, object]:
     return {"status": "healthy", "runtimeEnv": str(args.runtime_env)}
 
 
+def show_paths(args: argparse.Namespace) -> dict[str, object]:
+    paths = release_paths(args.root, args.runtime_env)
+    return {"root": str(paths.root), "state": str(paths.state),
+            "runtimeEnv": str(args.runtime_env), "mise": str(args.mise),
+            "workspace": str(paths.state / "workspace")}
+
+
 def resume(args: argparse.Namespace) -> dict[str, object]:
-    paths = ReleasePaths(args.root.resolve(strict=True))
+    paths = release_paths(args.root.resolve(strict=True), args.runtime_env)
     with release_lock(paths.run / "release.lock"):
         status = resume_release(paths=paths, attempt_path=args.attempt,
                                 environment_file=args.runtime_env, mise=args.mise, run=_run,
@@ -141,7 +145,7 @@ def preset_diff(args: argparse.Namespace) -> dict[str, object]:
 
     checkout = Path(read_environment(args.runtime_env)["AKASHIC_RUNTIME_CHECKOUT"])
     groups: dict[str, list[dict[str, object]]] = {"changed": [], "added": [], "same": []}
-    for item in preset_differences(ReleasePaths(args.root).state / "workspace", checkout):
+    for item in preset_differences(release_paths(args.root, args.runtime_env).state / "workspace", checkout):
         groups[item.kind].append({
             "plugin": item.plugin, "fields": list(item.fields),
             "preset": None if item.preset is None else {"disabled": item.preset.disabled, "config": dict(item.preset.config)},
@@ -156,7 +160,7 @@ def preset_diff(args: argparse.Namespace) -> dict[str, object]:
 def restore_state(args: argparse.Namespace) -> dict[str, object]:
     from scripts.akashic_release.activate import restore_state as restore
 
-    paths = ReleasePaths(args.root.resolve(strict=True))
+    paths = release_paths(args.root.resolve(strict=True), args.runtime_env)
     with release_lock(paths.run / "release.lock"):
         restore(paths=paths, attempt_path=args.attempt)
     return {"status": "restored", "attempt": str(args.attempt)}
@@ -166,13 +170,19 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="akashic-release")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    paths_parser = subparsers.add_parser("paths", help="只读显示当前实例发布路径，不输出凭据")
+    paths_parser.add_argument("--root", type=Path)
+    paths_parser.add_argument("--runtime-env", type=Path)
+    paths_parser.add_argument("--mise", type=Path)
+    paths_parser.set_defaults(handler=show_paths)
+
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("--source-checkout", type=Path, required=True)
     install_parser.add_argument("--commit")
     install_parser.add_argument("--origin", default=_DEFAULT_ORIGIN)
-    install_parser.add_argument("--root", type=Path, default=_DEFAULT_ROOT)
-    install_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
-    install_parser.add_argument("--mise", type=Path, default=_DEFAULT_MISE)
+    install_parser.add_argument("--root", type=Path, default=None)
+    install_parser.add_argument("--runtime-env", type=Path, default=None)
+    install_parser.add_argument("--mise", type=Path, default=None)
     install_parser.add_argument(
         "--unit-root", type=Path, default=Path("/etc/systemd/system")
     )
@@ -196,20 +206,21 @@ def _parser() -> argparse.ArgumentParser:
     install_parser.set_defaults(handler=install)
 
     doctor_parser = subparsers.add_parser("doctor")
-    doctor_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
+    doctor_parser.add_argument("--runtime-env", type=Path, default=None)
     doctor_parser.set_defaults(handler=doctor)
 
     resume_parser = subparsers.add_parser("resume", help="只重试已发布版本的启动和验收")
-    resume_parser.add_argument("--root", type=Path, default=_DEFAULT_ROOT)
-    resume_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
-    resume_parser.add_argument("--mise", type=Path, default=_DEFAULT_MISE)
+    resume_parser.add_argument("--root", type=Path, default=None)
+    resume_parser.add_argument("--runtime-env", type=Path, default=None)
+    resume_parser.add_argument("--mise", type=Path, default=None)
     resume_parser.add_argument("--attempt", type=Path, required=True)
     resume_parser.add_argument("--unit-root", type=Path, default=Path("/etc/systemd/system"))
     resume_parser.add_argument("--cli-path", type=Path, default=Path.home() / ".local/bin/akashic-release")
     resume_parser.set_defaults(handler=resume)
 
     restore_parser = subparsers.add_parser("restore-state", help="按部署回执里的恢复点还原选择、patch 与插件 cache 指针（先停服务）")
-    restore_parser.add_argument("--root", type=Path, default=_DEFAULT_ROOT)
+    restore_parser.add_argument("--root", type=Path, default=None)
+    restore_parser.add_argument("--runtime-env", type=Path, default=None)
     restore_parser.add_argument("--attempt", type=Path, required=True, help="部署回执（deploy-*.json），含恢复点与发布结果")
     restore_parser.set_defaults(handler=restore_state)
 
@@ -221,20 +232,21 @@ def _parser() -> argparse.ArgumentParser:
     from scripts.akashic_release.self_deploy import submit, status, worker
     submit_parser = subparsers.add_parser("submit", help="在本次 Shell 回合正常结束并送达后部署")
     submit_parser.add_argument("--commit", required=True)
-    submit_parser.add_argument("--root", type=Path, default=_DEFAULT_ROOT)
-    submit_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
-    submit_parser.add_argument("--mise", type=Path, default=_DEFAULT_MISE)
+    submit_parser.add_argument("--root", type=Path, default=None)
+    submit_parser.add_argument("--runtime-env", type=Path, default=None)
+    submit_parser.add_argument("--mise", type=Path, default=None)
     submit_parser.add_argument("--timeout", type=int, default=600)
     submit_parser.add_argument("--backup", action="store_true")
     submit_parser.add_argument("--session", help="部署失败时注入并唤醒的会话；默认是发起调用的会话")
     submit_parser.set_defaults(handler=submit)
     diff_parser = subparsers.add_parser("preset-diff", help="只读：列出本实例相对 preset 的启停与配置覆盖")
-    diff_parser.add_argument("--root", type=Path, default=_DEFAULT_ROOT)
-    diff_parser.add_argument("--runtime-env", type=Path, default=_DEFAULT_ENV)
+    diff_parser.add_argument("--root", type=Path, default=None)
+    diff_parser.add_argument("--runtime-env", type=Path, default=None)
     diff_parser.set_defaults(handler=preset_diff)
     status_parser = subparsers.add_parser("status", help="查询宿主部署任务，不启动模型回合")
     status_parser.add_argument("request_id")
-    status_parser.add_argument("--root", type=Path, default=_DEFAULT_ROOT)
+    status_parser.add_argument("--root", type=Path, default=None)
+    status_parser.add_argument("--runtime-env", type=Path, default=None)
     status_parser.set_defaults(handler=status)
     worker_parser = subparsers.add_parser("self-deploy-worker", help=argparse.SUPPRESS)
     worker_parser.add_argument("--request", type=Path, required=True)
@@ -246,6 +258,7 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = _parser()
     args = parser.parse_args()
+    resolve_arguments(args)
     # 与 start 同一条规则：离线输入已经决定了要装的包，不能再给 --profile/--groups。
     if getattr(args, "extra_inputs", None) and (getattr(args, "profile", None) or getattr(args, "groups", "")):
         parser.error("--extra-inputs 是预先下载好的输入目录，已经决定了要装的包，不能同时给 --profile/--groups")
