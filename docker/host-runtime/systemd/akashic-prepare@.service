@@ -1,0 +1,20 @@
+[Unit]
+Description=Prepare the verified Akashic release %i
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=exec
+ExecStart=/opt/akashic-publisher/current/python/bin/python -I -B /opt/akashic-publisher/current/source/scripts/akashic_release/authority.py prepare-worker %i
+WorkingDirectory=/
+Environment=PATH=/usr/bin:/bin HOME=/var/lib/akashic-publisher
+EnvironmentFile=-/etc/akashic-publisher/promotion-network.env
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/akashic-publisher
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RuntimeMaxSec=55min

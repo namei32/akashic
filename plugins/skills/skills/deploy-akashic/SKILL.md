@@ -8,6 +8,19 @@ description: 用户明确授权 Akashic 合并 PR 并更新当前 Docker 实例�
 本回合负责检查、合并和提交。宿主负责等待回复送达、停止、迁移与启动。
 成功接单不等于更新成功；提交之后不再操作，让本回合正常结束。
 
+独立发布器若支持 `prepare-pr`，普通应用 PR 优先使用这个入口。它通过宿主的专用 GitHub 身份
+核验、合并和准备制品，聊天 Shell 不需要 GitHub 写入凭据。只处理用户本次明确授权的 PR。
+
+1. 从 GitHub PR 或 `git ls-remote https://github.com/namei32/akashic.git refs/pull/<编号>/head`
+   确定完整 head。若同一任务包含多个获授权 PR，按依赖顺序准备，最后只发布最终目标。
+2. 运行 `akashic-release prepare-pr --pr <编号> --head <完整SHA> --wait`。
+   如果工具提前返回句柄，等待同一个命令；也可用 `akashic-release preparation-status <编号>` 查询。
+   只有返回 `status: prepared` 时才使用它的 `commit` 字段。失败时汇报原回执。
+3. 单独执行 `akashic-release submit --commit <返回的commit> --no-extra`。接单后正常最终回复并结束，
+   按下方规则核对部署回执。制品准备成功和部署成功是两个状态。
+
+若宿主没有配置该入口，沿用下面的手工准备流程。
+
 ```text
 ┌────────────── Agent 当前回合 ──────────────┐
 │ 检查 → 合并 → 固定 SHA → Shell submit → 最终回复 │
