@@ -103,10 +103,13 @@ def _stage_runtime(values: dict[str, str], uid: int, gid: int, controller_image:
     _install_text(CONFIG / "services.yaml", (INSTALL / "source/docker/host-runtime/compose.external-services.yaml").read_text())
     _install_text(CONFIG / "local.yaml", "services:\n  akashic-core:\n    environment:\n      OPENCODE_GO_API_KEY: !reset null\n")
     unit_source = INSTALL / "source/docker/host-runtime/systemd"
-    for unit in ("akashic-publisher.socket", "akashic-publisher@.service", "akashic-publish@.service"):
+    for unit in ("akashic-publisher.socket", "akashic-publisher@.service", "akashic-publish@.service",
+                 "akashic-publisher-mounts.service"):
         text = (unit_source / unit).read_text().replace("SocketGroup=huashen", f"SocketGroup={gid}")
         _install_text(SYSTEMD / unit, text)
     core_unit = (unit_source / "akashic-core.service").read_text()
+    core_unit = core_unit.replace("[Unit]", "[Unit]\nRequires=akashic-publisher-mounts.service\n"
+                                 "After=akashic-publisher-mounts.service")
     core_lines = []
     for line in core_unit.splitlines():
         if line.startswith(("User=", "Group=", "SupplementaryGroups=", "ExecStartPre=")):
@@ -119,6 +122,9 @@ def _stage_runtime(values: dict[str, str], uid: int, gid: int, controller_image:
         core_lines.append(line)
     _install_text(CONFIG / "akashic-core.service", "\n".join(core_lines) + "\n")
     bridge_unit = (unit_source / "akashic-host-bridge.service").read_text()
+    bridge_unit = bridge_unit.replace("[Unit]", "[Unit]\nRequires=akashic-publisher-mounts.service\n"
+                                     "After=akashic-publisher-mounts.service akashic-publisher.socket\n"
+                                     "Wants=akashic-publisher.socket")
     launch = f"{INSTALL}/python/bin/python -I -B {INSTALL}/source/scripts/akashic_release/sandbox.py"
     bridge_unit = bridge_unit.replace("[Service]", "[Service]\nNoNewPrivileges=yes\nUnsetEnvironment=OPENCODE_GO_API_KEY")
     bridge_unit = bridge_unit.replace("User=huashen", f"User={uid}").replace("Group=huashen", f"Group={gid}")
