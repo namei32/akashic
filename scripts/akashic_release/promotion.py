@@ -107,6 +107,8 @@ class GitHub:
 
 
 def _config() -> dict[str, Any]:
+    if not _CONFIG.is_file():
+        raise RuntimeError("宿主尚未安装本仓库的自动发布 GitHub App")
     configuration = read_json(protected(_CONFIG))
     if not re.fullmatch(r"[0-9a-f]{64}", configuration["workflow_sha256"]):
         raise ValueError("管理员必须固定构建工作流的内容摘要")
@@ -225,8 +227,19 @@ def request(policy: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
     with release_lock(root / "submit.lock"):
         if path.exists():
             return read_json(protected(path))
-        if any(read_json(protected(p))["status"] in {"queued", "running"} for p in root.glob("*.json")):
-            raise RuntimeError("已有发布准备任务")
+        for p in root.glob("*.json"):
+            prior = read_json(protected(p))
+            if prior["status"] not in {"queued", "running"}:
+                continue
+            result = subprocess.run(
+                ["/usr/bin/systemctl", "show", f"akashic-prepare@{p.stem}.service", "-p", "ActiveState", "--value"],
+                check=True, capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            if result in {"active", "activating", "reloading", "deactivating"}:
+                raise RuntimeError("已有发布准备任务")
+            if result not in {"inactive", "failed"}:
+                raise RuntimeError("无法确认原准备任务是否停止")
+            write_json(p, {**prior, "status": "failed", "phase": "interrupted", "error": "宿主准备任务已中断"})
         record = {"id": identity, "number": number, "head": head, "status": "queued"}
         write_json(path, record)
         try:

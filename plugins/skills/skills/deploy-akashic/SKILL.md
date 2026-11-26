@@ -14,7 +14,8 @@ description: 用户明确授权 Akashic 合并 PR 并更新当前 Docker 实例�
 1. 从 GitHub PR 或 `git ls-remote https://github.com/namei32/akashic.git refs/pull/<编号>/head`
    确定完整 head。若同一任务包含多个获授权 PR，按依赖顺序准备，最后只发布最终目标。
 2. 运行 `akashic-release prepare-pr --pr <编号> --head <完整SHA> --wait`。
-   如果工具提前返回句柄，等待同一个命令；也可用 `akashic-release preparation-status <编号>` 查询。
+   Shell 可设 `run_in_background=true`，让后台工作完成后在对话中通知。收到完成通知后继续第 3 步，
+   不需要用户再次输入。也可用 `akashic-release preparation-status <任务编号>` 查询原任务。
    只有返回 `status: prepared` 时才使用它的 `commit` 字段。失败时汇报原回执。
 3. 单独执行 `akashic-release submit --commit <返回的commit> --no-extra`。接单后正常最终回复并结束，
    按下方规则核对部署回执。制品准备成功和部署成功是两个状态。

@@ -284,6 +284,8 @@ def prepare_pull_request(args: argparse.Namespace) -> dict[str, object]:
         while result["status"] in ("queued", "running") and time.monotonic() < deadline:
             time.sleep(10)
             result = _publisher(args, {"action": "preparation-status", "id": result["id"]})
+        if result["status"] != "prepared":
+            raise RuntimeError(f"准备任务 {result['id']}: {result.get('error', '仍在处理中，请查询原任务')}")
     return result
 
 
