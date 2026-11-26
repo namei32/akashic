@@ -19,6 +19,8 @@ _UNIT_STAGING_ROOT = Path("/tmp")
 
 
 def _service_command(action: str, *arguments: str) -> list[str]:
+    if os.geteuid() == 0:
+        return ["/usr/bin/systemctl", *arguments]
     helper = os.environ.get("AKASHIC_DEPLOY_WORKER_HELPER")
     request = os.environ.get("AKASHIC_DEPLOY_REQUEST")
     if helper and request:
@@ -58,6 +60,11 @@ def install_units(
     runtime_env: Path | None = None,
 ) -> bool:
     """安装发生变化的单元；备份由部署者选择。"""
+
+    from scripts.akashic_release.publisher_mode import policy
+    if policy():
+        # 管理员预装固定控制面单元；应用制品不能更新系统命令或 Compose。
+        return False
 
     changed, rendered_units = _unit_changes(checkout=checkout, unit_root=unit_root, runtime_env=runtime_env)
     # 2. 预检必须在写任何单元之前完成：环境文件缺失是启动期故障，不是安装期发现。

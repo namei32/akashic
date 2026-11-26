@@ -21,6 +21,7 @@ from scripts.akashic_release.systemd import install_units, install_operator_entr
 from scripts.akashic_release.systemd import start_bridge, start_core, stop_runtime
 from scripts.akashic_release.warm import StateCacheWarmer
 from utils.timing import measure
+from scripts.akashic_release.publisher_mode import policy as publisher_policy, state_action
 
 Run = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -173,7 +174,8 @@ def release_environment(
     values.update(
         {
             "AKASHIC_BRIDGE_PYTHON": str(bridge_python),
-            "AKASHIC_HOST_PYTHON_PREFIX": str(_base_python_prefix(bridge_python)),
+            "AKASHIC_HOST_PYTHON_PREFIX": (current["AKASHIC_HOST_PYTHON_PREFIX"] if publisher_policy()
+                                            else str(_base_python_prefix(bridge_python))),
             "AKASHIC_MISE": str(mise),
             "AKASHIC_RUNTIME_CHECKOUT": str(paths.source(commit)),
             "AKASHIC_RUNTIME_COMMIT": commit,
@@ -181,7 +183,7 @@ def release_environment(
             "AKASHIC_HOST_TOOLCHAIN_DIGEST": str(host_identity["toolchainDigest"]),
             "AKASHIC_RELEASE_MANIFEST": str(paths.release(commit)),
             "AKASHIC_IMAGE": str(manifest["imageId"]),
-            "AKASHIC_HOST_BRIDGE_SOCKET": str(paths.run / "host-bridge.sock"),
+            "AKASHIC_HOST_BRIDGE_SOCKET": str(paths.run / ("bridge/host-bridge.sock" if publisher_policy() else "host-bridge.sock")),
             "AKASHIC_HOST_BRIDGE_TOKEN_FILE": str(paths.secrets / "host-bridge.token"),
             "AKASHIC_HOST_BRIDGE_TOKEN": token,
             "AKASHIC_HOST_BRIDGE_DIR": str(paths.run),
@@ -283,6 +285,9 @@ def _publish(
         owner = workspace.stat()
         for name in ("plugin-python-environments", "plugin-resources"):
             cache = workspace / "runtime" / name
+            if publisher_policy():
+                command += ["--mount", f"type=bind,src={cache},dst={cache}"]
+                continue
             current = paths.state
             for part in cache.relative_to(paths.state).parts:
                 current /= part
@@ -380,9 +385,12 @@ def _start_and_record(
     backup_root = paths.backups if attempt["backupDir"] is not None else None
     install_units(checkout=checkout, backup_root=backup_root, run=run,
                   unit_root=unit_root, runtime_env=environment_file)
-    install_operator_entrypoint(checkout=checkout, backup_root=backup_root, target=cli_path)
-    _prepare_workload_dirs(paths)
-    atomic_write(environment_file, render_environment(candidate))
+    if publisher_policy():
+        state_action("directories", {"state": str(paths.state)})
+    else:
+        install_operator_entrypoint(checkout=checkout, backup_root=backup_root, target=cli_path)
+        _prepare_workload_dirs(paths)
+    atomic_write(environment_file, render_environment(candidate), mode=0o640 if publisher_policy() else 0o600)
     with measure("release.start"):
         start_bridge(run=run)
         start_core(run=run)
@@ -490,7 +498,10 @@ def activate_release(
     else:
         # 首次激活已提交 Root 但上次没走到收尾：补写网页挑选标记并丢掉首装意图（没有意图时什么都不做）。
         from scripts.first_install import finish_first_install
-        finish_first_install(paths.state, paths.state / "workspace")
+        if publisher_policy():
+            state_action("finish", {"state": str(paths.state)})
+        else:
+            finish_first_install(paths.state, paths.state / "workspace")
         if plan is not None and (plan.is_symlink() or not plan.is_file()):
             raise ValueError("部署清单必须是普通文件")
         # 停机之前联网求 extra 包；任何一步失败都在这里抛错，旧服务不动。
@@ -577,7 +588,10 @@ def activate_release(
             selection_snapshot = stopped_selection
             # 恢复点落盘：选择、patch、清单涉及插件的 cache 指针；进程崩溃后可用 restore-state 还原。
             snapshot_path = attempt_path.with_suffix(".snapshot.json")
-            capture(paths, [str(item["plugin_id"]) for item in read_json(fixed_plan)["targets"]], snapshot_path)
+            if publisher_policy():
+                write_json(snapshot_path, state_action("capture", {"state": str(paths.state)}))
+            else:
+                capture(paths, [str(item["plugin_id"]) for item in read_json(fixed_plan)["targets"]], snapshot_path)
             attempt["snapshotPath"] = str(snapshot_path)
         attempt["phase"] = "publishing"
         write_json(attempt_path, attempt)
@@ -670,16 +684,20 @@ def _roll_back(
     # 1. 候选可能已部分启动；先停下，再把选择文件改回停机前的原文。
     stop_runtime(run=run)
     published = publication.get("new_root_ref") if isinstance(publication, dict) else None
-    if snapshot is not None:
-        _restore_selection(paths.state / "workspace/runtime/plugin-stable.json", snapshot, published, publishing)
-    # 选择先还原，再还原 patch 与 cache 指针，避免选择引用已被删除的 artifact。
-    if snapshot_path is not None:
-        restore_plugin_state(snapshot_path)
+    if publisher_policy():
+        state_action("restore", {"state": str(paths.state), "selection": snapshot, "published": published,
+                                 "publishing": publishing, "snapshot": read_json(snapshot_path) if snapshot_path else None})
+    else:
+        if snapshot is not None:
+            _restore_selection(paths.state / "workspace/runtime/plugin-stable.json", snapshot, published, publishing)
+        if snapshot_path is not None:
+            restore_plugin_state(snapshot_path)
     # 2. 恢复原单元、CLI 与 runtime.env，再按原版本启动并核对健康。
     checkout = paths.source(previous["AKASHIC_RUNTIME_COMMIT"])
     install_units(checkout=checkout, backup_root=None, run=run, unit_root=unit_root, runtime_env=environment_file)
-    install_operator_entrypoint(checkout=checkout, backup_root=None, target=cli_path)
-    atomic_write(environment_file, render_environment(previous))
+    if not publisher_policy():
+        install_operator_entrypoint(checkout=checkout, backup_root=None, target=cli_path)
+    atomic_write(environment_file, render_environment(previous), mode=0o640 if publisher_policy() else 0o600)
     with measure("release.rollback"):
         start_bridge(run=run)
         _start_core_after_limit(run=run)
