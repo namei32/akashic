@@ -218,7 +218,7 @@ class Jobs:
         socket = os.environ.get("AKASHIC_HOST_BRIDGE_SOCKET")
         if not socket:
             return
-        directory = Path(socket).parent / "self-deploy"
+        directory = Path(os.environ.get("AKASHIC_DEPLOY_STATUS_DIR", str(Path(socket).parent / "self-deploy")))
         errors: dict[Path, str] = {}
         while True:
             for path in await run_file_io(lambda: tuple(sorted(directory.glob("*.json")))):

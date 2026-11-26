@@ -1,0 +1,19 @@
+[Unit]
+Description=Akashic approved release %i
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=exec
+ExecStart=/opt/akashic-publisher/current/python/bin/python -I -B /opt/akashic-publisher/current/source/scripts/akashic_release/authority.py worker %i
+WorkingDirectory=/
+Environment=PATH=/usr/bin:/bin HOME=/var/lib/akashic-publisher
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+TimeoutStartSec=infinity
+TimeoutStopSec=180
+KillMode=control-group
