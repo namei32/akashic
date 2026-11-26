@@ -89,10 +89,10 @@ def verify_release(environment_file: Path) -> None:
     from scripts.akashic_release.publisher_mode import policy
     if policy():
         # Bridge 在其受限服务中核对宿主工具链；高权限进程不运行目标 Python 或 mise。
+        wait_for_core_health(environment["AKASHIC_CONTAINER_NAME"], release_health_timeout(environment))
         inspected = asyncio.run(_inspect_bridge(environment))
         if inspected.get("releaseCommit") != environment["AKASHIC_RUNTIME_COMMIT"]:
             raise RuntimeError("Host Bridge 版本未切换")
-        wait_for_core_health(environment["AKASHIC_CONTAINER_NAME"], release_health_timeout(environment))
         return
     verify_host_toolchain_deployment(
         manifest,

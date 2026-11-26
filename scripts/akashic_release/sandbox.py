@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import signal
+import subprocess
 import sys
 
 
@@ -35,7 +37,11 @@ def main() -> None:
     arguments += ["--setenv", "HOME", profile["home"], "--unsetenv", "WSL_INTEROP", "--unsetenv", "WSLENV",
                   "--unsetenv", "DBUS_SESSION_BUS_ADDRESS", "--unsetenv", "SSH_AUTH_SOCK",
                   "--chdir", profile["home"], "--", *sys.argv[1:]]
-    os.execv(arguments[0], arguments)
+    # systemd signals the whole cgroup. The Bridge handles TERM and releases its
+    # leases. Keep the launcher and bwrap alive to propagate its real exit code.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    result = subprocess.run(arguments, check=False)
+    raise SystemExit(result.returncode if result.returncode >= 0 else 128 - result.returncode)
 
 
 if __name__ == "__main__":
