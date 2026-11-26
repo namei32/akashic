@@ -182,6 +182,40 @@ def _artifact(github: GitHub, commit: str, configuration: dict[str, Any]) -> dic
     raise TimeoutError("等待构建和合并后 CI 超时")
 
 
+def _load_image(package: Path, release: dict[str, Any], commit: str) -> None:
+    """Classic Docker reports the config digest; containerd may report the index."""
+    tag = f"akashic-core:{commit[:12]}"
+    with tarfile.open(package) as saved:
+        def metadata(name: str) -> bytes:
+            entry = saved.getmember(name)
+            stream = saved.extractfile(entry)
+            if not entry.isfile() or entry.size > 2 * 1024 ** 2 or stream is None:
+                raise ValueError("镜像归档元数据无效")
+            return stream.read()
+
+        descriptions = json.loads(metadata("manifest.json"))
+        if len(descriptions) != 1 or descriptions[0]["RepoTags"] != [tag]:
+            raise ValueError("镜像归档不属于固定提交标签")
+        config_name = descriptions[0]["Config"]
+        if not re.fullmatch(r"(?:blobs/sha256/[0-9a-f]{64}|[0-9a-f]{64}\.json)", config_name):
+            raise ValueError("镜像配置路径无效")
+        config_bytes = metadata(config_name)
+    configuration = json.loads(config_bytes)
+    config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+    subprocess.run(["/usr/bin/docker", "load", "--input", str(package)], check=True, timeout=300)
+    [local] = json.loads(subprocess.check_output(["/usr/bin/docker", "image", "inspect", tag], timeout=30))
+    if release["imageId"] not in (config_digest, local["Id"]):
+        raise ValueError("镜像归档不匹配已核验制品的镜像摘要")
+    if (local["RootFS"]["Layers"] != configuration["rootfs"]["diff_ids"]
+            or local["Config"]["Labels"] != configuration["config"]["Labels"]
+            or any(local["Config"].get(key) != configuration["config"].get(key)
+                   for key in ("Entrypoint", "Cmd", "Env", "User", "WorkingDir"))):
+        raise ValueError("本机镜像配置或文件层不匹配已核验归档")
+    if release["imageId"] != local["Id"]:
+        release["buildImageId"] = release["imageId"]
+        release["imageId"] = local["Id"]
+
+
 def _import(github: GitHub, artifact: dict[str, Any], root: Path, commit: str) -> None:
     with tempfile.TemporaryDirectory(dir=root) as temporary:
         stage = Path(temporary)
@@ -204,11 +238,12 @@ def _import(github: GitHub, artifact: dict[str, Any], root: Path, commit: str) -
                 if not allowed or ".." in path.parts or not (entry.isfile() or entry.isdir()) or total > _MAX_BYTES:
                     raise ValueError("Bridge 制品含未批准的归档条目")
                 archive.extract(entry, stage, filter="data")
-        release = read_json(stage / "releases" / f"{commit}.json")
+        manifest = stage / "releases" / f"{commit}.json"
+        release = read_json(manifest)
         if release.get("sourceCommit") != commit:
             raise ValueError("制品提交不符")
-        subprocess.run(["/usr/bin/docker", "load", "--input", str(stage / "core.tar.gz")],
-                       check=True, timeout=300)
+        _load_image(stage / "core.tar.gz", release, commit)
+        write_json(manifest, release)
         subprocess.run([sys.executable, "-I", "-B", str(Path(__file__).with_name("approve.py")),
                         "--commit", commit, "--prepared-root", str(stage)], check=True, timeout=180)
 
