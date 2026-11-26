@@ -33,6 +33,7 @@ from plugins.host_execution.contract import (
     WorkloadMode,
     WorkloadStartRequest,
 )
+from plugins.host_execution.workload_policy import WorkloadPolicy
 
 _SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$")
 _NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -277,8 +278,10 @@ class WorkloadControllerServer:
         owner_grace_seconds: float = 10.0,
         owner_poll_seconds: float = 2.0,
         host_egress_dir: Path | None = None,
+        policy_path: Path | None = None,
     ) -> None:
         self._workspace = workspace.resolve(strict=True)
+        self._policy = None if policy_path is None else WorkloadPolicy(policy_path)
         self._host_egress_dir = host_egress_dir
         self._socket_path = socket_path
         self._engine = DockerEngine(docker_socket)
@@ -612,6 +615,8 @@ class WorkloadControllerServer:
     async def _ensure_image(self, image: str) -> dict[str, object]:
         if not _IMAGE.fullmatch(image):
             raise ValueError("镜像必须使用 sha256 digest 固定")
+        if self._policy is not None:
+            self._policy.image(image)
         if self._image_active is not None:
             raise RuntimeError(f"正在拉取 {self._image_active}，稍后再试")
         if self._image_survivor is not None and self._image_survivor.alive():
@@ -849,7 +854,7 @@ class WorkloadControllerServer:
             "com.akashic.generation": request.generation_id,
             "com.akashic.spec": request.spec_digest,
         }
-        memory, cpu, pids = request.limits
+        memory, cpu, pids = self._policy.limits(request) if self._policy is not None else request.limits
         docker_pids = None if pids == 0 else pids
         body: dict[str, object] = {
             "Image": request.image,
@@ -1015,6 +1020,8 @@ class WorkloadControllerServer:
         self,
         request: WorkloadStartRequest,
     ) -> tuple[tuple[str, str, bool], ...]:
+        if self._policy is not None:
+            return self._policy.mounts(request)
         data_root = _plugin_data_root(self._workspace, request)
         result: list[tuple[str, str, bool]] = []
         for name, target, writable in request.data:
@@ -1033,6 +1040,8 @@ class WorkloadControllerServer:
         return tuple(result)
 
     def _check_request(self, request: WorkloadStartRequest) -> None:
+        if self._policy is not None:
+            self._policy.limits(request)
         if request.workspace_id != self._workspace_id:
             raise ValueError("Workload workspace identity 不匹配")
         _safe_segment(request.plugin_id, "plugin_id")
@@ -1135,7 +1144,7 @@ class WorkloadControllerServer:
             and labels.get("com.akashic.transaction") != request.transaction_id
         ):
             raise RuntimeError("candidate Workload transaction 不一致")
-        memory, cpu, pids = request.limits
+        memory, cpu, pids = self._policy.limits(request) if self._policy is not None else request.limits
         docker_pids = None if pids == 0 else pids
         config = _object(detail, "Config")
         host = _object(detail, "HostConfig")
@@ -1657,6 +1666,7 @@ async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path
     parser.add_argument("--owner-grace-seconds", type=float, default=10.0)
     parser.add_argument("--owner-poll-seconds", type=float, default=2.0)
     parser.add_argument("--host-egress-dir", type=Path)
+    parser.add_argument("--policy", type=Path, help="管理员只读工作负载政策")
     args = parser.parse_args(arguments)
     server = WorkloadControllerServer(
         workspace=args.workspace,
@@ -1673,6 +1683,7 @@ async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path
         owner_grace_seconds=args.owner_grace_seconds,
         owner_poll_seconds=args.owner_poll_seconds,
         host_egress_dir=args.host_egress_dir,
+        policy_path=args.policy,
     )
     await _serve_until_signal(server)
     return 0

@@ -220,6 +220,13 @@ def release_environment(
         if not inherited:
             raise RuntimeError("首次安装必须通过环境提供 OPENCODE_GO_API_KEY")
         values["OPENCODE_GO_API_KEY"] = inherited
+    if configured := publisher_policy():
+        values.update(AKASHIC_PUBLISHER_SOCKET="/run/akashic-publisher/control.sock",
+                      AKASHIC_DEPLOY_STATUS_DIR=str(paths.run / "self-deploy"),
+                      AKASHIC_CONTROLLER_STATE_ROOT=configured["controller_state"],
+                      GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.directory",
+                      GIT_CONFIG_VALUE_0=str(paths.source(commit)))
+        values.pop("AKASHIC_DEPLOY_WORKER_HELPER", None)
     return values
 
 
@@ -683,6 +690,8 @@ def _roll_back(
 ) -> None:
     # 1. 候选可能已部分启动；先停下，再把选择文件改回停机前的原文。
     stop_runtime(run=run)
+    if configured := publisher_policy():
+        previous = {**previous, "AKASHIC_CONTROLLER_STATE_ROOT": configured["controller_state"]}
     published = publication.get("new_root_ref") if isinstance(publication, dict) else None
     if publisher_policy():
         state_action("restore", {"state": str(paths.state), "selection": snapshot, "published": published,

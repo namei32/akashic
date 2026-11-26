@@ -245,8 +245,7 @@ def verify_closed(ack: dict[str, object], current: dict[str, str]) -> str:
     if root != ack["rootIdentity"]:
         raise RuntimeError("旧 Core 关闭回执与排空的 Root 不符")
     controller = read_json(
-        Path(current["AKASHIC_EXPERIMENT_ROOT"])
-        / "workload-controller"
+        Path(current.get("AKASHIC_CONTROLLER_STATE_ROOT", str(Path(current["AKASHIC_EXPERIMENT_ROOT"]) / "workload-controller")))
         / "closed"
         / f"{ack['controllerId']}.json"
     )
