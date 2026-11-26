@@ -14,12 +14,23 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 
 def protected(path: Path) -> Path:
     """Reject writable ancestors as well as symlinks, including a writable home directory."""
-    if not path.is_absolute():
+    if not path.is_absolute() or ".." in path.parts:
         raise ValueError("发布路径必须为绝对路径")
     for item in (*reversed(path.parents), path):
         info = item.lstat()
         if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
             raise PermissionError(f"发布控制路径不受管理员保护: {item}")
+    return path
+
+
+def pinned_directory(path: Path) -> Path:
+    protected(path.parent)
+    if path.is_symlink() or not path.is_dir():
+        raise PermissionError("数据挂载点必须是固定的目录")
+    # Same-filesystem bind mounts are absent from os.path.ismount().
+    mounted = {line.split()[4] for line in Path("/proc/self/mountinfo").read_text().splitlines()}
+    if str(path) not in mounted or any(char.isspace() or char == "," for char in str(path)):
+        raise PermissionError("数据源必须先由管理员固定挂载")
     return path
 
 

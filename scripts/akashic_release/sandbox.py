@@ -19,8 +19,15 @@ def main() -> None:
     if not sys.argv[1:]:
         raise ValueError("缺少运行命令")
     arguments = ["/usr/bin/bwrap", "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-ipc",
-                 "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/run",
-                 "--tmpfs", "/tmp", "--tmpfs", "/mnt", "--tmpfs", "/home"]
+                 "--disable-userns", "--ro-bind", "/usr", "/usr", "--proc", "/proc", "--dev", "/dev",
+                 "--tmpfs", "/run", "--tmpfs", "/tmp"]
+    for name in ("bin", "sbin", "lib", "lib64"):
+        if Path("/" + name).is_symlink():
+            arguments += ["--symlink", "usr/" + name, "/" + name]
+    for name in ("passwd", "group", "hosts", "nsswitch.conf", "resolv.conf", "ssl", "localtime"):
+        source = Path("/etc") / name
+        if source.exists():
+            arguments += ["--ro-bind", str(source.resolve()), str(source)]
     for source, target in profile["readonly"]:
         arguments += ["--ro-bind", source, target]
     for source, target in profile["writable"]:

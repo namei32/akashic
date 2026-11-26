@@ -37,7 +37,7 @@ class _Stop(BaseModel):
 class _Request(BaseModel):
     stop: _Stop
     targetCommit: str = Field(pattern=r"^[0-9a-f]{40}$")
-    unit: str = Field(pattern=r"^akashic-deploy-[0-9a-f]{32}\.service$")
+    unit: str = Field(pattern=r"^akashic-(deploy-|publish@)[0-9a-f]{32}\.service$")
     notifySession: str | None = Field(default=None, min_length=1, max_length=512)
 
 
@@ -51,13 +51,16 @@ def failure_notice(record: Mapping[str, object]) -> HostNoticeParams:
     failure = _Failure.model_validate(record)
     request = failure.request
     identity = request.stop.request_id
-    if request.unit != f"akashic-deploy-{identity}.service":
+    protected = request.unit == f"akashic-publish@{identity}.service"
+    if not protected and request.unit != f"akashic-deploy-{identity}.service":
         raise ValueError("部署任务编号与 service 不一致")
+    hint = f"用 Shell 运行 `akashic-release status {identity}` 查明原因。"
+    if not protected:
+        hint += f"也可运行 `journalctl --user -u {request.unit} --no-pager -n 80`。"
     return HostNoticeParams(
         session_id=request.notifySession or request.stop.session_id, job_id=identity,
         kind="self-deploy", label=f"部署 {request.targetCommit[:12]}", status="failed", detail=failure.error[-7000:],
-        collect_hint=(f"用 Shell 运行 `akashic-release status {identity}` 和 "
-            f"`journalctl --user -u {request.unit} --no-pager -n 80` 查明原因。"
+        collect_hint=(hint +
             "仅在原授权范围内修复；送达失败、来源不支持或次数上限时等待用户新消息，不要换 SHA 重交。"
             "默认自部署通知来源没有最终送达 provider；修复后如实汇报，等用户新对话回合再提交。"
             "说明保留现场或回退失败时交给部署者处理。"))

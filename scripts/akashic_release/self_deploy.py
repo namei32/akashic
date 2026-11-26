@@ -72,6 +72,7 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
         from scripts.akashic_release.authority import exchange
         if args.backup:
             raise ValueError("受保护发布只激活已批准制品；备份和迁移由管理员单独执行")
+        exchange({"action": "eligible", "commit": args.commit}, authority)
         request = {"stop": stop.model_dump()}
         asyncio.run(_arm_stop(request, current))
         return exchange({"action": "submit", "commit": args.commit, "stop": stop.model_dump(),

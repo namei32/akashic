@@ -551,7 +551,7 @@ def activate_release(
     if self_deploy is not None:
         self_deploy["activationAttempt"] = str(attempt_path)
         self_deploy["phase"] = "waiting_for_turn"
-        write_json(Path(str(self_deploy["recordPath"])), self_deploy)
+        write_json(Path(str(self_deploy["recordPath"])), self_deploy, mode=0o640 if publisher_policy() else 0o600)
     # 预热有界等待放在关闭准入之前：旧服务等它时仍照常接纳工作。
     if warmer is not None:
         warmer.wait()
@@ -570,7 +570,7 @@ def activate_release(
         write_json(attempt_path, attempt)
         if self_deploy is not None:
             self_deploy["phase"] = "restarting"
-            write_json(Path(str(self_deploy["recordPath"])), self_deploy)
+            write_json(Path(str(self_deploy["recordPath"])), self_deploy, mode=0o640 if publisher_policy() else 0o600)
     except BaseException:
         if self_deploy is not None and stop_ack is not None:
             from scripts.akashic_release.self_deploy import cancel_stop

@@ -49,10 +49,11 @@ def atomic_write(path: Path, content: str, *, mode: int = 0o600) -> None:
             temporary.unlink()
 
 
-def write_json(path: Path, document: Mapping[str, object]) -> None:
+def write_json(path: Path, document: Mapping[str, object], *, mode: int = 0o600) -> None:
     atomic_write(
         path,
         json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        mode=mode,
     )
 
 

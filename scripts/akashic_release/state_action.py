@@ -35,6 +35,9 @@ def main() -> None:
         from scripts.first_install import finish_first_install
         state = Path(payload["state"])
         finish_first_install(state, state / "workspace")
+    elif action == "read-object":
+        from scripts.akashic_release.manifest import read_json
+        result = read_json(Path(payload["path"]))
     else:
         raise ValueError("未知的应用状态操作")
     print(json.dumps(result))
