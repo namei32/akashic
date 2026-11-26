@@ -141,6 +141,7 @@ def main() -> None:
     parser.add_argument("--python", type=Path, required=True, help="管理员构建的非 editable Python venv")
     parser.add_argument("--seed-env", type=Path, required=True, help="管理员审查的运行环境配置")
     parser.add_argument("--workloads", type=Path, required=True, help="管理员审查的工作负载授权")
+    parser.add_argument("--runtime-profile", type=Path, required=True, help="管理员审查的 Host Bridge 隔离配置")
     parser.add_argument("--controller-image", required=True)
     args = parser.parse_args()
     if os.geteuid() != 0 or not re.fullmatch(r"sha256:[0-9a-f]{64}", args.controller_image):
@@ -174,6 +175,10 @@ def main() -> None:
     mounts = _configure_bindings(state)
     _stage_runtime(values, uid, gid, args.controller_image)
     _install_text(CONFIG / "workloads.json", protected(args.workloads).read_text())
+    profile = json.loads(protected(args.runtime_profile).read_text())
+    if (profile["uid"], profile["gid"]) != (uid, gid):
+        raise ValueError("隔离配置与实例账号不符")
+    _install_text(CONFIG / "runtime.json", json.dumps(profile) + "\n")
     _install_text(POLICY, json.dumps({"version": 1, "runtime_uid": uid, "state": str(state),
                                     "root": str(ROOT), "runtime_env": str(ROOT / "runtime.env"),
                                     "publisher": str(INSTALL), "mounts": mounts,

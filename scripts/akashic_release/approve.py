@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.akashic_release.authority_policy import approval, protected, read_policy
+from scripts.akashic_release.doctor import read_environment
 from scripts.akashic_release.manifest import release_lock, write_json
 
 
@@ -82,6 +83,17 @@ def main() -> None:
         bridge = root / "bridge-venvs" / args.commit
         shutil.copytree((args.prepared_root / "bridge-venvs" / args.commit).resolve(strict=True), bridge,
                         symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
+        venv_config = bridge / "pyvenv.cfg"
+        prefix = Path(read_environment(Path(policy["runtime_env"]))["AKASHIC_HOST_PYTHON_PREFIX"])
+        protected(prefix)
+        config = venv_config.read_text()
+        old_base = next(line.partition(" = ")[2] for line in config.splitlines() if line.startswith("home = "))
+        old_prefix = str(Path(old_base).parent)
+        venv_config.write_text(config.replace(old_prefix + "/", str(prefix) + "/"))
+        for path in bridge.rglob("*"):
+            if path.is_symlink() and (link := os.readlink(path)).startswith(old_prefix + "/"):
+                path.unlink()
+                path.symlink_to(str(prefix) + link[len(old_prefix):])
         old_source = str(args.prepared_root / "runtime-sources" / args.commit)
         for path in bridge.rglob("*.pth"):
             if not path.is_symlink():
@@ -89,6 +101,9 @@ def main() -> None:
                 path.write_text(text.replace(old_source, str(source)))
         seal(source)
         seal(bridge)
+        for path in bridge.rglob("*"):
+            if path.is_symlink():
+                protected(path.resolve(strict=True))
         destination.write_bytes(manifest_bytes)
         destination.chmod(0o644)
         protected(destination)
