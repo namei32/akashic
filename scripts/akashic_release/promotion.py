@@ -128,8 +128,12 @@ def _merge(github: GitHub, number: int, head: str) -> str:
         raise ValueError("PR 的仓库、目标或固定 head 不符")
     if not 0 < pr["changed_files"] <= 300:
         raise ValueError("PR 文件数超出自动合并范围")
-    paths = [item for page in range(1, (pr["changed_files"] + 99) // 100 + 1)
-             for item in github.api(f"/pulls/{number}/files?per_page=100&page={page}")]
+    base = pr["base"]["sha"]
+    if not isinstance(base, str) or not _SHA.fullmatch(base):
+        raise ValueError("GitHub 未返回有效的 PR base")
+    comparison = github.api(f"/compare/{base}...{head}?per_page=1")
+    # File metadata is returned on the first compare page, for these two immutable objects.
+    paths = comparison["files"]
     if len(paths) != pr["changed_files"]:
         raise ValueError("无法核对完整 PR 文件清单")
     for row in paths:
