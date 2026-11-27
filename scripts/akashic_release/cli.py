@@ -4,7 +4,6 @@ import argparse
 import json
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 _SOURCE_ROOT = Path(__file__).resolve().parents[2]
@@ -12,7 +11,7 @@ if str(_SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(_SOURCE_ROOT))
 
 from scripts.akashic_release.activate import activate_release, resume_release
-from scripts.akashic_release.doctor import read_environment, verify_release
+from scripts.akashic_release.doctor import verify_release
 from scripts.akashic_release.extra import ExtraOptions
 from scripts.akashic_release.manifest import read_json, release_lock
 from scripts.akashic_release.migrate import migration_plan
@@ -177,17 +176,6 @@ def _parser() -> argparse.ArgumentParser:
     paths_parser.add_argument("--mise", type=Path)
     paths_parser.set_defaults(handler=show_paths)
 
-    prepare_parser = subparsers.add_parser("prepare-pr", help="宿主核验、合并并准备已批准制品")
-    prepare_parser.add_argument("--pr", required=True, type=int)
-    prepare_parser.add_argument("--head", required=True)
-    prepare_parser.add_argument("--runtime-env", type=Path)
-    prepare_parser.add_argument("--wait", action="store_true")
-    prepare_parser.set_defaults(handler=prepare_pull_request)
-    preparation_status = subparsers.add_parser("preparation-status", help="查询合并、构建与制品批准状态")
-    preparation_status.add_argument("id")
-    preparation_status.add_argument("--runtime-env", type=Path)
-    preparation_status.set_defaults(handler=lambda args: _publisher(args, {"action": "preparation-status", "id": args.id}))
-
     install_parser = subparsers.add_parser("install")
     install_parser.add_argument("--source-checkout", type=Path, required=True)
     install_parser.add_argument("--commit")
@@ -249,7 +237,6 @@ def _parser() -> argparse.ArgumentParser:
     submit_parser.add_argument("--mise", type=Path, default=None)
     submit_parser.add_argument("--timeout", type=int, default=600)
     submit_parser.add_argument("--backup", action="store_true")
-    submit_parser.add_argument("--no-extra", action="store_true", help="保留已安装扩展版本，只发布 Core 和内置代码")
     submit_parser.add_argument("--session", help="部署失败时注入并唤醒的会话；默认是发起调用的会话")
     submit_parser.set_defaults(handler=submit)
     diff_parser = subparsers.add_parser("preset-diff", help="只读：列出本实例相对 preset 的启停与配置覆盖")
@@ -266,27 +253,6 @@ def _parser() -> argparse.ArgumentParser:
     worker_parser.add_argument("--prepared", action="store_true", help=argparse.SUPPRESS)
     worker_parser.set_defaults(handler=worker)
     return parser
-
-
-def _publisher(args: argparse.Namespace, message: dict[str, object]) -> dict[str, object]:
-    from scripts.akashic_release.authority import exchange
-    socket = read_environment(args.runtime_env).get("AKASHIC_PUBLISHER_SOCKET")
-    if not socket:
-        raise RuntimeError("当前实例没有受保护发布入口")
-    return exchange(message, socket)
-
-
-def prepare_pull_request(args: argparse.Namespace) -> dict[str, object]:
-    result = _publisher(args, {"action": "prepare-pr", "number": args.pr, "head": args.head})
-    if args.wait:
-        print(f"准备任务 {result['id']} 已登记，可用 preparation-status 查询。", file=sys.stderr, flush=True)
-        deadline = time.monotonic() + 2700
-        while result["status"] in ("queued", "running") and time.monotonic() < deadline:
-            time.sleep(10)
-            result = _publisher(args, {"action": "preparation-status", "id": result["id"]})
-        if result["status"] != "prepared":
-            raise RuntimeError(f"准备任务 {result['id']}: {result.get('error', '仍在处理中，请查询原任务')}")
-    return result
 
 
 def main() -> int:

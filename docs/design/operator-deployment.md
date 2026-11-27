@@ -280,7 +280,10 @@ Source body-kind reads also use `message_source_kind_seq` on Session, source, `j
 
 ## Shell 自部署
 
-### 已授权 PR 的免人工准备
+本分支的当前入口以 [0170](../decisions/0170-restore-upstream-self-deploy.md) 为准。
+已有受保护实例可用原已安装宿主 CLI 和下面的记录核对旧部署；切换由管理员另行执行。
+
+### 旧受保护实例的 PR 准备入口
 
 `akashic-release prepare-pr --pr <编号> --head <完整SHA> --wait` 只接受同一仓库中指向
 `main` 的 PR。宿主核对完整文件清单和 CI，用固定 head 合并。控制面和工作流改动保留管理员流程。

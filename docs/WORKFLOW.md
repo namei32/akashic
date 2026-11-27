@@ -19,6 +19,7 @@
 ## 本仓库的开发约定
 
 本仓库的 `origin` 是 `https://github.com/namei32/akashic.git`。日常开发和 PR 以 `main` 为目标分支，`upstream-baseline` 保留用于上游对照。合并使用普通 merge，保留原始提交。
+启用 [0170](decisions/0170-restore-upstream-self-deploy.md) 的实例通过上游部署 Skill 自行合并 PR 时，按该 Skill 使用 squash。
 
 ### 中文提交说明
 
