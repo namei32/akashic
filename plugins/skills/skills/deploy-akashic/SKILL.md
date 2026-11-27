@@ -8,20 +8,6 @@ description: 用户明确授权 Akashic 合并 PR 并更新当前 Docker 实例�
 本回合负责检查、合并和提交。宿主负责等待回复送达、停止、迁移与启动。
 成功接单不等于更新成功；提交之后不再操作，让本回合正常结束。
 
-独立发布器若支持 `prepare-pr`，普通应用 PR 优先使用这个入口。它通过宿主的专用 GitHub 身份
-核验、合并和准备制品，聊天 Shell 不需要 GitHub 写入凭据。只处理用户本次明确授权的 PR。
-
-1. 从 GitHub PR 或 `git ls-remote https://github.com/namei32/akashic.git refs/pull/<编号>/head`
-   确定完整 head。若同一任务包含多个获授权 PR，按依赖顺序准备，最后只发布最终目标。
-2. 运行 `akashic-release prepare-pr --pr <编号> --head <完整SHA> --wait`。
-   Shell 可设 `run_in_background=true`，让后台工作完成后在对话中通知。收到完成通知后继续第 3 步，
-   不需要用户再次输入。也可用 `akashic-release preparation-status <任务编号>` 查询原任务。
-   只有返回 `status: prepared` 时才使用它的 `commit` 字段。失败时汇报原回执。
-3. 单独执行 `akashic-release submit --commit <返回的commit> --no-extra`。接单后正常最终回复并结束，
-   按下方规则核对部署回执。制品准备成功和部署成功是两个状态。
-
-若宿主没有配置该入口，沿用下面的手工准备流程。
-
 ```text
 ┌────────────── Agent 当前回合 ──────────────┐
 │ 检查 → 合并 → 固定 SHA → Shell submit → 最终回复 │
@@ -43,7 +29,7 @@ description: 用户明确授权 Akashic 合并 PR 并更新当前 Docker 实例�
 
 1. 从用户请求确定允许合并的 PR 和备份选择；“提 PR”不授权合并或部署。
 2. 用 Shell 的 `gh pr view` / `gh pr checks` 核对目标 head、依赖和 CI。
-   合并使用 `gh pr merge <number> --merge --match-head-commit <head-sha>`，保留原始提交。
+   合并使用 `gh pr merge <number> --squash --match-head-commit <head-sha>`。
    检查失败、head 改变或未解决冲突时停止部署，说明真实原因。
 3. 所有获授权 PR 合并后，用 `git ls-remote --exit-code origin refs/heads/main`
    取得唯一完整 40 位 SHA。宿主会准备干净 checkout；不需要在运行目录拉代码。
@@ -54,7 +40,6 @@ description: 用户明确授权 Akashic 合并 PR 并更新当前 Docker 实例�
    ```
 
    仅在本次明确要求备份时加 `--backup`；默认不备份。
-   本次只更新 Core/内置、需要保留已安装扩展版本时加 `--no-extra`。
    CLI 自动读取 Shell 的当前调用身份，不需要填写 session、Turn 或 boot ID。
    部署失败时，宿主会把失败原因送回本会话并唤醒你；用户要求把结果送到另一个对话会话时，
    加 `--session <会话编号>`。

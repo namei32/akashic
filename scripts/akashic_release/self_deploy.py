@@ -67,19 +67,6 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
     root = args.root.resolve()
     environment_file = args.runtime_env.resolve(strict=True)
     current = read_environment(environment_file)
-    authority = current.get("AKASHIC_PUBLISHER_SOCKET")
-    if authority:
-        from scripts.akashic_release.authority import exchange
-        if args.backup:
-            raise ValueError("受保护发布只激活已批准制品；备份和迁移由管理员单独执行")
-        exchange({"action": "eligible", "commit": args.commit}, authority)
-        request = {"stop": stop.model_dump()}
-        asyncio.run(_arm_stop(request, current))
-        return exchange({"action": "submit", "commit": args.commit, "stop": stop.model_dump(),
-                         "session": args.session or stop.session_id}, authority)
-    helper = current.get("AKASHIC_DEPLOY_WORKER_HELPER")
-    if helper:
-        subprocess.run(["sudo", "-n", helper, "check"], check=True, capture_output=True, text=True)
     ready = read_json(Path(current["AKASHIC_WORKSPACE"]) / ".runtime-ready.json")
     if ready["bootId"] != stop.boot_id or ready["state"] != "ready":
         raise RuntimeError("Shell 调用不属于当前就绪 boot")
@@ -98,8 +85,6 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
         "unit": unit,
         "notifySession": session,
     }
-    if getattr(args, "no_extra", False):
-        request["noExtra"] = True
     with release_lock(path.with_suffix(".lock")):
         if path.exists():
             record = read_json(path)
@@ -125,10 +110,6 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
         write_json(path, record)
         try:
             asyncio.run(_arm_stop(request, current))
-            command = (["sudo", "-n", helper, "run", identity] if helper else [
-                request["mise"], "exec", "--", sys.executable, "-m",
-                "scripts.akashic_release.cli", "self-deploy-worker", "--request", str(path),
-            ])
             subprocess.run(
                 [
                     "systemd-run",
@@ -138,7 +119,15 @@ def submit(args: argparse.Namespace) -> dict[str, object]:
                     "--property=KillMode=control-group",
                     "--property=TimeoutStartSec=infinity",
                     f"--working-directory={Path(__file__).resolve().parents[2]}",
-                    *command,
+                    request["mise"],
+                    "exec",
+                    "--",
+                    sys.executable,
+                    "-m",
+                    "scripts.akashic_release.cli",
+                    "self-deploy-worker",
+                    "--request",
+                    str(path),
                 ],
                 check=True,
                 capture_output=True,
@@ -187,7 +176,6 @@ async def _prepare_stop(
     from akashic_sdk import AsyncAkashic
     from plugins.gateway.cli import find_endpoint, read_token
     from plugins.host_execution.controller_client import UnixWorkloadController
-    from scripts.akashic_release.publisher_mode import policy, state_action
 
     workspace = Path(current["AKASHIC_WORKSPACE"])
     endpoint = find_endpoint(workspace)
@@ -197,11 +185,9 @@ async def _prepare_stop(
             if (not isinstance(result, dict) or result.get("state") != "drained"
                     or result.get("bootId") != request["stop"]["boot_id"]):
                 raise RuntimeError("Core 未确认正常回合和排空")
-            controller_socket = Path(current["AKASHIC_WORKLOAD_RUNTIME_DIR"]) / "controller.sock"
-            if policy():
-                controller = state_action("controller-status", {"socket": str(controller_socket)})
-            else:
-                controller = await UnixWorkloadController(controller_socket).status()
+            controller = await UnixWorkloadController(
+                Path(current["AKASHIC_WORKLOAD_RUNTIME_DIR"]) / "controller.sock"
+            ).status()
             result["controllerId"] = controller["controller_id"]
             result["containerId"] = subprocess.check_output(
                 [
@@ -241,24 +227,18 @@ def cancel_stop(record: dict[str, Any], current: dict[str, str]) -> None:
 def verify_closed(ack: dict[str, object], current: dict[str, str]) -> str:
     """核对 boot 回执、实际容器及 Controller 退出，返回可由发布器结算的 boot。"""
     from bootstrap.runtime_readiness import read_closed_boot
-    from scripts.akashic_release.publisher_mode import policy, state_action
 
     boot_id = ack["bootId"]
     if not isinstance(boot_id, str):
         raise RuntimeError("停止回执缺少 boot ID")
-    if policy():
-        root, _pending = state_action("read-closed", {"workspace": current["AKASHIC_WORKSPACE"], "boot": boot_id})
-    else:
-        root, _pending = read_closed_boot(Path(current["AKASHIC_WORKSPACE"]), boot_id)
+    root, _pending = read_closed_boot(Path(current["AKASHIC_WORKSPACE"]), boot_id)
     if root != ack["rootIdentity"]:
         raise RuntimeError("旧 Core 关闭回执与排空的 Root 不符")
-    controller_id = ack["controllerId"]
-    if not isinstance(controller_id, str) or not re.fullmatch(r"[0-9a-f]{32}", controller_id):
-        raise RuntimeError("旧 Controller 关闭回执缺少合法 ID")
     controller = read_json(
-        Path(current.get("AKASHIC_CONTROLLER_STATE_ROOT", str(Path(current["AKASHIC_EXPERIMENT_ROOT"]) / "workload-controller")))
+        Path(current["AKASHIC_EXPERIMENT_ROOT"])
+        / "workload-controller"
         / "closed"
-        / f"{controller_id}.json"
+        / f"{ack['controllerId']}.json"
     )
     if controller["controller"] != {"id": ack["controllerId"], "leases_empty": True}:
         raise RuntimeError("旧 Controller 缺少精确租约清理证据")
@@ -416,7 +396,6 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
                 plan=None,
                 inputs=None,
                 backup=request["backup"],
-                no_extra=request.get("noExtra", False),
             ),
             self_deploy=record,
         )
@@ -486,10 +465,6 @@ async def _send_notice(current: dict[str, str], params: dict[str, object]) -> No
 
 
 def status(args: argparse.Namespace) -> dict[str, object]:
-    current = read_environment(args.runtime_env)
-    if address := current.get("AKASHIC_PUBLISHER_SOCKET"):
-        from scripts.akashic_release.authority import exchange
-        return exchange({"action": "status", "requestId": args.request_id}, address)
     record = read_json(_request_path(args.root.resolve(), args.request_id))
     record["service"] = subprocess.check_output(
         [
