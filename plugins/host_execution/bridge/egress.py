@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import socket
 import stat
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 from core.common.diagnostic_log import log_event
@@ -20,6 +23,51 @@ _CHUNK = 65536
 # 看守间隔即入口丢失后的最长恢复时间。
 _WATCH_INTERVAL_S = 2.0
 _PROBE_TIMEOUT_S = 1.0
+_DNS_NAME = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", re.ASCII)
+
+
+@dataclass(frozen=True, slots=True)
+class EgressProxy:
+    """Operator opt-in: only listed HTTPS hosts use a local SOCKS5 listener."""
+
+    port: int
+    hosts: frozenset[str]
+
+    @classmethod
+    def parse(cls, port: str, hosts: str) -> EgressProxy | None:
+        if not port and not hosts:
+            return None
+        if not port.isascii() or not port.isdecimal() or len(port) > 5 or not 1 <= int(port) <= 65535:
+            raise ValueError("AKASHIC_HOST_EGRESS_SOCKS_PORT 必须是本机 SOCKS5 端口")
+        entries = frozenset(host.strip().lower().removesuffix(".") for host in hosts.split(","))
+        if any(len(host) > 253 or not _DNS_NAME.fullmatch(host) or not any(c.isalpha() for c in host)
+               for host in entries):
+            raise ValueError("AKASHIC_HOST_EGRESS_PROXY_HOSTS 必须是逗号分隔的完整 DNS 域名")
+        return cls(int(port), entries)
+
+    async def connect(self, host: str, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        target = host.lower().removesuffix(".")
+        if port != 443 or target not in self.hosts:
+            return await asyncio.open_connection(host, port)
+        # 本机 SOCKS 负责解析；不把 WSL DNS 返回的 Fake-IP 交给显式入口。
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.port)
+        try:
+            writer.write(b"\x05\x01\x00")
+            await writer.drain()
+            if await reader.readexactly(2) != b"\x05\x00":
+                raise OSError("本机 SOCKS5 入口不支持无认证")
+            name = target.encode("ascii")
+            writer.write(bytes((5, 1, 0, 3, len(name))) + name + port.to_bytes(2, "big"))
+            await writer.drain()
+            version, status, reserved, kind = await reader.readexactly(4)
+            if (version, status, reserved) != (5, 0, 0) or await _read_host(reader, kind) is None:
+                raise OSError("本机 SOCKS5 入口未建立连接")
+            await reader.readexactly(2)
+        except BaseException:
+            # 超时和取消同样必须关闭尚未转交给调用者的上游连接。
+            writer.close()
+            raise
+        return reader, writer
 
 
 class EgressPathError(RuntimeError):
@@ -29,8 +77,9 @@ class EgressPathError(RuntimeError):
 # 宿主出口的唯一生命周期 owner：绑定 socket，按 inode 看守路径，路径丢失时就地重绑。
 # 已建立的连接属于旧 listener，重绑不打断它们；Bridge、Core 与 Workload 都不需要重启。
 class HostEgress:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, proxy: EgressProxy | None = None) -> None:
         self._directory = directory
+        self._proxy = proxy
         self._path = directory / EGRESS_SOCKET_NAME
         self._server: asyncio.AbstractServer | None = None
         self._identity: tuple[int, int] | None = None
@@ -90,7 +139,7 @@ class HostEgress:
             sock.bind(str(self._path))
             # Workload 与 Bridge 用同一个宿主用户身份运行；组可写留给按组授权的部署。
             os.chmod(self._path, 0o660)
-            server = await asyncio.start_unix_server(_handle, sock=sock)
+            server = await asyncio.start_unix_server(partial(_handle, proxy=self._proxy), sock=sock)
         except BaseException:
             sock.close()
             raise
@@ -143,7 +192,9 @@ async def _listening(path: Path) -> bool:
 
 
 # 一条连接：协商无认证，读 CONNECT 目标，在宿主上连过去，然后双向转发到任一侧关闭。
-async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def _handle(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, proxy: EgressProxy | None,
+) -> None:
     upstream: asyncio.StreamWriter | None = None
     try:
         # 1. 协商：只接受"无认证"。
@@ -160,12 +211,11 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
         if version != 5 or command != 1 or host is None:
             writer.write(_reply(7 if host is not None else 8))
             return
-        # 3. 在宿主上连接目标；失败按"拒绝连接"回复，浏览器显示连接失败。
+        # 3. 在宿主上连接目标；显式配置失败时不静默回落到透明路由。
+        connect = asyncio.open_connection if proxy is None else proxy.connect
         try:
-            upstream_reader, upstream = await asyncio.wait_for(
-                asyncio.open_connection(host, port), _CONNECT_TIMEOUT_S
-            )
-        except (OSError, TimeoutError):
+            upstream_reader, upstream = await asyncio.wait_for(connect(host, port), _CONNECT_TIMEOUT_S)
+        except (OSError, TimeoutError, asyncio.IncompleteReadError):
             writer.write(_reply(5))
             return
         writer.write(_reply(0))
