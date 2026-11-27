@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import stat
+from functools import partial
 from pathlib import Path
 
 from core.common.diagnostic_log import log_event
@@ -29,7 +30,8 @@ class EgressPathError(RuntimeError):
 # 宿主出口的唯一生命周期 owner：绑定 socket，按 inode 看守路径，路径丢失时就地重绑。
 # 已建立的连接属于旧 listener，重绑不打断它们；Bridge、Core 与 Workload 都不需要重启。
 class HostEgress:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, *, tcp_mss: int | None = None) -> None:
+        self._tcp_mss = tcp_mss
         self._directory = directory
         self._path = directory / EGRESS_SOCKET_NAME
         self._server: asyncio.AbstractServer | None = None
@@ -90,7 +92,7 @@ class HostEgress:
             sock.bind(str(self._path))
             # Workload 与 Bridge 用同一个宿主用户身份运行；组可写留给按组授权的部署。
             os.chmod(self._path, 0o660)
-            server = await asyncio.start_unix_server(_handle, sock=sock)
+            server = await asyncio.start_unix_server(partial(_handle, tcp_mss=self._tcp_mss), sock=sock)
         except BaseException:
             sock.close()
             raise
@@ -142,8 +144,44 @@ async def _listening(path: Path) -> bool:
     return True
 
 
+def parse_tcp_mss(value: str) -> int | None:
+    """未配置时完全沿用系统默认。配置错误在启动监听前报告。"""
+    if not value:
+        return None
+    if not (value.isascii() and value.isdecimal() and len(value) <= 4 and 536 <= int(value) <= 8960):
+        raise ValueError("AKASHIC_HOST_EGRESS_TCP_MSS 必须是 536 到 8960 的整数")
+    if not hasattr(socket, "TCP_MAXSEG"):
+        raise ValueError("当前系统不支持 TCP_MAXSEG")
+    return int(value)
+
+
+async def _connect(host: str, port: int, tcp_mss: int | None) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    if tcp_mss is None:
+        return await asyncio.open_connection(host, port)
+    # 必须在 SYN 之前设置；事后更改 relay 的读写块大小不会改变对端的分段。
+    loop = asyncio.get_running_loop()
+    addresses = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    last_error: OSError = OSError("宿主 DNS 未返回可用的 TCP 地址")
+    for family, kind, proto, _, address in addresses:
+        sock = None
+        try:
+            sock = socket.socket(family, kind, proto)
+            sock.setblocking(False)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, tcp_mss)
+            await loop.sock_connect(sock, address)
+            streams = await asyncio.open_connection(sock=sock)
+            sock = None  # 之后由 StreamWriter 关闭。
+            return streams
+        except OSError as exc:
+            last_error = exc
+        finally:
+            if sock is not None:
+                sock.close()
+    raise last_error
+
+
 # 一条连接：协商无认证，读 CONNECT 目标，在宿主上连过去，然后双向转发到任一侧关闭。
-async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, *, tcp_mss: int | None) -> None:
     upstream: asyncio.StreamWriter | None = None
     try:
         # 1. 协商：只接受"无认证"。
@@ -163,7 +201,7 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
         # 3. 在宿主上连接目标；失败按"拒绝连接"回复，浏览器显示连接失败。
         try:
             upstream_reader, upstream = await asyncio.wait_for(
-                asyncio.open_connection(host, port), _CONNECT_TIMEOUT_S
+                _connect(host, port, tcp_mss), _CONNECT_TIMEOUT_S
             )
         except (OSError, TimeoutError):
             writer.write(_reply(5))

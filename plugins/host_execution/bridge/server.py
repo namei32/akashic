@@ -46,7 +46,7 @@ from plugins.host_execution.contract import (
     TerminalBackend, UnknownExecutionError, UnknownTerminalError
 )
 from ..process_runtime import ShellProcessManager
-from .egress import HostEgress
+from .egress import HostEgress, parse_tcp_mss
 from .path_info import PathInfoOperation
 from .filesystem import (
     FileByteAccess,
@@ -793,6 +793,7 @@ async def serve(
     runtime_checkout: Path,
     bridge_python: Path,
     egress_dir: Path | None = None,
+    tcp_mss: int | None = None,
 ) -> None:
     """Serve one private UDS and clean every leased process on shutdown."""
 
@@ -804,7 +805,7 @@ async def serve(
         socket_path.unlink()
 
     # 2. 启动 RPC 与 lease watchdog，再发布仅 owner 可访问的 socket。
-    egress = None if egress_dir is None else HostEgress(egress_dir)
+    egress = None if egress_dir is None else HostEgress(egress_dir, tcp_mss=tcp_mss)
     service = HostBridgeService(
         token,
         lease_timeout_s,
@@ -921,6 +922,12 @@ async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path
     parser.add_argument("--egress-dir", type=Path,
                         default=runtime_dir / "host-egress" if runtime_dir.is_absolute() else None)
     args = parser.parse_args(arguments)
+    try:
+        tcp_mss = parse_tcp_mss(os.environ.get("AKASHIC_HOST_EGRESS_TCP_MSS", ""))
+    except ValueError as error:
+        parser.error(str(error))
+    if tcp_mss is not None and args.egress_dir is None:
+        parser.error("配置宿主出口 TCP MSS 时必须启用 --egress-dir")
     token = args.token_file.read_text(encoding="utf-8").strip()
     await serve(
         args.socket.resolve(),
@@ -932,6 +939,7 @@ async def main(arguments: tuple[str, ...], *, workspace: Path, config_path: Path
         args.runtime_checkout.resolve(),
         args.bridge_python.absolute(),
         None if args.egress_dir is None else args.egress_dir.resolve(),
+        tcp_mss,
     )
     return 0
 
